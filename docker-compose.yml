@@ -1,0 +1,48 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: effismart
+      POSTGRES_PASSWORD: effismart
+      POSTGRES_DB: effismart
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U effismart -d effismart"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      EFFISMART_DATABASE_URL: postgresql+psycopg://effismart:effismart@db:5432/effismart
+      EFFISMART_JWT_SECRET: ${EFFISMART_JWT_SECRET:-dev-secret-a-changer-en-production}
+      EFFISMART_EXPORT_DIR: /data/exports
+      EFFISMART_CORS_ORIGINS: '["http://localhost:5173"]'
+    volumes:
+      - exports:/data/exports
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  exports:
