@@ -8,6 +8,7 @@ from app.deps import get_current_user, get_repo, require_writer
 from app.models import Drift, DriftStatus, Notification, User
 from app.repositories import TenantRepository
 from app.schemas import DriftOut, DriftUpdate, NotificationOut
+from app.services import drift as drift_service
 
 router = APIRouter(tags=["dérives"])
 
@@ -51,10 +52,7 @@ def qualify_drift(
 ) -> DriftOut:
     """Qualification humaine (principe P1) : ouverte → qualifiée / ignorée, ou réouverture."""
     drift = repo.get_drift(drift_id)
-    drift.status = body.status
-    drift.comment = body.comment
-    drift.qualified_by = user.id
-    db.commit()
+    drift_service.qualify_drift(db, drift, status=body.status, comment=body.comment, user_id=user.id)
     return drift_out(drift)
 
 

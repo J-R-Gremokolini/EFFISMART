@@ -1,14 +1,14 @@
 """F3 — Suivi réglementaire : échéances par site et journal d'actions."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import ActionLog, DeadlineStatus, Obligation, RegulatoryDeadline, Site
-from app.timeutils import today_local
+from app.timeutils import today_local, utcnow
 
 OBLIGATION_LABELS = {
     Obligation.DECRET_TERTIAIRE_OPERAT: "Déclaration OPERAT (Décret Tertiaire)",
@@ -68,6 +68,30 @@ def ensure_operat_deadline(db: Session, site: Site, today: date | None = None) -
         db, site, Obligation.DECRET_TERTIAIRE_OPERAT, next_operat_due_date(today or today_local()),
         "Déclaration annuelle des consommations N-1 sur la plateforme OPERAT (ADEME)",
     )
+
+
+def log_action(
+    db: Session,
+    site: Site,
+    *,
+    obligation: Obligation,
+    description: str,
+    user_id: int,
+    performed_at: datetime | None = None,
+) -> ActionLog:
+    description = description.strip()
+    if not description:
+        raise ValueError("La description de l'action est obligatoire")
+    action = ActionLog(
+        site_id=site.id,
+        obligation=obligation,
+        description=description,
+        performed_at=performed_at or utcnow(),
+        performed_by=user_id,
+    )
+    db.add(action)
+    db.commit()
+    return action
 
 
 def refresh_statuses(db: Session, today: date | None = None) -> int:

@@ -25,6 +25,7 @@ from app.models import (
     DeliveryPoint,
     Drift,
     DriftKind,
+    DriftStatus,
     Fluid,
     Measurement,
     MeasurementStep,
@@ -226,6 +227,17 @@ def _notify(db: Session, dp: DeliveryPoint, drift: Drift) -> None:
     )
     for user in db.scalars(select(User).where(or_(*conditions))):
         db.add(Notification(user_id=user.id, drift_id=drift.id, organization_id=organization_id, message=message))
+
+
+def qualify_drift(
+    db: Session, drift: Drift, *, status: DriftStatus, comment: str | None, user_id: int
+) -> Drift:
+    """Qualification humaine (principe P1) : ouverte → qualifiée / ignorée, ou réouverture."""
+    drift.status = status
+    drift.comment = comment
+    drift.qualified_by = user_id
+    db.commit()
+    return drift
 
 
 def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None = None) -> list[Drift]:

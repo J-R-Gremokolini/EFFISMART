@@ -1,8 +1,6 @@
 """Garde-fous de rôle (F5) : l'espace client est strictement en lecture seule, vérifié côté API."""
 import re
 
-from fastapi.routing import APIRoute
-
 from app.main import app
 from tests.conftest import login
 
@@ -29,14 +27,15 @@ def test_every_write_route_is_forbidden_to_client(client, world):
     """Parcourt TOUTES les routes d'écriture : une nouvelle route non protégée fera échouer ce test."""
     headers = login(client, world.client_a)
     checked = 0
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or route.path in PUBLIC_WRITE_ROUTES:
+    # Le schéma OpenAPI (API publique) liste toutes les routes, préfixes inclus.
+    for path, operations in app.openapi()["paths"].items():
+        if path in PUBLIC_WRITE_ROUTES:
             continue
-        for method in route.methods & WRITE_METHODS:
+        for method in {m.upper() for m in operations} & WRITE_METHODS:
             # Identifiants pris dans le périmètre du client : seul le rôle peut justifier le refus.
-            url = re.sub(r"\{[^}]+\}", str(world.org_a.id), route.path)
+            url = re.sub(r"\{[^}]+\}", str(world.org_a.id), path)
             response = client.request(method, url, headers=headers, json={})
-            assert response.status_code == 403, f"{method} {route.path} → {response.status_code}"
+            assert response.status_code == 403, f"{method} {path} → {response.status_code}"
             checked += 1
     assert checked >= 10
 
