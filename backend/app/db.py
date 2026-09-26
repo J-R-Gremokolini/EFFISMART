@@ -11,7 +11,12 @@ from app.config import settings
 
 def _make_engine(url: str) -> Engine:
     if url.startswith("sqlite"):
-        return create_engine(url, connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        connect_args = {"check_same_thread": False, "timeout": 30}
+        if url in ("sqlite://", "sqlite:///:memory:"):
+            # Base en mémoire (tests) : une connexion unique partagée, sinon chaque connexion aurait sa base.
+            return create_engine(url, connect_args=connect_args, poolclass=StaticPool)
+        # Fichier SQLite (mode local 100 % Python).
+        return create_engine(url, connect_args=connect_args)
     return create_engine(url, pool_pre_ping=True)
 
 

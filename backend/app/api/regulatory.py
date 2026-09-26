@@ -8,7 +8,7 @@ from app.models import ActionLog, RegulatoryDeadline, User
 from app.repositories import TenantRepository
 from app.schemas import ActionLogIn, ActionLogOut, DeadlineIn, DeadlineOut, DeadlineUpdate
 from app.services import regulatory
-from app.timeutils import today_local, utcnow
+from app.timeutils import today_local
 
 router = APIRouter(tags=["réglementaire"], dependencies=[Depends(require_auditor)])
 
@@ -73,13 +73,7 @@ def log_action(
     db: Session = Depends(get_db),
 ) -> ActionLog:
     site = repo.get_site(site_id)
-    action = ActionLog(
-        site_id=site.id,
-        obligation=body.obligation,
-        description=body.description,
-        performed_at=body.performed_at or utcnow(),
-        performed_by=user.id,
+    return regulatory.log_action(
+        db, site, obligation=body.obligation, description=body.description,
+        user_id=user.id, performed_at=body.performed_at,
     )
-    db.add(action)
-    db.commit()
-    return action

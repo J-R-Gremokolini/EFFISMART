@@ -1,0 +1,3 @@
+# Interface locale 100 % Python (Streamlit) : dépendances du backend + Streamlit.
+-r requirements.txt
+streamlit>=1.50

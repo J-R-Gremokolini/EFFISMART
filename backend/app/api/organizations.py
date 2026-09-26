@@ -2,13 +2,12 @@
 from datetime import date
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import get_repo, require_auditor, require_writer
-from app.models import AuditorClientLink, Organization, Role, Site, User
+from app.models import Organization, Site, User
 from app.repositories import TenantRepository
 from app.schemas import (
     OrganizationIn,
@@ -19,10 +18,8 @@ from app.schemas import (
     UserOut,
     ViewerIn,
 )
-from app.security import hash_password
-from app.services import dashboard, regulatory
+from app.services import dashboard, onboarding
 from app.services.delivery_points import delivery_point_out
-from app.timeutils import today_local
 
 router = APIRouter(tags=["organisations"])
 
@@ -41,17 +38,7 @@ def list_organizations(repo: TenantRepository = Depends(get_repo)):
 def create_organization(
     body: OrganizationIn, user: User = Depends(require_writer), db: Session = Depends(get_db)
 ) -> Organization:
-    org = Organization(name=body.name, siren=body.siren, address=body.address)
-    db.add(org)
-    db.flush()
-    if user.auditor_id is not None:
-        db.add(
-            AuditorClientLink(
-                auditor_id=user.auditor_id, organization_id=org.id, start_date=today_local(), active=True
-            )
-        )
-    db.commit()
-    return org
+    return onboarding.create_organization(db, user, name=body.name, siren=body.siren, address=body.address)
 
 
 @router.get("/organizations/{org_id}", response_model=OrganizationOut)
@@ -92,12 +79,7 @@ def create_site(
     db: Session = Depends(get_db),
 ) -> Site:
     org = repo.get_organization(org_id)
-    site = Site(organization_id=org.id, **body.model_dump())
-    db.add(site)
-    db.flush()
-    regulatory.ensure_operat_deadline(db, site)
-    db.commit()
-    return site
+    return onboarding.create_site(db, org, **body.model_dump())
 
 
 @router.post(
@@ -112,12 +94,4 @@ def create_viewer(
 ) -> User:
     """Crée un compte « espace client » en lecture seule (F5)."""
     org = repo.get_organization(org_id)
-    email = body.email.strip().lower()
-    if db.scalar(select(User.id).where(User.email == email)):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Un compte existe déjà avec cet e-mail")
-    viewer = User(
-        email=email, password_hash=hash_password(body.password), role=Role.CLIENT_VIEWER, organization_id=org.id
-    )
-    db.add(viewer)
-    db.commit()
-    return viewer
+    return onboarding.create_viewer(db, org, email=body.email, password=body.password)

@@ -1,17 +1,17 @@
 """Points de livraison, consentement (onboarding) et courbe de charge."""
 from datetime import date
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import get_repo, require_writer
-from app.models import Consent, DeliveryPoint, User
+from app.models import Consent, User
 from app.repositories import TenantRepository
 from app.schemas import ConsentIn, ConsentOut, DeliveryPointIn, DeliveryPointOut
 from app.services import consent as consent_service
-from app.services import dashboard
+from app.services import dashboard, onboarding
 from app.services.delivery_points import delivery_point_out
 from app.services.ingestion import backfill_delivery_point
 
@@ -29,11 +29,7 @@ def create_delivery_point(
     db: Session = Depends(get_db),
 ) -> DeliveryPointOut:
     site = repo.get_site(site_id)
-    if db.scalar(select(DeliveryPoint.id).where(DeliveryPoint.external_ref == body.external_ref)):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Ce point de livraison est déjà enregistré")
-    dp = DeliveryPoint(site_id=site.id, **body.model_dump())
-    db.add(dp)
-    db.commit()
+    dp = onboarding.create_delivery_point(db, site, **body.model_dump())
     return delivery_point_out(db, dp)
 
 

@@ -10,6 +10,7 @@ from app.api import auth, delivery_points, drifts, exports, organizations, regul
 from app.config import settings
 from app.repositories import ResourceNotFound
 from app.services.consent import ConsentRequiredError
+from app.services.onboarding import ConflictError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
@@ -39,6 +40,11 @@ app.add_middleware(
 async def _not_found(_: Request, __: ResourceNotFound) -> JSONResponse:
     # Une ressource hors périmètre est indiscernable d'une ressource inexistante.
     return JSONResponse({"detail": "Ressource introuvable"}, status_code=status.HTTP_404_NOT_FOUND)
+
+
+@app.exception_handler(ConflictError)
+async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=status.HTTP_409_CONFLICT)
 
 
 @app.exception_handler(ConsentRequiredError)

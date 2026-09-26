@@ -4,7 +4,25 @@ SaaS de suivi énergétique et de conformité réglementaire pour PME/ETI, pilot
 Cette V1 implémente strictement le brief technique : F1 (dashboard), F2a (dérives), F3 (réglementaire),
 F4 (exports OPERAT + VSME), F5 (espace client en lecture seule), sur données **mock** réalistes.
 
-## Démarrage
+## Démarrage rapide : version 100 % Python (sans Docker)
+
+Prérequis : Python 3.11 ou plus récent.
+
+Double-cliquez sur **`Lancer-EffiSmart.bat`**, ou exécutez :
+
+```bash
+python lancer.py
+```
+
+Le script crée l'environnement `.venv`, installe les dépendances au premier lancement, puis ouvre
+l'interface Streamlit sur http://localhost:8501. Les données sont stockées dans `backend/data/`
+(base SQLite et exports) ; supprimer ce dossier réinitialise la démonstration.
+
+Cette interface (`backend/effismart_ui.py`) appelle directement les services du backend : mêmes règles
+métier, même isolation entre clients et mêmes rôles que l'API. Le job quotidien est remplacé par un
+rattrapage automatique au démarrage et par le bouton « Mettre à jour les données ».
+
+## Démarrage : version complète (Docker)
 
 Prérequis : Docker Desktop.
 
