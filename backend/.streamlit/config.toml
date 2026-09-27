@@ -1,5 +1,12 @@
 [theme]
-primaryColor = "#0f766e"
+# Thème « Verre » (design system EffiSmart, recommandé par UI/UX Pro Max).
+# Pour revenir au thème « Nova » : EFFISMART_THEME=nova et les couleurs ci-dessous
+# (primaryColor #7c3aed, backgroundColor #05020c, secondaryBackgroundColor #180c32).
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#f8fafc"
 
 [browser]
 gatherUsageStats = false

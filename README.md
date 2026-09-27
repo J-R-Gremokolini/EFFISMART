@@ -22,6 +22,16 @@ Cette interface (`backend/effismart_ui.py`) appelle directement les services du 
 métier, même isolation entre clients et mêmes rôles que l'API. Le job quotidien est remplacé par un
 rattrapage automatique au démarrage et par le bouton « Mettre à jour les données ».
 
+### Design de l'interface
+
+- **Thème « Verre »** (par défaut) : design system généré par le skill UI/UX Pro Max pour un tableau de
+  bord énergie SaaS (verre dépoli sombre, ardoise + vert, Fira Sans / Fira Code), contrastes vérifiés
+  WCAG AA. Règles : `.claude/skills/design-system-effismart/SKILL.md` ; code : `backend/ui_theme.py`.
+- **Thème « Nova »** (violet) toujours disponible : lancer avec `EFFISMART_THEME=nova`.
+- **Visuels** (skill canvas-design) : affiche « Registre silencieux » et illustrations de l'interface,
+  générées à partir des vraies données simulées — `docs/visuel/`. Pour les régénérer :
+  `.venv\Scripts\python.exe docs\visuel\generer_visuels.py`.
+
 ## Démarrage : version complète (Docker)
 
 Prérequis : Docker Desktop.
