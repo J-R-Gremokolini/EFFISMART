@@ -6,6 +6,8 @@ from datetime import date, datetime
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models import (
+    AssetNodeKind,
+    AssetRelationKind,
     DeadlineStatus,
     DriftKind,
     DriftStatus,
@@ -13,7 +15,10 @@ from app.models import (
     ExportStatus,
     Fluid,
     Obligation,
+    PredictionKind,
     ProviderKind,
+    RecommendationKind,
+    ReviewStatus,
     Role,
 )
 
@@ -36,6 +41,7 @@ class UserOut(ORMModel):
     role: Role
     auditor_id: int | None
     organization_id: int | None
+    is_energy_manager: bool = False
 
 
 class TokenOut(BaseModel):
@@ -47,6 +53,8 @@ class TokenOut(BaseModel):
 class ViewerIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=128)
+    # Responsable énergie : valide ou écarte les sorties algorithmiques de son organisation (principe P1).
+    is_energy_manager: bool = False
 
 
 # --- Patrimoine ------------------------------------------------------------
@@ -135,10 +143,29 @@ class ConsentIn(BaseModel):
         return self
 
 
+# --- Principe P1 : sorties algorithmiques expliquées -------------------------------------------------
+
+
+class ExplanationOut(BaseModel):
+    """Raisonnement, gain estimé et niveau de confiance d'une sortie algorithmique."""
+
+    reasoning: list[str] = []
+    confidence: float | None = None
+    confidence_level: str
+    confidence_factors: list[dict] = []
+    gain_kwh: float | None = None
+    gain_eur: float | None = None
+    gain_kgco2e: float | None = None
+    gain_basis: str | None = None
+    algorithm: str | None = None
+    validated_by_role: str | None = None
+    validated_at: datetime | None = None
+
+
 # --- Dérives -------------------------------------------------------------------
 
 
-class DriftOut(BaseModel):
+class DriftOut(ExplanationOut):
     id: int
     delivery_point_id: int
     external_ref: str
@@ -159,6 +186,81 @@ class DriftOut(BaseModel):
 class DriftUpdate(BaseModel):
     status: DriftStatus
     comment: str | None = Field(default=None, max_length=2000)
+
+
+class ReviewIn(BaseModel):
+    """Décision humaine sur une recommandation ou une prévision (motif obligatoire pour écarter)."""
+
+    status: ReviewStatus
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class RecommendationOut(ExplanationOut):
+    id: int
+    organization_id: int
+    site_id: int
+    site_name: str
+    delivery_point_id: int | None
+    drift_id: int | None
+    equipment_id: int | None
+    kind: RecommendationKind
+    title: str
+    action: str
+    status: ReviewStatus
+    review_comment: str | None
+    applied_at: datetime | None
+    applied_comment: str | None
+    created_at: datetime
+
+
+class PredictionOut(ExplanationOut):
+    id: int
+    organization_id: int
+    site_id: int
+    site_name: str
+    fluid: Fluid
+    kind: PredictionKind
+    year: int
+    data_as_of: date
+    measured_kwh: float
+    predicted_kwh: float
+    low_kwh: float
+    high_kwh: float
+    reference_kwh: float | None
+    monthly: list[dict] = []
+    status: ReviewStatus
+    review_comment: str | None
+    created_at: datetime
+
+
+# --- Graphe physique -------------------------------------------------------------------------------
+
+
+class AssetNodeOut(ORMModel):
+    id: int
+    site_id: int
+    kind: AssetNodeKind
+    category: str
+    name: str
+    delivery_point_id: int | None
+    power_kw: float | None
+    surface_m2: float | None
+    always_occupied: bool
+
+
+class AssetRelationOut(ORMModel):
+    id: int
+    source_id: int
+    target_id: int
+    kind: AssetRelationKind
+
+
+class AssetGraphOut(BaseModel):
+    site_id: int
+    nodes: list[AssetNodeOut]
+    relations: list[AssetRelationOut]
+    chains: list[str]
+    warnings: list[str]
 
 
 class NotificationOut(ORMModel):

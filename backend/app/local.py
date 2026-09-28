@@ -29,7 +29,8 @@ def configure_local_environment() -> None:
 
 
 def _add_missing_columns(engine) -> None:
-    """Mise à niveau légère de la base locale : ajoute les colonnes facultatives apparues depuis sa création.
+    """Mise à niveau légère de la base locale : ajoute les colonnes apparues depuis sa création
+    (facultatives, ou obligatoires avec une valeur par défaut côté base).
 
     (PostgreSQL passe par les migrations Alembic ; ceci ne concerne que la base SQLite de démonstration.)
     """
@@ -45,10 +46,16 @@ def _add_missing_columns(engine) -> None:
                 continue
             present = {c["name"] for c in inspector.get_columns(table.name)}
             for column in table.columns:
-                if column.name in present or not column.nullable:
+                if column.name in present:
                     continue
+                constraint = ""
+                if not column.nullable:
+                    if column.server_default is None:
+                        continue
+                    default = column.server_default.arg.compile(dialect=engine.dialect)
+                    constraint = f" NOT NULL DEFAULT {default}"
                 column_type = column.type.compile(dialect=engine.dialect)
-                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}'))
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}{constraint}'))
                 logger.info("Colonne ajoutée : %s.%s", table.name, column.name)
 
 
@@ -68,7 +75,7 @@ def catch_up() -> int:
 
     from app.db import SessionLocal
     from app.models import DeliveryPoint
-    from app.services import integrations, regulatory
+    from app.services import integrations, predictions, regulatory
     from app.services.consent import active_consent_clause
     from app.services.dashboard import data_as_of
     from app.services.drift import run_detection
@@ -93,6 +100,7 @@ def catch_up() -> int:
                 run_detection(db, day, delivery_point_ids=[dp.id])
                 caught_up += 1
         regulatory.refresh_statuses(db)
+        predictions.refresh_predictions(db)
         integrations.dispatch_pending(db)
     logger.info("Rattrapage terminé : %d jour(s) x point(s)", caught_up)
     return caught_up

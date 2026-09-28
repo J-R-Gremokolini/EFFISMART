@@ -1,19 +1,35 @@
-"""F2a — Consultation et qualification des dérives, notifications."""
-from fastapi import APIRouter, Depends
+"""F2a — Consultation et validation humaine des dérives (principe P1), notifications."""
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import get_current_user, get_repo, require_writer
+from app.deps import get_current_user, get_repo, require_validator
 from app.models import Drift, DriftStatus, Notification, User
 from app.repositories import TenantRepository
 from app.schemas import DriftOut, DriftUpdate, NotificationOut
-from app.services import drift as drift_service
+from app.services import validation
 
 router = APIRouter(tags=["dérives"])
 
 
-def drift_out(drift: Drift) -> DriftOut:
+def explanation_fields(db: Session, output, validator_id: int | None, validated_at) -> dict:
+    return {
+        "reasoning": output.reasoning or [],
+        "confidence": output.confidence,
+        "confidence_level": validation.confidence_level(output.confidence)[0],
+        "confidence_factors": output.confidence_factors or [],
+        "gain_kwh": output.gain_kwh,
+        "gain_eur": output.gain_eur,
+        "gain_kgco2e": output.gain_kgco2e,
+        "gain_basis": output.gain_basis,
+        "algorithm": output.algorithm,
+        "validated_by_role": validation.validator_role(db.get(User, validator_id) if validator_id else None),
+        "validated_at": validated_at,
+    }
+
+
+def drift_out(db: Session, drift: Drift) -> DriftOut:
     dp = drift.delivery_point
     return DriftOut(
         id=drift.id,
@@ -31,6 +47,7 @@ def drift_out(drift: Drift) -> DriftOut:
         status=drift.status,
         comment=drift.comment,
         detected_at=drift.detected_at,
+        **explanation_fields(db, drift, drift.qualified_by, drift.qualified_at),
     )
 
 
@@ -38,22 +55,28 @@ def drift_out(drift: Drift) -> DriftOut:
 def list_drifts(
     org_id: int, status: DriftStatus | None = None, repo: TenantRepository = Depends(get_repo)
 ) -> list[DriftOut]:
+    """Un compte client (hors responsable énergie) ne voit que les dérives validées par un humain."""
     repo.get_organization(org_id)
-    return [drift_out(d) for d in repo.list_drifts(org_id, status)]
+    return [drift_out(repo.db, d) for d in repo.list_drifts(org_id, status)]
 
 
 @router.patch("/drifts/{drift_id}", response_model=DriftOut)
-def qualify_drift(
+def review_drift(
     drift_id: int,
     body: DriftUpdate,
-    user: User = Depends(require_writer),
+    user: User = Depends(require_validator),
     repo: TenantRepository = Depends(get_repo),
     db: Session = Depends(get_db),
 ) -> DriftOut:
-    """Qualification humaine (principe P1) : ouverte → qualifiée / ignorée, ou réouverture."""
-    drift = repo.get_drift(drift_id)
-    drift_service.qualify_drift(db, drift, status=body.status, comment=body.comment, user_id=user.id)
-    return drift_out(drift)
+    """Décision humaine (principe P1) : valider (QUALIFIED), écarter (IGNORED, motif obligatoire) ou rouvrir (OPEN).
+
+    Réservée à l'auditeur partenaire et au responsable énergie du client.
+    """
+    try:
+        drift, _ = validation.review_drift(db, repo, user, drift_id, body.status, body.comment)
+    except validation.ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return drift_out(db, drift)
 
 
 @router.get("/notifications", response_model=list[NotificationOut])

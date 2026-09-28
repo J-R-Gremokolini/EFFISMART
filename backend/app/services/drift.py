@@ -5,37 +5,31 @@ Trois détecteurs purement statistiques (pas d'IA) :
 2. CLIMATE_DEVIATION : écart à la même période N-1 corrigée des DJU ;
 3. BASELOAD          : talon anormal en période théorique d'inoccupation (nuit, week-end).
 
-Principe P1 : une dérive est une alerte à qualifier par un humain,
-jamais le déclencheur d'une action automatique.
+Principe P1 : une dérive est une anomalie *proposée*, expliquée (raisonnement, gain estimé,
+niveau de confiance) et validée ou écartée par un humain ; jamais le déclencheur d'une action automatique.
 """
 from __future__ import annotations
 
 import logging
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import (
-    AuditorClientLink,
     DeliveryPoint,
     Drift,
     DriftKind,
-    DriftStatus,
     Fluid,
     Measurement,
     MeasurementStep,
-    Notification,
-    Role,
-    User,
 )
 from app.providers.registry import get_energy_provider
 from app.providers.weather import WeatherProvider, WeatherUnavailableError
-from app.repositories import active_links_clause
 from app.services.consent import active_consent_clause
 from app.timeutils import local_day_bounds, to_local
 
@@ -55,6 +49,8 @@ class DriftCandidate:
     reference: float
     unit: str
     details: str
+    # Éléments du calcul, repris dans l'explication de l'anomalie (principe P1).
+    facts: dict = field(default_factory=dict, compare=False)
 
     @property
     def deviation_pct(self) -> float:
@@ -93,6 +89,21 @@ def daily_kwh(db: Session, delivery_point_id: int, start: date, end: date) -> di
     return dict(totals)
 
 
+def slot_count(db: Session, delivery_point_id: int, day: date) -> int:
+    t0, t1 = local_day_bounds(day, day)
+    return int(db.scalar(select(func.count()).select_from(Measurement).where(
+        Measurement.delivery_point_id == delivery_point_id, Measurement.time >= t0, Measurement.time < t1)) or 0)
+
+
+def coverage(db: Session, dp: DeliveryPoint, day: date) -> float:
+    """Part des mesures attendues effectivement reçues ce jour-là (46 à 50 pas les jours de changement d'heure)."""
+    if dp.fluid == Fluid.GAS:
+        return 1.0 if slot_count(db, dp.id, day) else 0.0
+    t0, t1 = local_day_bounds(day, day)
+    expected = (t1 - t0).total_seconds() / 1800
+    return min(1.0, slot_count(db, dp.id, day) / expected) if expected else 0.0
+
+
 def is_inactive_slot(local_dt: datetime) -> bool:
     """Période théorique d'inoccupation : week-end entier, et chaque nuit."""
     hour = local_dt.hour
@@ -116,9 +127,12 @@ def detect_threshold(db: Session, dp: DeliveryPoint, day: date, weather: Weather
         return DriftCandidate(
             DriftKind.THRESHOLD, total, dp.daily_threshold_kwh, "kWh",
             f"Consommation journalière de {total:.0f} kWh pour un seuil de {dp.daily_threshold_kwh:.0f} kWh",
+            facts={"threshold_source": "custom", "excess_kwh": total - dp.daily_threshold_kwh,
+                   "coverage": coverage(db, dp, day)},
         )
 
     threshold = dp.power_threshold_kw
+    subscribed = None
     if threshold is None:
         subscribed = dp.subscribed_power_kva
         if subscribed is None:
@@ -135,9 +149,16 @@ def detect_threshold(db: Session, dp: DeliveryPoint, day: date, weather: Weather
     peak_time, peak = max(slots, key=lambda slot: slot[1])
     if peak <= threshold:
         return None
+    above = [kw for _, kw in slots if kw > threshold]
     return DriftCandidate(
         DriftKind.THRESHOLD, peak, threshold, "kW",
         f"Pic de {peak:.0f} kW à {peak_time:%H:%M} pour un seuil de {threshold:.0f} kW",
+        facts={
+            "threshold_source": "subscribed" if subscribed else "custom", "subscribed_kva": subscribed,
+            "ratio": settings.threshold_ratio_of_subscribed_power, "peak_time": f"{peak_time:%H:%M}",
+            "slots_above": len(above), "excess_kw": peak - threshold,
+            "excess_kwh": sum((kw - threshold) * 0.5 for kw in above), "coverage": coverage(db, dp, day),
+        },
     )
 
 
@@ -182,10 +203,20 @@ def detect_climate_deviation(
     expected = mean_y + slope * (dju[day] - mean_x)
     if expected <= 0 or actual <= expected * (1 + settings.climate_deviation_tolerance):
         return None
+    residuals = [y - (mean_y + slope * (x - mean_x)) for x, y in points]
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
     return DriftCandidate(
         DriftKind.CLIMATE_DEVIATION, actual, expected, "kWh",
         f"Consommation de {actual:.0f} kWh pour {expected:.0f} kWh attendus "
-        f"(N-1 corrigé des DJU : {dju[day]:.1f} DJU ce jour)",
+        f"(N-1 corrigé des DJU : {dju[day]:.1f} DJU ce jour)".replace(".", ","),
+        facts={
+            "n_points": len(points), "slope": slope, "dju": dju[day], "window": window,
+            "center": center.isoformat(), "day_type": "week-end" if is_weekend else "ouvré",
+            "r2": 1 - sum(r * r for r in residuals) / ss_tot if ss_tot > 0 and slope > 0 else None,
+            "residual_cv": (statistics.fmean(r * r for r in residuals) ** 0.5) / mean_y if mean_y > 0 else None,
+            "tolerance": settings.climate_deviation_tolerance, "excess_kwh": actual - expected,
+            "weather_source": weather.source, "coverage": coverage(db, dp, day),
+        },
     )
 
 
@@ -208,51 +239,42 @@ def detect_baseload(db: Session, dp: DeliveryPoint, day: date, weather: WeatherP
     if reference <= 0 or measured <= reference * (1 + settings.baseload_tolerance):
         return None
     period = "le week-end" if day.weekday() >= 5 else "la nuit"
+    reference_mean = statistics.fmean(reference_slots)
     return DriftCandidate(
         DriftKind.BASELOAD, measured, reference, "kW",
         f"Puissance moyenne de {measured:.0f} kW {period} pour un talon de référence de {reference:.0f} kW",
+        facts={
+            "period": period, "inactive_slots": len(today_slots), "reference_slots": len(reference_slots),
+            "reference_days": settings.baseload_reference_days,
+            "reference_cv": statistics.pstdev(reference_slots) / reference_mean if reference_mean > 0 else None,
+            "tolerance": settings.baseload_tolerance, "excess_kw": measured - reference,
+            "excess_kwh": (measured - reference) * len(today_slots) * 0.5, "coverage": coverage(db, dp, day),
+        },
     )
 
 
 DETECTORS = (detect_threshold, detect_climate_deviation, detect_baseload)
+DETECTOR_BY_KIND = {
+    DriftKind.THRESHOLD: detect_threshold,
+    DriftKind.CLIMATE_DEVIATION: detect_climate_deviation,
+    DriftKind.BASELOAD: detect_baseload,
+}
 
 
 # --- Orchestration ---------------------------------------------------------------
 
 
-def _notify(db: Session, dp: DeliveryPoint, drift: Drift) -> None:
-    organization_id = dp.site.organization_id
-    linked_auditors = select(AuditorClientLink.auditor_id).where(
-        AuditorClientLink.organization_id == organization_id, *active_links_clause()
-    )
-    conditions = [and_(User.role == Role.AUDITOR, User.auditor_id.in_(linked_auditors))]
-    if settings.notify_clients_on_drift:
-        conditions.append(and_(User.role == Role.CLIENT_VIEWER, User.organization_id == organization_id))
-    message = (
-        f"{DRIFT_LABELS[drift.kind]} le {drift.day:%d/%m/%Y} — {dp.site.name} "
-        f"({dp.external_ref}) : écart de {drift.deviation_pct:+.0f} %"
-    )
-    for user in db.scalars(select(User).where(or_(*conditions))):
-        db.add(Notification(user_id=user.id, drift_id=drift.id, organization_id=organization_id, message=message))
-
-
-def qualify_drift(
-    db: Session, drift: Drift, *, status: DriftStatus, comment: str | None, user_id: int
-) -> Drift:
-    """Qualification humaine (principe P1) : ouverte → qualifiée / ignorée, ou réouverture."""
-    drift.status = status
-    drift.comment = comment
-    drift.qualified_by = user_id
-    db.commit()
-    return drift
-
-
 def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None = None) -> list[Drift]:
-    """Analyse un jour pour les points consentis. Idempotent : une dérive (point, type, jour) n'est créée qu'une fois."""
+    """Analyse un jour pour les points consentis. Idempotent : une dérive (point, type, jour) n'est créée qu'une fois.
+
+    Chaque dérive est créée « à valider », avec son explication ; seuls ses valideurs (auditeur, responsable
+    énergie) sont prévenus. Rien ne part vers l'extérieur (webhooks, API partenaires) avant validation humaine.
+    """
     stmt = select(DeliveryPoint).where(active_consent_clause())
     if delivery_point_ids is not None:
         stmt = stmt.where(DeliveryPoint.id.in_(delivery_point_ids))
-    from app.services import integrations  # import local : évite un cycle drift ↔ intégrations
+    # Imports locaux : évitent un cycle drift ↔ intégrations / explications.
+    from app.services import drift_explanations, integrations, validation
 
     weather = integrations.weather_provider(db)
     created: list[Drift] = []
@@ -280,13 +302,14 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
             )
             db.add(drift)
             db.flush()
-            _notify(db, dp, drift)
-            integrations.enqueue_event(db, "drift.created", dp.site.organization_id, {
-                "drift_id": drift.id, "kind": drift.kind.value, "day": drift.day.isoformat(),
-                "site": dp.site.name, "delivery_point": dp.external_ref, "fluid": dp.fluid.value,
-                "measured": drift.measured_value, "reference": drift.reference_value,
-                "deviation_pct": drift.deviation_pct, "unit": drift.unit, "details": drift.details,
-            })
+            drift_explanations.explain_drift(db, dp, drift, candidate)
+            level = validation.confidence_level(drift.confidence)[0].lower()
+            validation.notify(
+                db, dp.site.organization_id,
+                f"À valider : {DRIFT_LABELS[drift.kind].lower()} le {drift.day:%d/%m/%Y}, {dp.site.name} "
+                f"({dp.external_ref}), écart de {drift.deviation_pct:+.0f} %, confiance {level}",
+                validators_only=True, drift_id=drift.id,
+            )
             created.append(drift)
     db.commit()
     logger.info("Détection du %s : %d dérive(s) créée(s)", day, len(created))

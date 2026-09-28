@@ -4,6 +4,8 @@ Authentification par clé d'API (créée dans la page « Intégrations ») :
     X-API-Key: esk_…        ou        Authorization: Bearer esk_…
 Une clé voit les clients de son cabinet, ou un seul client si elle a été restreinte.
 Mêmes règles d'isolation que l'application (TenantRepository) ; seuls les points consentis sont exposés.
+Principe P1 : seules les sorties algorithmiques validées par un humain (auditeur ou responsable énergie)
+sont exposées, avec leur raisonnement, leur gain estimé et leur niveau de confiance.
 """
 from __future__ import annotations
 
@@ -13,15 +15,15 @@ from collections import defaultdict, deque
 from datetime import date, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import ApiKey, DriftStatus, Fluid, Role, User
+from app.models import ApiKey, DriftStatus, Fluid, ReviewStatus, Role, User
 from app.repositories import ResourceNotFound, TenantRepository
-from app.services import integrations
+from app.services import integrations, validation
 from app.services.consent import has_active_consent
 from app.services.dashboard import consented_delivery_points, data_as_of
 from app.services.drift import daily_kwh
@@ -132,21 +134,36 @@ def consumption(
 @router.get("/organizations/{org_id}/drifts")
 def drifts(
     org_id: int,
-    drift_status: DriftStatus | None = Query(default=None, alias="status"),
     since: date | None = None,
     scope: PartnerScope = Depends(partner_scope),
+    db: Session = Depends(get_db),
 ) -> list[dict]:
+    """Anomalies validées par un humain (les anomalies à valider ou écartées ne sortent pas)."""
     org = scope.organization(org_id)
-    items = scope.repo.list_drifts(org.id, drift_status)
+    items = scope.repo.list_drifts(org.id, DriftStatus.QUALIFIED)
     if since:
         items = [d for d in items if d.day >= since]
-    return [
-        {"id": d.id, "kind": d.kind.value, "day": d.day, "status": d.status.value,
-         "site": d.delivery_point.site.name, "delivery_point": d.delivery_point.external_ref,
-         "measured": d.measured_value, "reference": d.reference_value, "deviation_pct": d.deviation_pct,
-         "unit": d.unit, "details": d.details}
-        for d in items
-    ]
+    return [validation.drift_payload(db, d) for d in items]
+
+
+@router.get("/organizations/{org_id}/recommendations")
+def recommendations(
+    org_id: int, scope: PartnerScope = Depends(partner_scope), db: Session = Depends(get_db)
+) -> list[dict]:
+    """Recommandations validées ou déclarées appliquées par un humain."""
+    org = scope.organization(org_id)
+    items = scope.repo.list_recommendations(org.id, [ReviewStatus.VALIDATED, ReviewStatus.APPLIED])
+    return [validation.recommendation_payload(db, r) for r in items]
+
+
+@router.get("/organizations/{org_id}/predictions")
+def predictions(
+    org_id: int, scope: PartnerScope = Depends(partner_scope), db: Session = Depends(get_db)
+) -> list[dict]:
+    """Prévisions validées par un humain."""
+    org = scope.organization(org_id)
+    return [validation.prediction_payload(db, p)
+            for p in scope.repo.list_predictions(org.id, [ReviewStatus.VALIDATED])]
 
 
 

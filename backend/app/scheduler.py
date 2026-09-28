@@ -1,4 +1,5 @@
-"""Job quotidien : ingestion de la veille, détection des dérives, statuts des échéances.
+"""Job quotidien : ingestion de la veille, détection des dérives, statuts des échéances,
+projection annuelle (au plus une fois par mois de données). Toutes les sorties sont créées « à valider ».
 
 Lancement manuel : ``python -m app.scheduler``.
 Note : un seul processus applicatif doit porter le scheduler (uvicorn sans --workers).
@@ -13,7 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
 from app.db import SessionLocal
-from app.services import regulatory
+from app.services import predictions, regulatory
 from app.services.drift import run_detection
 from app.services.ingestion import ingest_all_for_day
 from app.timeutils import today_local
@@ -29,10 +30,11 @@ def run_daily_pipeline(today: date | None = None) -> None:
         logger.info("Pipeline quotidien : %d mesures ingérées pour le %s", count, yesterday)
         run_detection(db, yesterday)
         regulatory.refresh_statuses(db, today)
+        predictions.refresh_predictions(db)
 
 
 def dispatch_webhooks() -> None:
-    """Toutes les minutes : envoie les webhooks en attente (nouvelles dérives, nouveaux documents)."""
+    """Toutes les minutes : envoie les webhooks en attente (sorties validées, nouveaux documents)."""
     from app.services import integrations
 
     with SessionLocal() as db:

@@ -22,6 +22,20 @@ class WeatherProvider(Protocol):
         ...
 
 
+NORMALS_SOURCE = "normales simplifiées : sinusoïde calée sur Paris-Montsouris (5 °C mi-janvier, 20,5 °C mi-juillet)"
+
+
+def normal_mean_temperature(day: date) -> float:
+    """Température moyenne « normale » du jour, sans aléa (utilisée pour projeter l'avenir)."""
+    day_of_year = day.timetuple().tm_yday
+    return 12.75 - 7.75 * math.cos(2 * math.pi * (day_of_year - 15) / 365.25)
+
+
+def normal_dju(day: date, base_temperature: float | None = None) -> float:
+    base = settings.dju_base_temperature if base_temperature is None else base_temperature
+    return max(0.0, base - normal_mean_temperature(day))
+
+
 class MockWeatherProvider:
     """Température moyenne journalière synthétique.
 
@@ -43,10 +57,8 @@ class MockWeatherProvider:
 
     @staticmethod
     def mean_temperature(day: date) -> float:
-        day_of_year = day.timetuple().tm_yday
-        seasonal = 12.75 - 7.75 * math.cos(2 * math.pi * (day_of_year - 15) / 365.25)
         noise = random.Random(f"temperature:{day.isoformat()}").uniform(-3.0, 3.0)
-        return seasonal + noise
+        return normal_mean_temperature(day) + noise
 
     def dju(self, day: date) -> float:
         return max(0.0, self.base_temperature - self.mean_temperature(day))

@@ -306,6 +306,35 @@ html, [data-testid="stMain"], [data-testid="stAppViewContainer"] { scroll-paddin
 .es-empty-title { font-size: 18px; font-weight: 700; color: var(--color-text); margin-bottom: 6px; }
 .es-empty-text { font-size: 15px; color: var(--color-muted); }
 
+/* --- Principe P1 : sorties de la plateforme expliquées --- */
+.es-output-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.es-output-title { font-size: 17px; font-weight: 700; color: var(--color-text); margin: 2px 0 6px; }
+.es-output-action { font-size: 15px; color: var(--color-text-2); margin: 4px 0; }
+.es-output-gain { font-size: 15px; color: var(--color-text-2); margin: 8px 0 4px; }
+.es-output-gain b { color: var(--color-text); }
+.es-output-meta { font-size: 13px; color: var(--color-muted); margin-top: 4px; }
+ol.es-steps { margin: 4px 0 12px 20px; padding: 0; }
+ol.es-steps li { margin: 5px 0; font-size: 14px; color: var(--color-text-2); line-height: 1.5; }
+ul.es-factors { list-style: none; margin: 4px 0 8px; padding: 0; }
+ul.es-factors li { display: flex; gap: 12px; margin: 4px 0; font-size: 14px; color: var(--color-text-2); }
+ul.es-factors .delta { min-width: 84px; font-weight: 600; font-variant-numeric: tabular-nums; }
+ul.es-factors .delta.up { color: var(--color-success); }
+ul.es-factors .delta.down { color: var(--color-danger); }
+
+/* --- Graphe physique --- */
+.es-chain { font-size: 14px; color: var(--color-text-2); padding: 8px 0; border-bottom: 1px solid var(--color-border); }
+ul.es-warnings { margin: 0 0 0 18px; padding: 0; }
+ul.es-warnings li { font-size: 14px; color: var(--color-warning); margin: 4px 0; }
+.es-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--color-muted); margin-top: 8px; }
+.es-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.es-legend i { width: 14px; height: 14px; border-radius: 4px; border: 2px solid; display: inline-block; }
+.es-legend .k-meter { background: #0c4a6e; border-color: #38bdf8; }
+.es-legend .k-equipment { background: #14532d; border-color: #22c55e; }
+.es-legend .k-flow { background: #1e293b; border-color: #94a3b8; border-radius: 50%; }
+.es-legend .k-zone { background: #312e81; border-color: #a5b4fc; }
+.es-legend .k-usage { background: #422006; border-color: #fbbf24; }
+.es-legend .k-target { background: transparent; border-color: #fbbf24; border-width: 3px; }
+
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 """
 
@@ -373,6 +402,7 @@ _ICON_PATHS = {
     "co2": '<path d="M11 20A7 7 0 0 1 4 13c0-6 7-9 16-9 0 9-3 16-9 16z"/><path d="M4 21c3-4 6-7 10-9"/>',
     "clients": '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>',
     "drifts": '<path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4M12 17h.01"/>',
+    "check": '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
 }
 
 def e(text: object) -> str:

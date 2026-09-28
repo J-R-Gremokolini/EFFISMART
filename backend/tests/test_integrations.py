@@ -310,8 +310,8 @@ def test_webhook_failure_is_retried_then_abandoned(db, world, fake_api, monkeypa
     routes[("POST", "https://hooks.partenaire.example/panne")] = lambda r: httpx.Response(500)
     webhook, _ = integrations.create_webhook(db, world.auditor_a, TenantRepository(db, world.auditor_a),
                                              name="Panne", url="https://hooks.partenaire.example/panne",
-                                             events=["drift.created"])
-    integrations.enqueue_event(db, "drift.created", world.org_a.id, {"drift_id": 1})
+                                             events=["drift.created"])  # ancien nom : alias de drift.validated
+    integrations.enqueue_event(db, "drift.validated", world.org_a.id, {"drift_id": 1})
     db.commit()
     assert integrations.dispatch_pending(db) == (0, 0)
     delivery = db.query(WebhookDelivery).one()

@@ -2,6 +2,9 @@
 
 Hiérarchie multi-tenant :
 Auditor → (AuditorClientLink daté) → Organization → Site → DeliveryPoint → Measurement
+
+Graphe physique d'un site (AssetNode / AssetRelation), distinct de cette hiérarchie de rangement :
+Compteur → alimente → Chaudière → produit → Eau chaude → alimente → CTA → dessert → Zone → accueille → Usage
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -91,9 +95,21 @@ class DriftKind(str, enum.Enum):
 
 
 class DriftStatus(str, enum.Enum):
-    OPEN = "OPEN"
-    QUALIFIED = "QUALIFIED"
-    IGNORED = "IGNORED"
+    """Validation humaine d'une anomalie (principe P1) : à valider → validée / écartée."""
+
+    OPEN = "OPEN"  # proposée par la plateforme, à valider
+    QUALIFIED = "QUALIFIED"  # validée par un humain
+    IGNORED = "IGNORED"  # écartée par un humain
+
+
+class ReviewStatus(str, enum.Enum):
+    """Cycle de vie d'une recommandation ou d'une prévision (principe P1)."""
+
+    PROPOSED = "PROPOSED"  # proposée par la plateforme, à valider
+    VALIDATED = "VALIDATED"  # validée par l'auditeur ou le responsable énergie
+    REJECTED = "REJECTED"  # écartée par un humain
+    APPLIED = "APPLIED"  # recommandation mise en œuvre, déclarée par un humain
+    SUPERSEDED = "SUPERSEDED"  # prévision non validée remplacée par une plus récente
 
 
 # --- Tenants et utilisateurs ------------------------------------------------
@@ -121,6 +137,9 @@ class User(Base):
     role: Mapped[Role] = mapped_column(_enum(Role))
     email: Mapped[str] = mapped_column(String(254), unique=True)
     password_hash: Mapped[str] = mapped_column(String(200))
+    # Responsable énergie du client (CLIENT_VIEWER uniquement) : voit les sorties algorithmiques
+    # non validées de son organisation et peut les valider ou les écarter (principe P1).
+    is_energy_manager: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -284,11 +303,34 @@ class ExportJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+# --- Principe P1 : sorties algorithmiques expliquées, validées par un humain ----------------
+
+
+class ExplainedOutput:
+    """Colonnes communes à toute sortie algorithmique (anomalie, recommandation, prévision).
+
+    Chaque sortie porte son raisonnement, son gain estimé et son niveau de confiance, et attend
+    la validation de l'auditeur ou du responsable énergie du client : la plateforme ne valide jamais seule.
+    """
+
+    # none_as_null : « pas encore d'explication » est un vrai NULL SQL, pas la valeur JSON null.
+    reasoning: Mapped[list | None] = mapped_column(JSON(none_as_null=True))  # étapes du raisonnement, dans l'ordre
+    # Score de 0 à 1, borné à 0,95 : la plateforme n'est jamais certaine.
+    confidence: Mapped[float | None] = mapped_column(Float)
+    confidence_factors: Mapped[list | None] = mapped_column(JSON(none_as_null=True))  # [{"label": …, "delta": …}]
+    # Gain annuel estimé (valeur négative = surcoût, pour une prévision au-dessus de N-1).
+    gain_kwh: Mapped[float | None] = mapped_column(Float)
+    gain_eur: Mapped[float | None] = mapped_column(Float)
+    gain_kgco2e: Mapped[float | None] = mapped_column(Float)
+    gain_basis: Mapped[str | None] = mapped_column(Text)  # hypothèses du calcul du gain
+    algorithm: Mapped[str | None] = mapped_column(String(120))  # algorithme et version (traçabilité)
+
+
 # --- F2a : dérives ----------------------------------------------------------
 
 
-class Drift(Base):
-    """Dérive détectée : une alerte à qualifier par un humain (principe P1), jamais une action."""
+class Drift(ExplainedOutput, Base):
+    """Anomalie détectée : une proposition à valider par un humain (principe P1), jamais une action."""
 
     __tablename__ = "drifts"
     __table_args__ = (UniqueConstraint("delivery_point_id", "kind", "day", name="uq_drift_dp_kind_day"),)
@@ -306,8 +348,134 @@ class Drift(Base):
     comment: Mapped[str | None] = mapped_column(Text)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     qualified_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     delivery_point: Mapped[DeliveryPoint] = relationship()
+
+
+# --- Graphe physique des équipements ------------------------------------------------------------
+
+
+class AssetNodeKind(str, enum.Enum):
+    METER = "METER"  # compteur : un point de livraison dans le graphe
+    EQUIPMENT = "EQUIPMENT"  # chaudière, CTA, groupe froid, éclairage…
+    FLOW = "FLOW"  # fluide produit : eau chaude, eau glacée, air neuf…
+    ZONE = "ZONE"  # zone desservie
+    USAGE = "USAGE"  # usage final : chauffage, froid, éclairage…
+
+
+class AssetRelationKind(str, enum.Enum):
+    SUPPLIES = "SUPPLIES"  # alimente
+    PRODUCES = "PRODUCES"  # produit
+    SERVES = "SERVES"  # dessert
+    HOSTS = "HOSTS"  # accueille (zone → usage)
+
+
+class AssetNode(Base):
+    """Nœud du graphe physique d'un site. Les relations sont typées, pas une arborescence de rangement."""
+
+    __tablename__ = "asset_nodes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    kind: Mapped[AssetNodeKind] = mapped_column(_enum(AssetNodeKind))
+    category: Mapped[str] = mapped_column(String(32))  # ex. BOILER (équipement), HOT_WATER (fluide), HEATING (usage)
+    name: Mapped[str] = mapped_column(String(120))
+    delivery_point_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_points.id"), unique=True)
+    power_kw: Mapped[float | None] = mapped_column(Float)  # puissance nominale d'un équipement
+    surface_m2: Mapped[float | None] = mapped_column(Float)  # surface d'une zone
+    # Zone occupée 24 h/24 (chambres, local serveur) : ses équipements fonctionnent légitimement la nuit.
+    always_occupied: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    delivery_point: Mapped[DeliveryPoint | None] = relationship()
+
+
+class AssetRelation(Base):
+    """Relation physique orientée : source → (alimente | produit | dessert | accueille) → cible."""
+
+    __tablename__ = "asset_relations"
+    __table_args__ = (UniqueConstraint("source_id", "target_id", "kind", name="uq_asset_relation"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("asset_nodes.id"), index=True)
+    target_id: Mapped[int] = mapped_column(ForeignKey("asset_nodes.id"), index=True)
+    kind: Mapped[AssetRelationKind] = mapped_column(_enum(AssetRelationKind))
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# --- Recommandations et prévisions ------------------------------------------------------------------
+
+
+class RecommendationKind(str, enum.Enum):
+    SCHEDULE_OFF_HOURS = "SCHEDULE_OFF_HOURS"  # arrêt ou réduit en période d'inoccupation
+    HEATING_CONTROL = "HEATING_CONTROL"  # régulation : consignes, loi d'eau, programmation
+    PEAK_SHAVING = "PEAK_SHAVING"  # délestage ou décalage des appels de puissance
+    INVESTIGATE = "INVESTIGATE"  # graphe incomplet : identifier l'équipement en cause
+
+
+class Recommendation(ExplainedOutput, Base):
+    """Recommandation d'optimisation, proposée à partir d'une anomalie validée et du graphe physique."""
+
+    __tablename__ = "recommendations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    delivery_point_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_points.id"))
+    drift_id: Mapped[int | None] = mapped_column(ForeignKey("drifts.id"))  # anomalie validée à l'origine
+    equipment_id: Mapped[int | None] = mapped_column(ForeignKey("asset_nodes.id"))  # équipement visé
+    supporting_drift_ids: Mapped[list | None] = mapped_column(JSON)  # autres anomalies validées du même motif
+    kind: Mapped[RecommendationKind] = mapped_column(_enum(RecommendationKind))
+    title: Mapped[str] = mapped_column(String(200))
+    action: Mapped[str] = mapped_column(Text)  # ce qu'un humain devra faire ; la plateforme n'agit jamais
+    status: Mapped[ReviewStatus] = mapped_column(_enum(ReviewStatus), default=ReviewStatus.PROPOSED)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[str | None] = mapped_column(Text)
+    applied_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_comment: Mapped[str | None] = mapped_column(Text)
+
+    site: Mapped[Site] = relationship()
+    delivery_point: Mapped[DeliveryPoint | None] = relationship()
+
+
+class PredictionKind(str, enum.Enum):
+    ANNUAL_CONSUMPTION = "ANNUAL_CONSUMPTION"  # projection de la consommation de l'année civile
+
+
+class Prediction(ExplainedOutput, Base):
+    """Prévision : visible par le client seulement une fois validée par un humain."""
+
+    __tablename__ = "predictions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    fluid: Mapped[Fluid] = mapped_column(_enum(Fluid))
+    kind: Mapped[PredictionKind] = mapped_column(_enum(PredictionKind))
+    year: Mapped[int] = mapped_column()
+    data_as_of: Mapped[date] = mapped_column(Date)  # dernière donnée utilisée
+    measured_kwh: Mapped[float] = mapped_column(Float)  # consommé depuis le 1er janvier
+    predicted_kwh: Mapped[float] = mapped_column(Float)  # total projeté sur l'année
+    low_kwh: Mapped[float] = mapped_column(Float)
+    high_kwh: Mapped[float] = mapped_column(Float)
+    reference_kwh: Mapped[float | None] = mapped_column(Float)  # année N-1 complète, si disponible
+    monthly: Mapped[list | None] = mapped_column(JSON)  # [{"month", "measured", "predicted", "reference"}]
+    status: Mapped[ReviewStatus] = mapped_column(_enum(ReviewStatus), default=ReviewStatus.PROPOSED)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[str | None] = mapped_column(Text)
+
+    site: Mapped[Site] = relationship()
 
 
 class DocumentKind(str, enum.Enum):
@@ -435,7 +603,7 @@ class ApiKey(Base):
 
 
 class Webhook(Base):
-    """Envoi d'événements (nouvelle dérive, nouveau document) vers l'outil d'un partenaire."""
+    """Envoi d'événements (sorties validées par un humain, nouveau document) vers l'outil d'un partenaire."""
 
     __tablename__ = "webhooks"
 

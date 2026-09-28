@@ -51,6 +51,7 @@ Au premier démarrage, le backend applique les migrations, puis le seed génère
 | Compte | Mot de passe | Rôle |
 |---|---|---|
 | `auditeur@effismart.demo` | `demo1234` | Auditeur (portefeuille de 3 clients) |
+| `energie@clinique-du-parc.demo` | `demo1234` | Responsable énergie : valide ou écarte les sorties de la plateforme |
 | `client@clinique-du-parc.demo` | `demo1234` | Espace client, lecture seule |
 | `client@boulangeries-martin.demo` | `demo1234` | Espace client, lecture seule |
 | `client@logistique-rhone.demo` | `demo1234` | Espace client, lecture seule |
@@ -80,7 +81,8 @@ Lancement manuel : `docker compose exec backend python -m app.scheduler`.
 backend/            FastAPI + SQLAlchemy 2 + Alembic
   app/providers/    EnergyDataProvider (contrat), Mock, Enedis Data Connect, GRDF ADICT, connecteur générique,
                     WeatherProvider (DJU : Mock ou Open-Meteo)
-  app/services/     consentement, ingestion, dashboard, dérives, réglementaire, exports, documents, intégrations
+  app/services/     consentement, ingestion, dashboard, dérives, réglementaire, exports, documents, intégrations,
+                    validation (principe P1), explications, recommandations, prévisions, graphe des équipements
   app/repositories.py  TenantRepository : filtre d'isolation appliqué dans chaque requête SQL
   app/api/          routes HTTP (préfixe /api)
   alembic/          migrations (measurements = hypertable TimescaleDB)
@@ -93,7 +95,9 @@ docker/             Dockerfiles
   répond 404 (indiscernable d'une ressource inexistante). L'accès d'un auditeur suit les liens datés
   `AuditorClientLink` en vigueur.
 - **Lecture seule client** : double verrou côté API — dépendance `require_writer` sur chaque route d'écriture,
-  et refus global de toute méthode non-GET pour un `CLIENT_VIEWER` dans `get_current_user`.
+  et refus global de toute méthode non-GET pour un `CLIENT_VIEWER` dans `get_current_user`. Seule exception :
+  le responsable énergie peut valider ou écarter (`PATCH`) une anomalie, une recommandation ou une prévision
+  de sa propre organisation (voir « Principe 1 »).
 - **Dépôt de documents** (page « Documents ») : seule écriture ouverte au client — déposer des factures et des
   relevés pour sa propre organisation, et retirer un dépôt non encore traité. L'auditeur télécharge, marque
   « traité » ou « refusé » (motif obligatoire, visible par le client) ; chaque dépôt et chaque décision
@@ -123,6 +127,66 @@ les normales de Paris-Montsouris, base 18 °C). Anomalies récurrentes de la dé
 
 Le point 30001000000004 est volontairement **sans consentement** pour illustrer l'étape d'onboarding
 (onglet « Patrimoine & consentements »).
+
+## Principe 1 : la plateforme propose, un humain décide
+
+Toute sortie algorithmique (anomalie, recommandation d'optimisation, prévision) est présentée avec son
+**raisonnement**, son **gain estimé** et son **niveau de confiance**, et attend la **validation d'un humain**
+avant d'être appliquée : l'auditeur partenaire ou le responsable énergie du client, jamais la plateforme
+seule. L'auditeur vend son expertise ; l'outil l'outille sans décider à sa place, ce qui cadre aussi
+l'exposition en responsabilité. Code : `app/services/validation.py`.
+
+| Sortie | Produite par | Raisonnement | Gain estimé |
+|---|---|---|---|
+| Anomalie (dérive) | détecteurs F2a | donnée analysée, référence et méthode, écart, récurrence, équipements du compteur | excès du jour × occurrences par an (rythme observé sur 90 jours) |
+| Recommandation | une anomalie **validée** + le graphe physique | équipements candidats, exclusions, correspondance de puissance, chaîne physique | gain de l'anomalie × part attribuable à l'équipement |
+| Prévision | signature énergétique (conso = a + b × DJU, ouvrés / week-end) | modèle, mesuré, projeté, intervalle, comparaison à N-1 | écart projeté à l'année précédente |
+
+- **Confiance** : départ à 50 points, chaque facteur l'ajuste d'un montant affiché (netteté de l'écart,
+  complétude des données, stabilité de la référence, récurrence, correspondance de puissance, météo simulée…),
+  borné entre 5 et 95 : jamais 100 %. Élevée ≥ 75, moyenne ≥ 50, faible en dessous.
+- **Qui valide** : l'auditeur lié au client et le responsable énergie du client (case « Responsable énergie »
+  dans « Patrimoine & consentements »). L'administrateur de la plateforme voit tout mais ne valide rien.
+  Écarter exige un motif, conservé. Pas de validation en masse : chaque sortie se valide une à une.
+- **Avant validation**, une sortie n'est vue que de ses valideurs : pas d'affichage aux autres comptes du
+  client, pas de notification au client, pas de webhook, pas d'API partenaires. Le filtre est appliqué dans
+  `TenantRepository` (donc dans chaque requête SQL), comme l'isolation entre clients.
+- **Application** : la plateforme ne pilote aucun équipement. Une recommandation validée se déclare
+  « appliquée » par un humain, après l'intervention réelle. Une anomalie validée déclenche une recommandation
+  *proposée*, elle-même à valider ; si l'anomalie est ensuite écartée, sa recommandation encore non validée
+  est retirée. Une prévision plus récente remplace une prévision non validée, jamais une prévision validée.
+- **Interface** : page « À valider » (file triée par gain × confiance), pages « Dérives »,
+  « Recommandations » et « Prévisions » ; le volet « Raisonnement, niveau de confiance et hypothèses » de
+  chaque carte détaille le calcul et l'algorithme utilisé (nom et version, pour la traçabilité).
+- **API** : `PATCH /api/drifts/{id}`, `/api/recommendations/{id}`, `/api/predictions/{id}` (auditeur ou
+  responsable énergie) ; les réponses incluent `reasoning`, `confidence`, `confidence_factors`, `gain_*`.
+
+## Principe 2 : un graphe physique des équipements
+
+Page « Équipements » : les relations physiques réelles entre éléments d'un site, et non une arborescence
+de rangement. Code : `app/services/assets.py`.
+
+```
+Compteur → alimente → Chaudière → produit → Eau chaude → alimente → CTA → dessert → Zone → accueille → Usage
+```
+
+- **Éléments** : compteur (créé avec chaque point de livraison), équipement (puissance nominale), fluide
+  produit, zone (surface, occupée 24 h/24 ou non), usage.
+- **Relations autorisées** : compteur → alimente → équipement (ou sous-compteur) ; équipement → produit →
+  fluide ; fluide → alimente → équipement ; équipement → dessert → zone ; zone → accueille → usage. Toute
+  autre relation est refusée comme physiquement incohérente, de même que les liens entre deux sites.
+- **Un graphe, pas un arbre** : une CTA peut recevoir de l'eau chaude et de l'eau glacée, un usage peut être
+  partagé par plusieurs zones, une boucle de récupération de chaleur est tolérée.
+- **Pertinence physique** : une chaîne ne mène qu'aux usages que chacun de ses équipements peut servir (un
+  groupe froid ne mène pas au chauffage, une CTA ne produit pas d'eau chaude sanitaire).
+- **Usage par les recommandations** : l'équipement visé est choisi dans le graphe. Un talon anormal de
+  52 kW le week-end désigne le groupe froid de 55 kW ; la salle serveurs, qui fonctionne en continu, est
+  écartée, comme tout équipement qui ne dessert que des zones occupées 24 h/24. Pour un pic de puissance,
+  c'est la hausse par rapport au pic habituel qui est comparée aux puissances nominales. Les maillons
+  manquants sont signalés, car ils empêchent de localiser une anomalie.
+- **Qui modifie** : l'auditeur ; l'espace client consulte. Démo : graphes de la Clinique du Parc et des deux
+  sites de Logistique Rhône ; les Boulangeries Martin n'en ont pas, pour montrer une recommandation
+  « identifier l'équipement en cause ». API : `GET /api/sites/{id}/assets`.
 
 ## Intégrations d'API
 
@@ -167,7 +231,9 @@ http://localhost:8000/api/v1 :
 | `GET /organizations` | clients visibles par la clé |
 | `GET /organizations/{id}/sites` | sites et points de livraison |
 | `GET /organizations/{id}/consumption?start=&end=&granularity=day\|month` | kWh par période et par énergie (2 ans max.) |
-| `GET /organizations/{id}/drifts?status=&since=` | dérives |
+| `GET /organizations/{id}/drifts?since=` | anomalies **validées**, avec raisonnement, gain et confiance |
+| `GET /organizations/{id}/recommendations` | recommandations validées ou appliquées |
+| `GET /organizations/{id}/predictions` | prévisions validées |
 
 Authentification : en-tête `X-API-Key: esk_…` ou `Authorization: Bearer esk_…`. La clé est affichée une
 seule fois à sa création ; seule son empreinte SHA-256 est enregistrée. Elle donne accès à tous les clients
@@ -177,8 +243,11 @@ par clé (`EFFISMART_PARTNER_API_RATE_LIMIT_PER_MINUTE`).
 
 ### 4. Webhooks (auditeur)
 
-EffiSmart envoie un `POST` JSON vers l'URL choisie à chaque événement : `drift.created` (nouvelle dérive)
-et `document.deposited` (nouveau dépôt ; métadonnées seulement, jamais le fichier). En-têtes :
+EffiSmart envoie un `POST` JSON vers l'URL choisie à chaque événement : `drift.validated`,
+`recommendation.validated`, `recommendation.applied`, `prediction.validated` (principe 1 : seules les
+sorties validées par un humain partent ; le rôle du valideur est transmis, jamais son identité) et
+`document.deposited` (nouveau dépôt ; métadonnées seulement, jamais le fichier). Un abonnement à l'ancien
+événement `drift.created` reçoit désormais `drift.validated`. En-têtes :
 `X-EffiSmart-Event`, `X-EffiSmart-Delivery`, `X-EffiSmart-Timestamp` et
 `X-EffiSmart-Signature: sha256=<HMAC-SHA256 de « horodatage.corps » avec le secret whsec_…>`. En cas
 d'échec, nouvel essai après 1, 5, 30 puis 120 minutes (5 tentatives au total, `EFFISMART_WEBHOOK_MAX_ATTEMPTS`).
@@ -233,3 +302,14 @@ Toutes sont dans `backend/app/config.py`, surchargeables par variable d'environn
     sont réglées pour toute la plateforme par l'administrateur ; connecteurs, clés d'API et webhooks
     appartiennent à chaque cabinet. Le consentement d'un point alimenté par un connecteur est celui recueilli
     dans EffiSmart (le connecteur n'a pas de mécanisme de consentement propre).
+11. **Principe 1 (validation humaine)** : ajout demandé après le brief (migration `0004_validation_and_assets`).
+    Les statuts d'une dérive gardent leurs valeurs (`OPEN` / `QUALIFIED` / `IGNORED`, compatibles avec l'API
+    et le front React) mais s'affichent « À valider / Validée / Écartée ». Le responsable énergie est un
+    compte client avec l'attribut `is_energy_manager`, et non un nouveau rôle : toutes les règles
+    d'isolation restent inchangées. Les simples comptes client ne sont plus notifiés à la détection, mais à
+    la validation. Recommandations et prévisions sont des règles d'expert et une régression, sans
+    apprentissage automatique ; les DJU « normaux » des prévisions sont des normales simplifiées, à remplacer
+    par des normales de station météo en production. Le front React n'affiche pas encore ces nouveautés.
+12. **Principe 2 (graphe physique)** : les relations sont limitées à un même site ; une chaufferie commune à
+    plusieurs bâtiments se modélise comme un site avec plusieurs zones. La correspondance entre équipement
+    et usages (`RELEVANT_USAGES`) est une table d'expert, à compléter si de nouvelles catégories apparaissent.

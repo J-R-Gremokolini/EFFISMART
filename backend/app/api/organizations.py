@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import get_repo, require_auditor, require_writer
 from app.models import Organization, Site, User
-from app.repositories import TenantRepository
+from app.repositories import TenantRepository, sees_unvalidated
 from app.schemas import (
     OrganizationIn,
     OrganizationOut,
@@ -56,7 +56,10 @@ def get_dashboard(
     db: Session = Depends(get_db),
 ) -> dict:
     org = repo.get_organization(org_id)
-    return dashboard.organization_dashboard(db, org, period, start, end)
+    data = dashboard.organization_dashboard(db, org, period, start, end)
+    if not sees_unvalidated(repo.user):
+        data["open_drifts"] = 0  # principe P1 : les dérives non validées ne sont pas montrées à ce compte
+    return data
 
 
 @router.get("/organizations/{org_id}/sites", response_model=list[SiteDetailOut])
@@ -92,6 +95,7 @@ def create_viewer(
     repo: TenantRepository = Depends(get_repo),
     db: Session = Depends(get_db),
 ) -> User:
-    """Crée un compte « espace client » en lecture seule (F5)."""
+    """Crée un compte « espace client » en lecture seule (F5), éventuellement responsable énergie (P1)."""
     org = repo.get_organization(org_id)
-    return onboarding.create_viewer(db, org, email=body.email, password=body.password)
+    return onboarding.create_viewer(db, org, email=body.email, password=body.password,
+                                    energy_manager=body.is_energy_manager)

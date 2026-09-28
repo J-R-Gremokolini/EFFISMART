@@ -368,10 +368,16 @@ def authenticate_api_key(db: Session, raw: str | None) -> ApiKey | None:
 
 # --- Webhooks ---------------------------------------------------------------------------------------
 
+# Principe P1 : seules les sorties validées par un humain partent vers les outils des partenaires.
 WEBHOOK_EVENTS = {
-    "drift.created": "Nouvelle dérive détectée",
+    "drift.validated": "Anomalie validée",
+    "recommendation.validated": "Recommandation validée",
+    "recommendation.applied": "Recommandation déclarée appliquée",
+    "prediction.validated": "Prévision validée",
     "document.deposited": "Nouveau document déposé",
 }
+# Abonnements créés avant le principe P1 : « drift.created » reçoit désormais les anomalies validées.
+LEGACY_EVENTS = {"drift.created": "drift.validated"}
 RETRY_DELAYS_MIN = [1, 5, 30, 120]
 
 
@@ -386,7 +392,7 @@ def create_webhook(db: Session, user: User, repo: TenantRepository, *, name: str
         url = net.check_public_url(url)
     except net.UnsafeUrlError as exc:
         raise IntegrationError(str(exc)) from exc
-    events = [e for e in events if e in WEBHOOK_EVENTS]
+    events = [e for e in dict.fromkeys(LEGACY_EVENTS.get(e, e) for e in events) if e in WEBHOOK_EVENTS]
     if not events:
         raise IntegrationError("Choisissez au moins un événement.")
     if organization_id is not None:
@@ -438,7 +444,8 @@ def enqueue_event(db: Session, event: str, organization_id: int, data: dict) -> 
     webhooks = db.scalars(select(Webhook).where(Webhook.enabled.is_(True), Webhook.auditor_id.in_(linked)))
     count = 0
     for webhook in webhooks:
-        if event not in (webhook.events or []) or webhook.organization_id not in (None, organization_id):
+        subscribed = {LEGACY_EVENTS.get(e, e) for e in webhook.events or []}
+        if event not in subscribed or webhook.organization_id not in (None, organization_id):
             continue
         db.add(WebhookDelivery(webhook_id=webhook.id, event=event, payload={
             "event": event, "organization_id": organization_id, "created_at": utcnow().isoformat(), "data": data,

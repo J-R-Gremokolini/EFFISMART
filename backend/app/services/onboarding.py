@@ -22,7 +22,7 @@ from app.models import (
     User,
 )
 from app.security import hash_password
-from app.services import regulatory
+from app.services import assets, regulatory
 from app.timeutils import today_local
 
 _DELIVERY_POINT_REF = re.compile(r"^\d{14}$")
@@ -124,12 +124,20 @@ def create_delivery_point(
         connector_id=connector.id if provider == ProviderKind.GENERIC_API else None,
     )
     db.add(dp)
+    db.flush()
+    assets.ensure_meter_node(db, dp)  # le compteur entre dans le graphe physique du site
     db.commit()
     return dp
 
 
-def create_viewer(db: Session, org: Organization, *, email: str, password: str) -> User:
-    """Crée un compte « espace client » en lecture seule (F5)."""
+def create_viewer(
+    db: Session, org: Organization, *, email: str, password: str, energy_manager: bool = False
+) -> User:
+    """Crée un compte « espace client » en lecture seule (F5).
+
+    `energy_manager` : responsable énergie du client, seul compte client autorisé à valider ou écarter
+    les sorties algorithmiques de son organisation (principe P1).
+    """
     email = email.strip().lower()
     if "@" not in email:
         raise ValueError("Adresse e-mail invalide")
@@ -138,8 +146,24 @@ def create_viewer(db: Session, org: Organization, *, email: str, password: str) 
     if db.scalar(select(User.id).where(User.email == email)):
         raise ConflictError("Un compte existe déjà avec cet e-mail")
     viewer = User(
-        email=email, password_hash=hash_password(password), role=Role.CLIENT_VIEWER, organization_id=org.id
+        email=email, password_hash=hash_password(password), role=Role.CLIENT_VIEWER, organization_id=org.id,
+        is_energy_manager=energy_manager,
     )
     db.add(viewer)
     db.commit()
     return viewer
+
+
+def list_client_users(db: Session, org: Organization) -> list[User]:
+    return list(db.scalars(select(User).where(User.role == Role.CLIENT_VIEWER, User.organization_id == org.id)
+                           .order_by(User.email)))
+
+
+def set_energy_manager(db: Session, org: Organization, user_id: int, value: bool) -> User:
+    """Désigne (ou retire) le responsable énergie parmi les comptes client de l'organisation."""
+    user = db.get(User, user_id)
+    if user is None or user.role != Role.CLIENT_VIEWER or user.organization_id != org.id:
+        raise ValueError("Compte client introuvable pour cette organisation")
+    user.is_energy_manager = value
+    db.commit()
+    return user

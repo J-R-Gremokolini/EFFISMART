@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     ActionLog,
+    AssetNode,
     AuditorClientLink,
     Consent,
     DeliveryPoint,
@@ -21,7 +22,10 @@ from app.models import (
     DriftStatus,
     ExportJob,
     Organization,
+    Prediction,
+    Recommendation,
     RegulatoryDeadline,
+    ReviewStatus,
     Role,
     Site,
     User,
@@ -39,6 +43,14 @@ def active_links_clause():
         AuditorClientLink.active.is_(True),
         or_(AuditorClientLink.end_date.is_(None), AuditorClientLink.end_date >= today_local()),
     )
+
+
+def sees_unvalidated(user: User) -> bool:
+    """Principe P1 : une sortie algorithmique non validée n'est visible que de ceux qui la valident
+    (auditeur, responsable énergie du client) et de l'administrateur de la plateforme."""
+    if user.role in (Role.AUDITOR, Role.ADMIN):
+        return True
+    return user.role == Role.CLIENT_VIEWER and bool(user.is_energy_manager)
 
 
 class TenantRepository:
@@ -116,15 +128,18 @@ class TenantRepository:
             .where(Consent.id == consent_id, self.org_clause(Site.organization_id))
         )
 
-    # --- Dérives --------------------------------------------------------------
+    # --- Dérives (anomalies) --------------------------------------------------------
 
     def _drifts_stmt(self) -> Select:
-        return (
+        stmt = (
             select(Drift)
             .join(DeliveryPoint, Drift.delivery_point_id == DeliveryPoint.id)
             .join(Site, DeliveryPoint.site_id == Site.id)
             .where(self.org_clause(Site.organization_id))
         )
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(Drift.status == DriftStatus.QUALIFIED)
+        return stmt
 
     def list_drifts(self, organization_id: int, status: DriftStatus | None = None) -> list[Drift]:
         stmt = self._drifts_stmt().where(Site.organization_id == organization_id)
@@ -134,6 +149,52 @@ class TenantRepository:
 
     def get_drift(self, drift_id: int) -> Drift:
         return self._one(self._drifts_stmt().where(Drift.id == drift_id))
+
+    # --- Recommandations et prévisions (principe P1 : non validées = réservées aux valideurs) --------
+
+    def _recommendations_stmt(self) -> Select:
+        stmt = select(Recommendation).where(self.org_clause(Recommendation.organization_id))
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(Recommendation.status.in_([ReviewStatus.VALIDATED, ReviewStatus.APPLIED]))
+        return stmt
+
+    def list_recommendations(
+        self, organization_id: int, statuses: list[ReviewStatus] | None = None
+    ) -> list[Recommendation]:
+        stmt = self._recommendations_stmt().where(Recommendation.organization_id == organization_id)
+        if statuses:
+            stmt = stmt.where(Recommendation.status.in_(statuses))
+        return list(self.db.scalars(stmt.order_by(Recommendation.created_at.desc(), Recommendation.id.desc())))
+
+    def get_recommendation(self, recommendation_id: int) -> Recommendation:
+        return self._one(self._recommendations_stmt().where(Recommendation.id == recommendation_id))
+
+    def _predictions_stmt(self) -> Select:
+        stmt = select(Prediction).where(self.org_clause(Prediction.organization_id))
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(Prediction.status == ReviewStatus.VALIDATED)
+        return stmt
+
+    def list_predictions(self, organization_id: int, statuses: list[ReviewStatus] | None = None) -> list[Prediction]:
+        stmt = self._predictions_stmt().where(Prediction.organization_id == organization_id)
+        if statuses:
+            stmt = stmt.where(Prediction.status.in_(statuses))
+        return list(self.db.scalars(stmt.order_by(Prediction.created_at.desc(), Prediction.id.desc())))
+
+    def get_prediction(self, prediction_id: int) -> Prediction:
+        return self._one(self._predictions_stmt().where(Prediction.id == prediction_id))
+
+    # --- Graphe physique des équipements -----------------------------------------------------
+
+    def list_asset_nodes(self, site_id: int) -> list[AssetNode]:
+        site = self.get_site(site_id)
+        stmt = select(AssetNode).where(AssetNode.site_id == site.id, self.org_clause(AssetNode.organization_id))
+        return list(self.db.scalars(stmt.order_by(AssetNode.id)))
+
+    def get_asset_node(self, node_id: int) -> AssetNode:
+        return self._one(
+            select(AssetNode).where(AssetNode.id == node_id, self.org_clause(AssetNode.organization_id))
+        )
 
     # --- Réglementaire --------------------------------------------------------
 

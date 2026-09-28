@@ -12,6 +12,8 @@ from app.models import (
     Fluid,
     Notification,
     ProviderKind,
+    Role,
+    User,
 )
 from app.providers.mock import AnomalyKind, AnomalySpec, MockDataProvider, between
 from app.providers.registry import set_provider_factory
@@ -94,7 +96,12 @@ def test_overconsumption_raises_climate_deviation_drift(db, dp):
     )
 
 
-def test_detection_is_idempotent_and_notifies(db, dp, world):
+def test_detection_is_idempotent_and_notifies_validators_only(db, dp, world):
+    """Principe P1 : une anomalie non validée n'est signalée qu'à ceux qui peuvent la valider."""
+    manager = User(email="energie-a@test.fr", password_hash="x", role=Role.CLIENT_VIEWER,
+                   organization_id=world.org_a.id, is_energy_manager=True)
+    db.add(manager)
+    db.commit()
     day = date(2025, 6, 14)
     _use_mock([AnomalySpec(REF, AnomalyKind.WEEKEND_ON, between(day, day), 0.35)])
     ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
@@ -103,7 +110,8 @@ def test_detection_is_idempotent_and_notifies(db, dp, world):
     assert first and not second
     recipients = {n.user_id for n in db.query(Notification).all()}
     assert world.auditor_a.id in recipients
-    assert world.client_a.id in recipients
+    assert manager.id in recipients
+    assert world.client_a.id not in recipients  # simple compte client : rien avant validation
     assert world.auditor_b.id not in recipients
 
 
