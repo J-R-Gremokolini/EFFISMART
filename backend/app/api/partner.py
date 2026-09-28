@@ -1,0 +1,152 @@
+"""API partenaires (lecture seule) : pour les logiciels des cabinets et de leurs clients (ERP, GMAO, BI…).
+
+Authentification par clé d'API (créée dans la page « Intégrations ») :
+    X-API-Key: esk_…        ou        Authorization: Bearer esk_…
+Une clé voit les clients de son cabinet, ou un seul client si elle a été restreinte.
+Mêmes règles d'isolation que l'application (TenantRepository) ; seuls les points consentis sont exposés.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import date, timedelta
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.db import get_db
+from app.models import ApiKey, DriftStatus, Fluid, Role, User
+from app.repositories import ResourceNotFound, TenantRepository
+from app.services import integrations
+from app.services.consent import has_active_consent
+from app.services.dashboard import consented_delivery_points, data_as_of
+from app.services.drift import daily_kwh
+from app.timeutils import month_start, yesterday_local
+
+class UTF8JSONResponse(JSONResponse):
+    """Encodage déclaré explicitement : certains clients (PowerShell 5, anciens ERP) lisent sinon en Latin-1."""
+
+    media_type = "application/json; charset=utf-8"
+
+
+router = APIRouter(prefix="/v1", tags=["API partenaires"], default_response_class=UTF8JSONResponse)
+
+_hits: dict[int, deque] = defaultdict(deque)
+_lock = threading.Lock()
+
+
+class PartnerScope:
+    def __init__(self, key: ApiKey, repo: TenantRepository) -> None:
+        self.key, self.repo = key, repo
+
+    def organization(self, organization_id: int):
+        if self.key.organization_id not in (None, organization_id):
+            raise ResourceNotFound()
+        return self.repo.get_organization(organization_id)
+
+
+def _rate_limit(key_id: int) -> None:
+    now = time.monotonic()
+    with _lock:
+        hits = _hits[key_id]
+        while hits and now - hits[0] > 60:
+            hits.popleft()
+        if len(hits) >= settings.partner_api_rate_limit_per_minute:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Trop de requêtes : réessayez dans une minute.")
+        hits.append(now)
+
+
+def partner_scope(
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> PartnerScope:
+    raw = x_api_key or (authorization[7:] if authorization and authorization.lower().startswith("bearer ") else None)
+    key = integrations.authenticate_api_key(db, raw)
+    if key is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Clé d'API absente, invalide ou révoquée.")
+    _rate_limit(key.id)
+    # Utilisateur technique (non enregistré) portant le périmètre du cabinet propriétaire de la clé.
+    return PartnerScope(key, TenantRepository(db, User(role=Role.AUDITOR, auditor_id=key.auditor_id)))
+
+
+@router.get("/organizations")
+def list_organizations(scope: PartnerScope = Depends(partner_scope)) -> list[dict]:
+    orgs = scope.repo.list_organizations()
+    if scope.key.organization_id is not None:
+        orgs = [o for o in orgs if o.id == scope.key.organization_id]
+    return [{"id": o.id, "name": o.name, "siren": o.siren} for o in orgs]
+
+
+@router.get("/organizations/{org_id}/sites")
+def list_sites(org_id: int, scope: PartnerScope = Depends(partner_scope), db: Session = Depends(get_db)) -> list[dict]:
+    org = scope.organization(org_id)
+    return [
+        {
+            "id": site.id, "name": site.name, "surface_m2": site.surface_m2,
+            "is_tertiary_decret": site.is_tertiary_decret,
+            "delivery_points": [
+                {"id": dp.id, "fluid": dp.fluid.value, "reference": dp.external_ref, "is_primary": dp.is_primary,
+                 "data_available": has_active_consent(db, dp.id)}
+                for dp in site.delivery_points
+            ],
+        }
+        for site in scope.repo.list_sites(org.id)
+    ]
+
+
+@router.get("/organizations/{org_id}/consumption")
+def consumption(
+    org_id: int,
+    start: date | None = None,
+    end: date | None = None,
+    granularity: Literal["day", "month"] = "day",
+    scope: PartnerScope = Depends(partner_scope),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Consommation en kWh par jour ou par mois et par énergie (points consentis uniquement)."""
+    org = scope.organization(org_id)
+    points = consented_delivery_points(db, org.id)
+    end = end or data_as_of(db, [p.id for p in points]) or yesterday_local()
+    start = start or end - timedelta(days=29)
+    if start > end:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "start doit précéder end.")
+    if (end - start).days > 731:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Période limitée à 2 ans par requête.")
+    totals: dict[str, dict[str, float]] = {}
+    for dp in points:
+        for day, kwh in daily_kwh(db, dp.id, start, end).items():
+            key = day.isoformat() if granularity == "day" else month_start(day).strftime("%Y-%m")
+            bucket = totals.setdefault(key, {f.value: 0.0 for f in Fluid})
+            bucket[dp.fluid.value] += kwh
+    rows = [{"period": k, **{f"{fluid.lower()}_kwh": round(v, 3) for fluid, v in values.items()}}
+            for k, values in sorted(totals.items())]
+    return {"organization_id": org.id, "start": start, "end": end, "granularity": granularity,
+            "unit": "kWh", "data": rows}
+
+
+@router.get("/organizations/{org_id}/drifts")
+def drifts(
+    org_id: int,
+    drift_status: DriftStatus | None = Query(default=None, alias="status"),
+    since: date | None = None,
+    scope: PartnerScope = Depends(partner_scope),
+) -> list[dict]:
+    org = scope.organization(org_id)
+    items = scope.repo.list_drifts(org.id, drift_status)
+    if since:
+        items = [d for d in items if d.day >= since]
+    return [
+        {"id": d.id, "kind": d.kind.value, "day": d.day, "status": d.status.value,
+         "site": d.delivery_point.site.name, "delivery_point": d.delivery_point.external_ref,
+         "measured": d.measured_value, "reference": d.reference_value, "deviation_pct": d.deviation_pct,
+         "unit": d.unit, "details": d.details}
+        for d in items
+    ]
+
+
+

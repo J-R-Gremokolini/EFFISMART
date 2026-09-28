@@ -26,7 +26,7 @@ _INSERT_CHUNK = 5000
 def ingest_delivery_point(db: Session, delivery_point: DeliveryPoint, start: date, end: date) -> int:
     """Récupère et stocke les mesures [start, end] (jours locaux inclus). Renvoie le nombre de mesures."""
     require_active_consent(db, delivery_point)
-    provider = get_energy_provider(delivery_point.provider, delivery_point.fluid)
+    provider = get_energy_provider(delivery_point.provider, delivery_point.fluid, delivery_point)
     measurements = provider.fetch_load_curve(delivery_point.external_ref, start, end)
 
     t0, t1 = local_day_bounds(start, end)

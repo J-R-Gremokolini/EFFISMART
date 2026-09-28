@@ -33,6 +33,7 @@ VENV_PYTHON = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 REQUIREMENTS = [BACKEND / "requirements-ui.txt", BACKEND / "requirements.txt"]
 STAMP = VENV / ".effismart-deps"
 DEFAULT_PORT = 8501
+API_PORT = 8000
 STARTUP_TIMEOUT_S = 300
 
 
@@ -93,6 +94,15 @@ def main() -> int:
 
     say(f"EffiSmart démarre sur http://localhost:{port} — laissez cette fenêtre ouverte (Ctrl+C pour arrêter).")
     say("Premier lancement : génération des données de démonstration, comptez 1 à 2 minutes.")
+
+    # API partenaires (même base locale), si le port 8000 est libre.
+    api = None
+    if is_port_free(API_PORT):
+        api = subprocess.Popen([str(VENV_PYTHON), "-m", "app.local_api", str(API_PORT)], cwd=BACKEND)
+        say(f"API partenaires : http://localhost:{API_PORT}/api/v1 (documentation : http://localhost:{API_PORT}/docs)")
+    else:
+        say(f"Port {API_PORT} occupé : l'API partenaires n'est pas démarrée.")
+
     threading.Thread(target=open_browser_when_ready, args=(port,), daemon=True).start()
     command = [
         str(VENV_PYTHON), "-m", "streamlit", "run", "effismart_ui.py",
@@ -102,6 +112,9 @@ def main() -> int:
         return subprocess.run(command, cwd=BACKEND).returncode
     except KeyboardInterrupt:
         return 0
+    finally:
+        if api is not None:
+            api.terminate()
 
 
 if __name__ == "__main__":

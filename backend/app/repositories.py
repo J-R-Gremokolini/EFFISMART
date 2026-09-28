@@ -15,6 +15,8 @@ from app.models import (
     AuditorClientLink,
     Consent,
     DeliveryPoint,
+    Document,
+    DocumentStatus,
     Drift,
     DriftStatus,
     ExportJob,
@@ -156,6 +158,21 @@ class TenantRepository:
         site = self.get_site(site_id)
         stmt = select(ActionLog).where(ActionLog.site_id == site.id).order_by(ActionLog.performed_at.desc())
         return list(self.db.scalars(stmt))
+
+    # --- Documents déposés -----------------------------------------------------------
+
+    def list_documents(self, organization_id: int, status: DocumentStatus | None = None) -> list[Document]:
+        stmt = select(Document).where(
+            Document.organization_id == organization_id, self.org_clause(Document.organization_id)
+        )
+        if status is not None:
+            stmt = stmt.where(Document.status == status)
+        return list(self.db.scalars(stmt.order_by(Document.uploaded_at.desc(), Document.id.desc())))
+
+    def get_document(self, document_id: int) -> Document:
+        return self._one(
+            select(Document).where(Document.id == document_id, self.org_clause(Document.organization_id))
+        )
 
     # --- Exports ----------------------------------------------------------------
 

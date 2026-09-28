@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     AuditorClientLink,
+    Connector,
     DeliveryPoint,
     Fluid,
     Organization,
@@ -25,6 +26,7 @@ from app.services import regulatory
 from app.timeutils import today_local
 
 _DELIVERY_POINT_REF = re.compile(r"^\d{14}$")
+_GENERIC_REF = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
 _SIREN = re.compile(r"^\d{9}$")
 MIN_PASSWORD_LENGTH = 8
 
@@ -94,10 +96,21 @@ def create_delivery_point(
     is_primary: bool = False,
     power_threshold_kw: float | None = None,
     daily_threshold_kwh: float | None = None,
+    connector: Connector | None = None,
 ) -> DeliveryPoint:
+    """`connector` : connecteur générique déjà vérifié dans le périmètre de l'appelant (source GENERIC_API)."""
     external_ref = external_ref.strip()
-    if not _DELIVERY_POINT_REF.match(external_ref):
+    if provider == ProviderKind.GENERIC_API:
+        if connector is None:
+            raise ValueError("Choisissez le connecteur qui fournit les relevés de ce point")
+        if not _GENERIC_REF.match(external_ref):
+            raise ValueError("Référence du point : 1 à 32 caractères (lettres, chiffres, - _ . :)")
+    elif not _DELIVERY_POINT_REF.match(external_ref):
         raise ValueError("Le numéro PRM / PCE doit comporter 14 chiffres")
+    if provider == ProviderKind.GRDF_ADICT and fluid != Fluid.GAS:
+        raise ValueError("GRDF ne fournit que des données de gaz")
+    if provider in (ProviderKind.ENEDIS_DATACONNECT, ProviderKind.ENEDIS_SGE) and fluid != Fluid.ELEC:
+        raise ValueError("Enedis ne fournit que des données d'électricité")
     if db.scalar(select(DeliveryPoint.id).where(DeliveryPoint.external_ref == external_ref)):
         raise ConflictError("Ce point de livraison est déjà enregistré")
     dp = DeliveryPoint(
@@ -108,6 +121,7 @@ def create_delivery_point(
         is_primary=is_primary,
         power_threshold_kw=power_threshold_kw,
         daily_threshold_kwh=daily_threshold_kwh,
+        connector_id=connector.id if provider == ProviderKind.GENERIC_API else None,
     )
     db.add(dp)
     db.commit()

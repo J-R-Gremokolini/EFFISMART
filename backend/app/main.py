@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import auth, delivery_points, drifts, exports, organizations, regulatory
+from app.api import auth, delivery_points, drifts, exports, organizations, partner, regulatory
 from app.config import settings
 from app.repositories import ResourceNotFound
 from app.services.consent import ConsentRequiredError
@@ -55,7 +55,7 @@ async def _consent_required(_: Request, __: ConsentRequiredError) -> JSONRespons
     )
 
 
-for module in (auth, organizations, delivery_points, drifts, regulatory, exports):
+for module in (auth, organizations, delivery_points, drifts, regulatory, exports, partner):
     app.include_router(module.router, prefix="/api")
 
 

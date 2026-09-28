@@ -34,7 +34,7 @@ from app.models import (
     User,
 )
 from app.providers.registry import get_energy_provider
-from app.providers.weather import WeatherProvider, get_weather_provider
+from app.providers.weather import WeatherProvider, WeatherUnavailableError
 from app.repositories import active_links_clause
 from app.services.consent import active_consent_clause
 from app.timeutils import local_day_bounds, to_local
@@ -122,7 +122,7 @@ def detect_threshold(db: Session, dp: DeliveryPoint, day: date, weather: Weather
     if threshold is None:
         subscribed = dp.subscribed_power_kva
         if subscribed is None:
-            provider = get_energy_provider(dp.provider, dp.fluid)
+            provider = get_energy_provider(dp.provider, dp.fluid, dp)
             subscribed = provider.fetch_contract_info(dp.external_ref).subscribed_power_kva
         if not subscribed:
             return None
@@ -158,9 +158,16 @@ def detect_climate_deviation(
     history = daily_kwh(db, dp.id, center - timedelta(days=window), center + timedelta(days=window))
     if not history:
         return None
-    dju = weather.daily_dju(min(history), max(max(history), day))
+    try:
+        dju = weather.daily_dju(min(history), max(max(history), day))
+    except WeatherUnavailableError:
+        logger.warning("Météo indisponible : détecteur climatique ignoré pour le %s", day)
+        return None
+    if day not in dju:
+        return None
     is_weekend = day.weekday() >= 5
-    points = [(dju[d], kwh) for d, kwh in history.items() if (d.weekday() >= 5) == is_weekend]
+    points = [(dju[d], kwh) for d, kwh in history.items()
+              if d in dju and (d.weekday() >= 5) == is_weekend]
     if len(points) < 8:
         return None
 
@@ -245,7 +252,9 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
     stmt = select(DeliveryPoint).where(active_consent_clause())
     if delivery_point_ids is not None:
         stmt = stmt.where(DeliveryPoint.id.in_(delivery_point_ids))
-    weather = get_weather_provider()
+    from app.services import integrations  # import local : évite un cycle drift ↔ intégrations
+
+    weather = integrations.weather_provider(db)
     created: list[Drift] = []
     for dp in db.scalars(stmt).all():
         for detector in DETECTORS:
@@ -272,6 +281,12 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
             db.add(drift)
             db.flush()
             _notify(db, dp, drift)
+            integrations.enqueue_event(db, "drift.created", dp.site.organization_id, {
+                "drift_id": drift.id, "kind": drift.kind.value, "day": drift.day.isoformat(),
+                "site": dp.site.name, "delivery_point": dp.external_ref, "fluid": dp.fluid.value,
+                "measured": drift.measured_value, "reference": drift.reference_value,
+                "deviation_pct": drift.deviation_pct, "unit": drift.unit, "details": drift.details,
+            })
             created.append(drift)
     db.commit()
     logger.info("Détection du %s : %d dérive(s) créée(s)", day, len(created))

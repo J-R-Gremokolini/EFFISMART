@@ -31,6 +31,14 @@ def run_daily_pipeline(today: date | None = None) -> None:
         regulatory.refresh_statuses(db, today)
 
 
+def dispatch_webhooks() -> None:
+    """Toutes les minutes : envoie les webhooks en attente (nouvelles dérives, nouveaux documents)."""
+    from app.services import integrations
+
+    with SessionLocal() as db:
+        integrations.dispatch_pending(db)
+
+
 def start_scheduler() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=settings.timezone)
     scheduler.add_job(
@@ -41,6 +49,8 @@ def start_scheduler() -> BackgroundScheduler:
         misfire_grace_time=3600,
         coalesce=True,
     )
+    scheduler.add_job(dispatch_webhooks, "interval", minutes=1, id="webhooks", replace_existing=True,
+                      coalesce=True, max_instances=1)
     scheduler.start()
     logger.info("Scheduler démarré (pipeline quotidien à %02dh00)", settings.daily_job_hour)
     return scheduler

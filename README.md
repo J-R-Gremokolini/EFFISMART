@@ -15,8 +15,10 @@ python lancer.py
 ```
 
 Le script crée l'environnement `.venv`, installe les dépendances au premier lancement, puis ouvre
-l'interface Streamlit sur http://localhost:8501. Les données sont stockées dans `backend/data/`
-(base SQLite et exports) ; supprimer ce dossier réinitialise la démonstration.
+l'interface Streamlit sur http://localhost:8501. Il démarre aussi l'API partenaires sur
+http://localhost:8000/api/v1 (documentation interactive : http://localhost:8000/docs). Les données sont
+stockées dans `backend/data/` (base SQLite, exports, documents déposés et clé de chiffrement
+`secret.key`) ; supprimer ce dossier réinitialise la démonstration.
 
 Cette interface (`backend/effismart_ui.py`) appelle directement les services du backend : mêmes règles
 métier, même isolation entre clients et mêmes rôles que l'API. Le job quotidien est remplacé par un
@@ -76,8 +78,9 @@ Lancement manuel : `docker compose exec backend python -m app.scheduler`.
 
 ```
 backend/            FastAPI + SQLAlchemy 2 + Alembic
-  app/providers/    EnergyDataProvider (contrat), MockDataProvider, stubs Enedis/GRDF, WeatherProvider (DJU)
-  app/services/     consentement, ingestion, dashboard, dérives, réglementaire, exports
+  app/providers/    EnergyDataProvider (contrat), Mock, Enedis Data Connect, GRDF ADICT, connecteur générique,
+                    WeatherProvider (DJU : Mock ou Open-Meteo)
+  app/services/     consentement, ingestion, dashboard, dérives, réglementaire, exports, documents, intégrations
   app/repositories.py  TenantRepository : filtre d'isolation appliqué dans chaque requête SQL
   app/api/          routes HTTP (préfixe /api)
   alembic/          migrations (measurements = hypertable TimescaleDB)
@@ -91,10 +94,19 @@ docker/             Dockerfiles
   `AuditorClientLink` en vigueur.
 - **Lecture seule client** : double verrou côté API — dépendance `require_writer` sur chaque route d'écriture,
   et refus global de toute méthode non-GET pour un `CLIENT_VIEWER` dans `get_current_user`.
+- **Dépôt de documents** (page « Documents ») : seule écriture ouverte au client — déposer des factures et des
+  relevés pour sa propre organisation, et retirer un dépôt non encore traité. L'auditeur télécharge, marque
+  « traité » ou « refusé » (motif obligatoire, visible par le client) ; chaque dépôt et chaque décision
+  notifient l'autre partie. Contrôles au niveau service (`app/services/documents.py`) : périmètre via
+  `TenantRepository`, formats PDF / PNG / JPEG / CSV / XLSX vérifiés par signature de contenu, 10 Mo par
+  fichier (`EFFISMART_DOCUMENT_MAX_MB`), stockage sous nom aléatoire dans `backend/data/documents/`,
+  doublons refusés (SHA-256). Disponible dans l'interface Python ; pas encore exposé par l'API REST.
 - **Consentement** : vérifié au niveau service (`require_active_consent`) avant tout appel fournisseur ou
   lecture de courbe ; les agrégats n'incluent que les points consentis.
-- **Brancher Enedis / GRDF** (jalon 8) : implémenter `app/providers/enedis.py` / `grdf.py`, puis changer
-  `DeliveryPoint.provider`. Aucun autre code ne change.
+- **Choix du fournisseur** : `get_energy_provider(provider, fluid, delivery_point)` dans
+  `app/providers/registry.py` renvoie le Mock, Enedis, GRDF ou le connecteur du point selon
+  `DeliveryPoint.provider` ; le reste du code (ingestion, dérives, exports) ne change pas. Voir
+  « Intégrations d'API » ci-dessous.
 
 ### Données mock
 
@@ -111,6 +123,77 @@ les normales de Paris-Montsouris, base 18 °C). Anomalies récurrentes de la dé
 
 Le point 30001000000004 est volontairement **sans consentement** pour illustrer l'étape d'onboarding
 (onglet « Patrimoine & consentements »).
+
+## Intégrations d'API
+
+Page « Intégrations » de l'interface, en quatre onglets. Code : `app/services/integrations.py`,
+`app/providers/`, `app/api/partner.py`.
+
+### 1. Sources de données (administrateur)
+
+| Source | Usage | Paramètres |
+|---|---|---|
+| Enedis Data Connect | courbe de charge élec. 30 min + contrat | client_id / client_secret, bac à sable ou production |
+| GRDF ADICT | consommations gaz journalières + contrat | client_id / client_secret |
+| Open-Meteo | températures réelles → DJU du détecteur climatique | latitude / longitude |
+
+Seul l'administrateur active une source et saisit ses identifiants ; les auditeurs voient l'état en lecture
+seule. Le bouton « Tester la connexion » vérifie une source sans l'activer. Un point de livraison utilise
+Enedis ou GRDF quand on choisit cette source à sa création (« Patrimoine & consentements »).
+
+- Les identifiants Enedis et GRDF s'obtiennent en signant les contrats partenaires de ces opérateurs.
+  Les formats de réponse ont été codés d'après leur documentation publique, **sans compte réel** : à
+  revalider dans le bac à sable Enedis et avec GRDF avant la production.
+- **Ne pas activer Open-Meteo avec les données simulées** : les DJU réels ne correspondent pas à la météo
+  simulée et produiraient de fausses dérives climatiques. Son offre gratuite est réservée à un usage non
+  commercial ; prévoir l'offre payante en production.
+
+### 2. Connecteurs (auditeur)
+
+Pour toute autre API REST qui renvoie du JSON (GTB, compteur divisionnaire, plateforme IoT…).
+L'auditeur décrit l'URL (`{ref}`, `{start}`, `{end}` remplacés à chaque appel), l'authentification (aucune,
+clé dans un en-tête, Bearer, Basic), le chemin des relevés dans la réponse, les champs date et valeur,
+l'unité (kWh, Wh, kW, W) et le pas (30 min ou jour). « Tester » affiche un aperçu des valeurs lues. Le
+connecteur se choisit ensuite comme source d'un point de livraison ; la référence du point est alors
+libre (32 caractères).
+
+### 3. API partenaires (auditeur)
+
+API en lecture seule pour les logiciels du cabinet ou de ses clients (ERP, BI…), sur
+http://localhost:8000/api/v1 :
+
+| Route | Contenu |
+|---|---|
+| `GET /organizations` | clients visibles par la clé |
+| `GET /organizations/{id}/sites` | sites et points de livraison |
+| `GET /organizations/{id}/consumption?start=&end=&granularity=day\|month` | kWh par période et par énergie (2 ans max.) |
+| `GET /organizations/{id}/drifts?status=&since=` | dérives |
+
+Authentification : en-tête `X-API-Key: esk_…` ou `Authorization: Bearer esk_…`. La clé est affichée une
+seule fois à sa création ; seule son empreinte SHA-256 est enregistrée. Elle donne accès à tous les clients
+du cabinet, ou à un seul si on la restreint, et se révoque à tout moment. Mêmes règles d'isolation que
+l'application (`TenantRepository`) ; seuls les points consentis sont exposés ; 120 requêtes par minute et
+par clé (`EFFISMART_PARTNER_API_RATE_LIMIT_PER_MINUTE`).
+
+### 4. Webhooks (auditeur)
+
+EffiSmart envoie un `POST` JSON vers l'URL choisie à chaque événement : `drift.created` (nouvelle dérive)
+et `document.deposited` (nouveau dépôt ; métadonnées seulement, jamais le fichier). En-têtes :
+`X-EffiSmart-Event`, `X-EffiSmart-Delivery`, `X-EffiSmart-Timestamp` et
+`X-EffiSmart-Signature: sha256=<HMAC-SHA256 de « horodatage.corps » avec le secret whsec_…>`. En cas
+d'échec, nouvel essai après 1, 5, 30 puis 120 minutes (5 tentatives au total, `EFFISMART_WEBHOOK_MAX_ATTEMPTS`).
+L'onglet affiche les derniers envois et un exemple de vérification de signature en Python.
+
+### Sécurité
+
+- Secrets (identifiants des sources, des connecteurs et des webhooks) chiffrés en base (Fernet). La clé vient
+  de `EFFISMART_SECRET_KEY`, sinon du fichier `backend/data/secret.key` créé au premier lancement.
+  **En production, définir `EFFISMART_SECRET_KEY`** et la sauvegarder : sans elle, les secrets enregistrés
+  sont illisibles.
+- Appels sortants : HTTPS uniquement, adresses publiques uniquement (pas de réseau interne ni de
+  `localhost`), redirections refusées, délai maximal de 20 s (`EFFISMART_INTEGRATIONS_HTTP_TIMEOUT_S`).
+- L'API partenaires tourne dans le serveur FastAPI, pas dans Streamlit : `lancer.py` la démarre à côté de
+  l'interface (`python -m app.local_api` depuis `backend/`) ; en version Docker elle est servie par le backend.
 
 ## Décisions ouvertes : valeurs par défaut appliquées (brief §7)
 
@@ -143,3 +226,10 @@ Toutes sont dans `backend/app/config.py`, surchargeables par variable d'environn
    non géré par le code. Aucune valeur de consommation n'est écrite dans les logs applicatifs.
 8. **Notifications** : table `Notification` ajoutée (non listée au §4) pour matérialiser « chaque dérive crée
    une notification » ; affichées dans l'application, pas d'envoi d'e-mail en V1.
+9. **Exception à F5 (lecture seule client)** : ajout demandé après le brief — le client peut déposer des
+   factures et des relevés (table `Document`, migration `0002_documents`). Les fichiers sont conservés tels
+   quels : les relevés CSV/Excel ne sont pas encore importés comme mesures, l'auditeur les exploite à la main.
+10. **Intégrations d'API** : ajout demandé après le brief (migration `0003_integrations`). Les sources réelles
+    sont réglées pour toute la plateforme par l'administrateur ; connecteurs, clés d'API et webhooks
+    appartiennent à chaque cabinet. Le consentement d'un point alimenté par un connecteur est celui recueilli
+    dans EffiSmart (le connecteur n'a pas de mécanisme de consentement propre).

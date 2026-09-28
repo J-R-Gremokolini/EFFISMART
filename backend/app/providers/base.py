@@ -54,3 +54,7 @@ class EnergyDataProvider(Protocol):
 
 class ProviderNotConfiguredError(RuntimeError):
     """Levée par un fournisseur réel tant que les accès (contrat, référencement) ne sont pas obtenus."""
+
+
+class ProviderApiError(RuntimeError):
+    """Réponse inattendue d'une API de fournisseur ; message affichable (jamais de secret)."""

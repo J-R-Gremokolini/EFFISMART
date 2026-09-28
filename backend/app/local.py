@@ -2,9 +2,9 @@
 
 - `configure_local_environment()` fixe les variables EFFISMART_* par défaut ;
   à appeler AVANT tout import de `app.config`.
-- `prepare_database()` crée le schéma et le jeu de démonstration au premier lancement.
+- `prepare_database()` crée le schéma (et ajoute les colonnes apparues depuis) puis le jeu de démonstration.
 - `catch_up()` remplace le scheduler : il rattrape les jours manquants depuis la
-  dernière donnée (ingestion, détection des dérives, statuts des échéances).
+  dernière donnée (ingestion, détection des dérives, statuts des échéances, envoi des webhooks).
 """
 from __future__ import annotations
 
@@ -23,7 +23,33 @@ def configure_local_environment() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("EFFISMART_DATABASE_URL", f"sqlite:///{(DATA_DIR / 'effismart.db').as_posix()}")
     os.environ.setdefault("EFFISMART_EXPORT_DIR", str(DATA_DIR / "exports"))
+    os.environ.setdefault("EFFISMART_DOCUMENT_DIR", str(DATA_DIR / "documents"))
+    os.environ.setdefault("EFFISMART_SECRET_KEY_FILE", str(DATA_DIR / "secret.key"))
     os.environ.setdefault("EFFISMART_ENABLE_SCHEDULER", "false")
+
+
+def _add_missing_columns(engine) -> None:
+    """Mise à niveau légère de la base locale : ajoute les colonnes facultatives apparues depuis sa création.
+
+    (PostgreSQL passe par les migrations Alembic ; ceci ne concerne que la base SQLite de démonstration.)
+    """
+    from sqlalchemy import inspect, text
+
+    from app.models import Base
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            present = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present or not column.nullable:
+                    continue
+                column_type = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}'))
+                logger.info("Colonne ajoutée : %s.%s", table.name, column.name)
 
 
 def prepare_database() -> None:
@@ -32,6 +58,7 @@ def prepare_database() -> None:
     from app.seed import seed
 
     Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
     seed()
 
 
@@ -41,7 +68,7 @@ def catch_up() -> int:
 
     from app.db import SessionLocal
     from app.models import DeliveryPoint
-    from app.services import regulatory
+    from app.services import integrations, regulatory
     from app.services.consent import active_consent_clause
     from app.services.dashboard import data_as_of
     from app.services.drift import run_detection
@@ -53,13 +80,19 @@ def catch_up() -> int:
     with SessionLocal() as db:
         for dp in db.scalars(select(DeliveryPoint).where(active_consent_clause())).all():
             last = data_as_of(db, [dp.id])
-            if last is None or last >= yesterday:
+            if last is not None and last >= yesterday:
                 continue
-            start = last + timedelta(days=1)
-            ingest_delivery_point(db, dp, start, yesterday)
+            start = last + timedelta(days=1) if last else yesterday - timedelta(days=6)
+            try:
+                ingest_delivery_point(db, dp, start, yesterday)
+            except Exception:  # une source indisponible (API externe) ne bloque pas les autres points
+                db.rollback()
+                logger.exception("Rattrapage impossible pour le point #%s", dp.id)
+                continue
             for day in daterange(start, yesterday):
                 run_detection(db, day, delivery_point_ids=[dp.id])
                 caught_up += 1
         regulatory.refresh_statuses(db)
+        integrations.dispatch_pending(db)
     logger.info("Rattrapage terminé : %d jour(s) x point(s)", caught_up)
     return caught_up

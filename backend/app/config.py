@@ -22,7 +22,21 @@ class Settings(BaseSettings):
     enable_scheduler: bool = True
     daily_job_hour: int = 6
     export_dir: str = "./data/exports"
+    # Dépôt de documents (factures, relevés) : stockage hors dépôt Git, taille maximale par fichier.
+    document_dir: str = "./data/documents"
+    document_max_mb: float = 10
     timezone: str = "Europe/Paris"
+
+    # --- Intégrations d'API -------------------------------------------------
+    # Clé de chiffrement des identifiants (Fernet, base64). En production : EFFISMART_SECRET_KEY.
+    # À défaut, une clé est générée dans `secret_key_file` (mode local).
+    secret_key: str = ""
+    secret_key_file: str = "./data/secret.key"
+    integrations_http_timeout_s: float = 20
+    # Refuse par défaut les adresses privées / locales (protection SSRF). Ne mettre à true qu'en développement.
+    integrations_allow_private_urls: bool = False
+    partner_api_rate_limit_per_minute: int = 120
+    webhook_max_attempts: int = 5
     cors_origins: list[str] = ["http://localhost:5173"]
 
     # --- Données énergie ------------------------------------------------

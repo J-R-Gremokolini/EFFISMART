@@ -5,6 +5,7 @@ sans consentement actif (non expiré, non révoqué).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from sqlalchemy import func, or_, select
@@ -13,6 +14,8 @@ from sqlalchemy.orm import Session
 from app.models import Consent, DeliveryPoint
 from app.providers.registry import get_energy_provider
 from app.timeutils import ensure_utc, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 class ConsentRequiredError(Exception):
@@ -71,10 +74,13 @@ def grant_consent(
     )
     db.add(consent)
     db.flush()
-    contract = get_energy_provider(delivery_point.provider, delivery_point.fluid).fetch_contract_info(
-        delivery_point.external_ref
-    )
-    delivery_point.subscribed_power_kva = contract.subscribed_power_kva
+    try:
+        contract = get_energy_provider(
+            delivery_point.provider, delivery_point.fluid, delivery_point
+        ).fetch_contract_info(delivery_point.external_ref)
+        delivery_point.subscribed_power_kva = contract.subscribed_power_kva
+    except Exception:  # API externe indisponible : le consentement reste enregistré, le contrat sera relu plus tard
+        logger.warning("Infos contrat indisponibles pour le point #%s", delivery_point.id)
     db.commit()
     return consent
 

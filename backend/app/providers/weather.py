@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import random
-from datetime import date
+from datetime import date, timedelta
 from typing import Protocol
 
 from app.config import settings
@@ -55,5 +55,70 @@ class MockWeatherProvider:
         return {day: self.dju(day) for day in daterange(start, end)}
 
 
+class WeatherUnavailableError(RuntimeError):
+    """Source météo injoignable : le détecteur climatique saute la journée plutôt que de conclure à tort."""
+
+
+class OpenMeteoWeatherProvider:
+    """Températures moyennes journalières réelles (Open-Meteo, sans clé d'API).
+
+    - jours de plus de 5 jours : API d'archive (réanalyse ERA5, publiée avec quelques jours de décalage) ;
+    - jours récents : API de prévision avec l'historique des derniers jours (`past_days`).
+    DJU méthode « météo » : max(0, T_base − Tmoy). Résultats mis en cache pour la durée du processus.
+    Usage commercial : prévoir l'offre payante Open-Meteo (licence de l'API gratuite non commerciale).
+    """
+
+    ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+    FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+    ARCHIVE_LAG_DAYS = 5
+    _cache: dict[tuple[float, float, date], float] = {}
+
+    def __init__(self, latitude: float, longitude: float, base_temperature: float | None = None) -> None:
+        self.latitude, self.longitude = round(float(latitude), 4), round(float(longitude), 4)
+        self.base_temperature = settings.dju_base_temperature if base_temperature is None else base_temperature
+        self.source = f"Open-Meteo, point {self.latitude}, {self.longitude} ; DJU méthode météo base {self.base_temperature:g} °C"
+
+    def _fetch(self, url: str, params: dict) -> dict[date, float]:
+        from app.services import net  # import local : évite un cycle providers ↔ services
+
+        try:
+            with net.client() as http:
+                response = http.get(url, params={
+                    "latitude": self.latitude, "longitude": self.longitude, "daily": "temperature_2m_mean",
+                    "timezone": settings.timezone, **params,
+                })
+            response.raise_for_status()
+            daily = response.json()["daily"]
+        except Exception as exc:  # réseau, format inattendu…
+            raise WeatherUnavailableError(f"Open-Meteo indisponible : {exc.__class__.__name__}") from exc
+        return {date.fromisoformat(d): float(t) for d, t in zip(daily["time"], daily["temperature_2m_mean"])
+                if t is not None}
+
+    def mean_temperatures(self, start: date, end: date) -> dict[date, float]:
+        key = (self.latitude, self.longitude)
+        missing = [d for d in daterange(start, end) if (*key, d) not in self._cache]
+        if missing:
+            from app.timeutils import today_local
+
+            today = today_local()
+            limit = today - timedelta(days=self.ARCHIVE_LAG_DAYS)
+            old = [d for d in missing if d < limit]
+            recent = [d for d in missing if d >= limit]
+            fetched: dict[date, float] = {}
+            if old:
+                fetched |= self._fetch(self.ARCHIVE_URL, {"start_date": min(old).isoformat(),
+                                                           "end_date": max(old).isoformat()})
+            if recent:
+                fetched |= self._fetch(self.FORECAST_URL, {"past_days": min(92, (today - min(recent)).days + 1),
+                                                            "forecast_days": 1})
+            for day, temperature in fetched.items():
+                self._cache[(*key, day)] = temperature
+        return {d: self._cache[(*key, d)] for d in daterange(start, end) if (*key, d) in self._cache}
+
+    def daily_dju(self, start: date, end: date) -> dict[date, float]:
+        return {d: max(0.0, self.base_temperature - t) for d, t in self.mean_temperatures(start, end).items()}
+
+
 def get_weather_provider() -> WeatherProvider:
+    """Source simulée par défaut ; la source réelle se choisit dans les intégrations (`integrations.weather_provider`)."""
     return MockWeatherProvider()

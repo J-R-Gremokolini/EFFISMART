@@ -8,6 +8,10 @@ os.environ["EFFISMART_ENABLE_SCHEDULER"] = "false"
 os.environ["EFFISMART_BACKFILL_DAYS"] = "10"
 os.environ["EFFISMART_DETECTION_BACKFILL_DAYS"] = "2"
 os.environ["EFFISMART_EXPORT_DIR"] = tempfile.mkdtemp(prefix="effismart-exports-")
+os.environ["EFFISMART_DOCUMENT_DIR"] = tempfile.mkdtemp(prefix="effismart-documents-")
+from cryptography.fernet import Fernet  # noqa: E402
+
+os.environ["EFFISMART_SECRET_KEY"] = Fernet.generate_key().decode()
 
 from dataclasses import dataclass  # noqa: E402
 from datetime import date, timedelta  # noqa: E402
