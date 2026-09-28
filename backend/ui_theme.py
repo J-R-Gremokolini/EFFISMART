@@ -205,11 +205,9 @@ html, [data-testid="stMain"], [data-testid="stAppViewContainer"] { scroll-paddin
 .st-key-es-new-export button p { font-size: 17px; font-weight: 700; }
 
 /* --- Composants EffiSmart --- */
-.es-logo { display: flex; align-items: center; gap: 12px; margin: 4px 0 24px; }
-.es-logo-mark {
-  width: 44px; height: 44px; border-radius: 50%; background: var(--color-primary); color: var(--color-on-primary); display: grid; place-items: center;
-}
-.es-logo-name { font-weight: 700; font-size: 24px; color: var(--color-text); letter-spacing: -0.02em; }
+.es-logo { display: block; margin: 4px 0 28px; }
+.es-logo img { display: block; height: 30px; width: auto; }
+.es-logo.es-logo-large img { height: 44px; }
 .es-user { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 .es-avatar {
   width: 44px; height: 44px; border-radius: 50%; background: var(--color-surface-3); color: var(--color-text);
@@ -376,11 +374,6 @@ _ICON_PATHS = {
     "clients": '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>',
     "drifts": '<path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4M12 17h.01"/>',
 }
-_LOGO = ('<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
-         'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-         '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/>'
-         '<path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg>')
-
 
 def e(text: object) -> str:
     return html.escape(str(text))
@@ -434,8 +427,12 @@ def initials(email: str) -> str:
     return letters.upper()[:2]
 
 
-def logo_html() -> str:
-    return f'<div class="es-logo"><div class="es-logo-mark">{_LOGO}</div><div class="es-logo-name">EffiSmart</div></div>'
+def logo_html(large: bool = False) -> str:
+    """Logo officiel (version claire pour fond sombre), avec « EffiSmart » comme texte alternatif."""
+    return f'<div class="es-logo{" es-logo-large" if large else ""}">{artwork("logo-clair.png", "EffiSmart", "")}</div>'
+
+
+ICON_PATH = str(ASSETS / "icone.png")  # icône d'onglet : les trois barres du logo
 
 
 def user_html(email: str, role_label: str) -> str:

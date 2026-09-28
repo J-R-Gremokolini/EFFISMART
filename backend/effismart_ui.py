@@ -209,7 +209,7 @@ def login_page(db: Session) -> None:
             "chaque demi-heure en ligne ; la journée ressort en vert, la nuit et le week-end en sombre.",
         ))
     with center:
-        ui.render(ui.logo_html())
+        ui.render(ui.logo_html(large=True))
         st.title("Connexion")
         st.caption("Suivi énergétique & conformité réglementaire")
         with st.form("login"):
@@ -931,7 +931,7 @@ def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organ
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_NAME, page_icon=":material/bolt:", layout="wide")
+    st.set_page_config(page_title=APP_NAME, page_icon=ui.ICON_PATH, layout="wide")
     ui.inject_css()
     initialize()
     with SessionLocal() as db:
