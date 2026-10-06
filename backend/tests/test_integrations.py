@@ -178,6 +178,21 @@ def test_open_meteo_computes_dju_and_caches(fake_api):
     assert len(calls) == 1  # second appel servi par le cache
 
 
+def test_open_meteo_provides_solar_radiation(fake_api):
+    """Rayonnement journalier (MJ/m²) converti en W/m² moyens : entrée de la température sol-air."""
+    routes, calls = fake_api
+    OpenMeteoWeatherProvider._cache.clear()
+    OpenMeteoWeatherProvider._solar_cache.clear()
+    routes[("GET", OpenMeteoWeatherProvider.ARCHIVE_URL)] = lambda request: httpx.Response(200, json={"daily": {
+        "time": ["2025-01-01", "2025-01-02"], "temperature_2m_mean": [5.0, 6.0],
+        "shortwave_radiation_sum": [8.64, None]}})
+    weather = OpenMeteoWeatherProvider(48.85, 2.35)
+    assert weather.daily_solar(date(2025, 1, 1), date(2025, 1, 2)) == {date(2025, 1, 1): pytest.approx(100.0)}
+    assert weather.daily_temperature(date(2025, 1, 1), date(2025, 1, 2)) == {date(2025, 1, 1): 5.0,
+                                                                              date(2025, 1, 2): 6.0}
+    assert "shortwave_radiation_sum" in str(calls[0].url) and len(calls) == 1
+
+
 # --- Connecteur générique -----------------------------------------------------------------
 
 

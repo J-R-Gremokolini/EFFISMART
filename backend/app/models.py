@@ -469,6 +469,8 @@ class Prediction(ExplainedOutput, Base):
     high_kwh: Mapped[float] = mapped_column(Float)
     reference_kwh: Mapped[float | None] = mapped_column(Float)  # année N-1 complète, si disponible
     monthly: Mapped[list | None] = mapped_column(JSON)  # [{"month", "measured", "predicted", "reference"}]
+    # Modèles comparés en validation hors échantillon : [{"family", "label", "cv_rmse", "chosen"}]
+    model_comparison: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
     status: Mapped[ReviewStatus] = mapped_column(_enum(ReviewStatus), default=ReviewStatus.PROPOSED)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))

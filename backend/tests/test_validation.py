@@ -289,6 +289,10 @@ def test_predictions_are_proposed_explained_and_validated_by_a_human(db, world, 
     assert prediction.reasoning and prediction.confidence_factors and prediction.algorithm
     assert prediction.low_kwh <= prediction.predicted_kwh <= prediction.high_kwh
     assert 0 < prediction.measured_kwh <= prediction.predicted_kwh
+    # Modèles mis en concurrence hors échantillon (Catalina et al., 2009 ; Paudel, 2016), un seul retenu.
+    assert {m["family"] for m in prediction.model_comparison} == {"v1", "poly2", "relevant"}
+    assert sum(m["chosen"] for m in prediction.model_comparison) == 1
+    assert any("Validation hors échantillon" in step for step in prediction.reasoning)
     with pytest.raises(ResourceNotFound):
         TenantRepository(db, world.client_a).get_prediction(prediction.id)
 

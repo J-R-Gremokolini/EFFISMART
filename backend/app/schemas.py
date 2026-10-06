@@ -228,6 +228,7 @@ class PredictionOut(ExplanationOut):
     high_kwh: float
     reference_kwh: float | None
     monthly: list[dict] = []
+    model_comparison: list[dict] = []  # modèles comparés en validation hors échantillon
     status: ReviewStatus
     review_comment: str | None
     created_at: datetime

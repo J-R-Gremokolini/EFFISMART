@@ -92,9 +92,11 @@ def explain_drift(db: Session, dp: DeliveryPoint, drift: Drift, candidate=None) 
         a.factor("Seuil fixé spécifiquement pour ce point", 0.05)
         _margin_factor(a, drift.deviation_pct, 0.1)
     elif drift.kind == DriftKind.CLIMATE_DEVIATION:
-        workday = facts["day_type"] == "ouvré"
-        days = "jours ouvrés" if workday else "jours de week-end"
-        a.step(f"Mesure : {fr(drift.measured_value)} kWh consommés ({'jour ouvré' if workday else 'jour de week-end'}).")
+        day_class = facts["day_class"]
+        origin = "classe déduite des données" if facts.get("classes_learned") else "classe par défaut"
+        days = f"jours comparables ({day_class})"
+        a.step(f"Mesure : {fr(drift.measured_value)} kWh consommés ; jour comparé aux jours « {day_class} » "
+               f"({origin}).")
         center = facts["center"]
         if facts["slope"] <= 0:
             model = ("à cette saison, la consommation ne dépend pas de la météo : la référence est leur moyenne")

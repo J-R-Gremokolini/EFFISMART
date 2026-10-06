@@ -115,8 +115,22 @@ docker/             Dockerfiles
 ### Données mock
 
 `MockDataProvider` est déterministe (même point + même jour ⇒ mêmes valeurs) : occupation 8 h–18 h 30 en semaine,
-creux du week-end, talon de nuit, chauffage proportionnel aux DJU du `MockWeatherProvider` (sinusoïde calée sur
-les normales de Paris-Montsouris, base 18 °C). Anomalies récurrentes de la démo (`DEFAULT_ANOMALIES`) :
+creux du week-end, talon de nuit, chauffage selon la température du `MockWeatherProvider` (sinusoïde calée sur
+les normales de Paris-Montsouris, rayonnement solaire simulé).
+
+Les points de démonstration ont une physique de bâtiment réaliste (`DEMO_BEHAVIOURS` dans
+`app/providers/mock.py`), pour que le moteur de prévision ait quelque chose à découvrir :
+
+| Site | Comportement simulé |
+|---|---|
+| Atelier central (Boulangeries Martin) | fours : chauffage seulement sous 15 °C ; inertie ~1 jour ; gaz : production le samedi, fermé le dimanche |
+| Boutique Bellecour | vitrine plein sud (forts apports solaires), construction légère, fermée le lundi |
+| Clinique du Parc | béton lourd (inertie ~3 jours), besoin de chauffage non linéaire, groupe froid au-delà de 21 °C |
+| Entrepôt Genas | bardage métallique (peu d'inertie), chauffé hors gel sous 12 °C, réassort du lundi |
+| Bureaux Part-Dieu | façades vitrées, pompe à chaleur réversible (climatisation au-delà de 22 °C), vendredi en télétravail |
+
+Les autres points (créés par l'utilisateur, tests) gardent le comportement standard : DJU base 18 °C du jour.
+Anomalies récurrentes de la démo (`DEFAULT_ANOMALIES`) :
 
 | Point | Anomalie | Dérive attendue |
 |---|---|---|
@@ -140,7 +154,7 @@ l'exposition en responsabilité. Code : `app/services/validation.py`.
 |---|---|---|---|
 | Anomalie (dérive) | détecteurs F2a | donnée analysée, référence et méthode, écart, récurrence, équipements du compteur | excès du jour × occurrences par an (rythme observé sur 90 jours) |
 | Recommandation | une anomalie **validée** + le graphe physique | équipements candidats, exclusions, correspondance de puissance, chaîne physique | gain de l'anomalie × part attribuable à l'équipement |
-| Prévision | signature énergétique (conso = a + b × DJU, ouvrés / week-end) | modèle, mesuré, projeté, intervalle, comparaison à N-1 | écart projeté à l'année précédente |
+| Prévision | moteur v2 : modèles mis en concurrence, validés hors échantillon (voir « Moteur de prévision ») | classes de fonctionnement, modèles comparés, inertie, sol-air, mesuré, projeté, intervalle, comparaison à N-1 | écart projeté à l'année précédente |
 
 - **Confiance** : départ à 50 points, chaque facteur l'ajuste d'un montant affiché (netteté de l'écart,
   complétude des données, stabilité de la référence, récurrence, correspondance de puissance, météo simulée…),
@@ -160,6 +174,60 @@ l'exposition en responsabilité. Code : `app/services/validation.py`.
   chaque carte détaille le calcul et l'algorithme utilisé (nom et version, pour la traçabilité).
 - **API** : `PATCH /api/drifts/{id}`, `/api/recommendations/{id}`, `/api/predictions/{id}` (auditeur ou
   responsable énergie) ; les réponses incluent `reasoning`, `confidence`, `confidence_factors`, `gain_*`.
+
+### Moteur de prévision (v2)
+
+Code : `app/services/forecasting.py`, appelé par `app/services/predictions.py`. Il s'appuie sur deux
+références :
+
+- **Catalina, Virgone, Blanco (2009)**, *Création de modèles de régression pour prédire les consommations
+  d'énergie des bâtiments à partir de simulations numériques*, CIFQ, Lille (hal-00985331). Les degrés-jours
+  seuls surestiment le besoin car ils ignorent soleil et inertie ; température **sol-air**
+  T + 0,6 × rayonnement / 23 ; modèle **d'ordre 2** ; validation sur des cas non appris.
+- **Paudel (2016)**, *Méthodologie pour estimer la consommation d'énergie dans les bâtiments en utilisant des
+  techniques d'intelligence artificielle*, thèse, École des Mines de Nantes (tel-01382882). **Inertie** :
+  le climat des 1 à 3 jours précédents compte ; **classes de fonctionnement** déduites des données ;
+  **jours pertinents** : apprendre sur les 7 à 14 jours passés les plus semblables au jour à prévoir.
+
+Fonctionnement, pour chaque site et énergie, sur les 365 derniers jours :
+
+1. Classes de fonctionnement : niveau de chaque jour de la semaine rapporté à la moyenne de sa semaine,
+   regroupement des jours à moins de 8 % d'écart (ex. « lundi–vendredi 118 % ; samedi, dimanche 55 % »).
+2. Candidats : signature linéaire v1 (référence) ; signature d'ordre 2 (chauffage H et H², refroidissement
+   pour l'électricité) ; jours pertinents (7, 10 ou 14 jours analogues, régression locale pondérée). Chacun
+   avec une inertie de 0 à 3 jours et avec ou sans sol-air (si le rayonnement est disponible).
+3. Validation hors échantillon : l'historique est coupé en 6 périodes d'environ deux mois ; chaque période
+   est retirée de l'apprentissage puis prédite. Critère : erreur journalière CV(RMSE) ; à 2 % près, le
+   modèle le plus simple l'emporte.
+4. Projection du reste de l'année avec la météo normale ; intervalle = erreur de validation (plancher 3 %)
+   et sensibilité au climat (normales ± 1,5 °C), combinées quadratiquement.
+
+La carte de chaque prévision affiche le tableau des modèles testés et le modèle retenu. Les modèles restent
+explicables (régressions, jours analogues) plutôt qu'un réseau de neurones ou un SVM : chaque prévision
+doit présenter son raisonnement (principe 1). La thèse observe d'ailleurs que, sur le bâtiment réel étudié,
+SVM linéaire et moindres carrés donnent des poids similaires.
+
+**Sur les données de démonstration** (simulateur réaliste, voir « Données mock »), erreur journalière hors
+échantillon :
+
+| Site | Méthode v1 | Moteur v2 | Ce qu'il retient |
+|---|---|---|---|
+| Boutique Bellecour | 26 % | 0,6 % | sol-air (vitrine), fermeture du lundi |
+| Atelier central, gaz | 35 % | 10 % | inertie 1 jour, samedi et dimanche distincts |
+| Clinique, gaz | 30 % | 19 % | inertie 3 jours, sol-air |
+| Bureaux Part-Dieu | 17 % | 14 % | inertie 2 jours, sol-air, vendredi distinct |
+| Entrepôt Genas | 7 % | 6 % | inertie 1 jour |
+
+L'électricité de la clinique reste à ~19 % : l'anomalie récurrente du groupe froid (week-ends) est
+imprévisible par nature, et c'est au détecteur de dérives de la signaler. Les tests
+`tests/test_forecasting.py` vérifient sur des données synthétiques que le moteur retrouve l'inertie, l'effet
+solaire, les classes de fonctionnement ou une régulation en tout ou rien.
+
+Le détecteur « écart climatique » des dérives utilise lui aussi les classes de fonctionnement apprises : un
+samedi de production n'est plus comparé à un dimanche de fermeture (avant : +61 % et une fausse alerte chaque
+samedi à l'atelier).
+
+Rayonnement solaire : Open-Meteo (`shortwave_radiation_sum`) en production, valeurs simulées en démonstration.
 
 ## Principe 2 : un graphe physique des équipements
 
@@ -307,9 +375,15 @@ Toutes sont dans `backend/app/config.py`, surchargeables par variable d'environn
     et le front React) mais s'affichent « À valider / Validée / Écartée ». Le responsable énergie est un
     compte client avec l'attribut `is_energy_manager`, et non un nouveau rôle : toutes les règles
     d'isolation restent inchangées. Les simples comptes client ne sont plus notifiés à la détection, mais à
-    la validation. Recommandations et prévisions sont des règles d'expert et une régression, sans
-    apprentissage automatique ; les DJU « normaux » des prévisions sont des normales simplifiées, à remplacer
-    par des normales de station météo en production. Le front React n'affiche pas encore ces nouveautés.
+    la validation. Les recommandations sont des règles d'expert ; les prévisions, un moteur de modèles
+    explicables sélectionnés par validation (voir « Moteur de prévision »). La météo « normale » des
+    prévisions (température, rayonnement) est simplifiée, à remplacer par des normales de station météo en
+    production. Le front React n'affiche pas encore ces nouveautés.
 12. **Principe 2 (graphe physique)** : les relations sont limitées à un même site ; une chaufferie commune à
     plusieurs bâtiments se modélise comme un site avec plusieurs zones. La correspondance entre équipement
     et usages (`RELEVANT_USAGES`) est une table d'expert, à compléter si de nouvelles catégories apparaissent.
+13. **Moteur de prévision v2** (migration `0005_prediction_models`) : les classes de fonctionnement sont
+    apprises sur tout l'historique avant la validation (choix structurel, peu sensible) ; les jours
+    comportant une anomalie restent dans l'apprentissage (les exclure serait une amélioration ultérieure) ;
+    le détecteur « écart climatique » garde sa régression N-1 sur les DJU du jour, mais par classe de
+    fonctionnement apprise (sans inertie ni sol-air : une alerte doit rester simple à vérifier).

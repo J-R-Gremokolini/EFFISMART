@@ -256,6 +256,7 @@ def prediction_payload(db: Session, prediction: Prediction) -> dict:
         "fluid": prediction.fluid.value, "year": prediction.year, "data_as_of": prediction.data_as_of.isoformat(),
         "measured_kwh": prediction.measured_kwh, "predicted_kwh": prediction.predicted_kwh,
         "low_kwh": prediction.low_kwh, "high_kwh": prediction.high_kwh, "reference_kwh": prediction.reference_kwh,
+        "models_compared": prediction.model_comparison or [],
         "status": prediction.status.value,
         "validated_by_role": validator_role(db.get(User, prediction.reviewed_by) if prediction.reviewed_by else None),
         "validated_at": prediction.reviewed_at.isoformat() if prediction.reviewed_at else None,

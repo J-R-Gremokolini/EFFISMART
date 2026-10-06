@@ -745,6 +745,27 @@ def prediction_chart(prediction: Prediction) -> None:
     st.caption("Barres : mesuré puis projeté, par mois ; pointillés : même mois de l'année précédente.")
 
 
+def model_table(prediction: Prediction) -> None:
+    """Modèles mis en concurrence pour cette prévision, avec leur erreur sur des périodes non apprises."""
+    rows = prediction.model_comparison or []
+    if not rows:
+        return
+    def variant(row: dict) -> str:
+        details = row["config"].removeprefix(row["label"]).lstrip(", ")
+        return f"<span class='sub'>{ui.e(details)}</span>" if details else ""
+
+    ui.table(
+        ["Modèle testé", "Erreur journalière", "Écart max. sur 2 mois", ""],
+        [[f"{ui.e(r['label'])}{variant(r)}",
+          ui.e(fmt_pct(r["cv_rmse"] * 100).lstrip("+")), ui.e(fmt_pct(r["max_block_error"] * 100).lstrip("+")),
+          ui.status("Retenu", "success") if r["chosen"] else ""] for r in rows],
+        numeric={1, 2},
+    )
+    st.caption("Chaque modèle est testé sur des périodes de deux mois qu'il n'a pas apprises (validation hors "
+               "échantillon). À 2 % près, le plus simple l'emporte. Méthodes : Catalina et al. (2009), "
+               "Paudel (2016).")
+
+
 def output_card(db: Session, repo: TenantRepository, user: User, kind: str, output, key: str) -> None:
     """Carte d'une sortie de la plateforme : quoi, pourquoi (raisonnement), combien (gain), avec quelle confiance."""
     with st.container(border=True):
@@ -802,6 +823,7 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
             )
             if kind == "prediction":
                 prediction_chart(output)
+                model_table(output)
             explanation_block(output)
         with actions:
             review_actions(db, repo, user, kind, output, key)
@@ -928,8 +950,9 @@ def page_recommendations(db: Session, repo: TenantRepository, user: User, org: O
 
 def page_predictions(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     ui.page_header(org.name, "Prévisions de consommation",
-                   "Projection de l'année en cours par site et par énergie (signature énergétique × météo normale). "
-                   "Chaque projection est expliquée et doit être validée avant d'être montrée au client.")
+                   "Projection de l'année en cours par site et par énergie. Plusieurs modèles (signature linéaire, "
+                   "ordre 2, jours pertinents ; inertie, apports solaires) sont testés sur des périodes non apprises "
+                   "et le meilleur est retenu. Chaque projection doit être validée avant d'être montrée au client.")
     if can_write(user) and st.button("Recalculer les projections", icon=":material/refresh:",
                                      help="Nouvelle projection avec les dernières données, proposée à la validation"):
         with st.spinner("Calcul des projections…"):

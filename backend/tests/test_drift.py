@@ -96,6 +96,22 @@ def test_overconsumption_raises_climate_deviation_drift(db, dp):
     )
 
 
+def test_saturday_production_is_not_compared_with_closed_sunday(db, world):
+    """Atelier de démonstration : production gaz le samedi, fermé le dimanche. Le détecteur compare le samedi
+    aux samedis (classe déduite des données), et non à un « week-end » moyen : pas de fausse alerte."""
+    _use_mock([])
+    atelier = DeliveryPoint(site_id=world.site_a.id, fluid=Fluid.GAS, external_ref="21000000000007",
+                            provider=ProviderKind.MOCK)
+    db.add(atelier)
+    db.flush()
+    db.add(Consent(delivery_point_id=atelier.id, granted_at=utcnow() - timedelta(days=1), scope="t", proof_ref="t"))
+    db.commit()
+    ingest_delivery_point(db, atelier, date(2024, 4, 1), date(2025, 6, 20))
+    saturday = date(2025, 6, 14)
+    drifts = run_detection(db, saturday, delivery_point_ids=[atelier.id])
+    assert DriftKind.CLIMATE_DEVIATION not in _kinds(drifts)
+
+
 def test_detection_is_idempotent_and_notifies_validators_only(db, dp, world):
     """Principe P1 : une anomalie non validée n'est signalée qu'à ceux qui peuvent la valider."""
     manager = User(email="energie-a@test.fr", password_hash="x", role=Role.CLIENT_VIEWER,

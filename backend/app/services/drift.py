@@ -31,6 +31,7 @@ from app.models import (
 from app.providers.registry import get_energy_provider
 from app.providers.weather import WeatherProvider, WeatherUnavailableError
 from app.services.consent import active_consent_clause
+from app.services.forecasting import learn_operation_classes
 from app.timeutils import local_day_bounds, to_local
 
 logger = logging.getLogger(__name__)
@@ -167,18 +168,23 @@ def detect_climate_deviation(
 ) -> DriftCandidate | None:
     """Compare la conso du jour à l'attendu issu de N-1 corrigé des DJU.
 
-    Sur une fenêtre de ±W jours autour de J-364 (même jour de semaine), on ajuste
-    par moindres carrés conso = a + b × DJU sur les jours de même type (ouvré /
-    week-end), puis attendu = a + b × DJU(jour).
+    Sur une fenêtre de ±W jours autour de J-364, on ajuste par moindres carrés
+    conso = a + b × DJU sur les jours de la même classe de fonctionnement que le
+    jour analysé, puis attendu = a + b × DJU(jour). Les classes (jours de la
+    semaine qui se ressemblent) sont déduites des données (Paudel, 2016) : un
+    samedi de production n'est pas comparé à un dimanche de fermeture. Si la
+    classe compte trop peu de jours dans la fenêtre, celle-ci est doublée.
     """
     actual = daily_kwh(db, dp.id, day, day).get(day)
     if actual is None:
         return None
     window = settings.climate_regression_window_days
     center = day - timedelta(days=364)
-    history = daily_kwh(db, dp.id, center - timedelta(days=window), center + timedelta(days=window))
+    history = daily_kwh(db, dp.id, center - timedelta(days=2 * window), center + timedelta(days=2 * window))
     if not history:
         return None
+    recent = daily_kwh(db, dp.id, day - timedelta(days=56), day - timedelta(days=1))
+    classes = learn_operation_classes({**history, **recent}, min_class_days=8)
     try:
         dju = weather.daily_dju(min(history), max(max(history), day))
     except WeatherUnavailableError:
@@ -186,10 +192,14 @@ def detect_climate_deviation(
         return None
     if day not in dju:
         return None
-    is_weekend = day.weekday() >= 5
-    points = [(dju[d], kwh) for d, kwh in history.items()
-              if d in dju and (d.weekday() >= 5) == is_weekend]
-    if len(points) < 8:
+    day_class = classes.of(day)
+    for span in (window, 2 * window):
+        points = [(dju[d], kwh) for d, kwh in history.items()
+                  if d in dju and abs((d - center).days) <= span and classes.of(d) == day_class]
+        if len(points) >= 8:
+            window = span
+            break
+    else:
         return None
 
     xs = [x for x, _ in points]
@@ -211,7 +221,7 @@ def detect_climate_deviation(
         f"(N-1 corrigé des DJU : {dju[day]:.1f} DJU ce jour)".replace(".", ","),
         facts={
             "n_points": len(points), "slope": slope, "dju": dju[day], "window": window,
-            "center": center.isoformat(), "day_type": "week-end" if is_weekend else "ouvré",
+            "center": center.isoformat(), "day_class": classes.label_of(day), "classes_learned": classes.learned,
             "r2": 1 - sum(r * r for r in residuals) / ss_tot if ss_tot > 0 and slope > 0 else None,
             "residual_cv": (statistics.fmean(r * r for r in residuals) ** 0.5) / mean_y if mean_y > 0 else None,
             "tolerance": settings.climate_deviation_tolerance, "excess_kwh": actual - expected,

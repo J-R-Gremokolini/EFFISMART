@@ -1,12 +1,14 @@
 """Prévisions (principe P1) : projection de la consommation de l'année civile, par site et par énergie.
 
-Méthode — signature énergétique, courante en audit énergétique :
-1. sur les 365 derniers jours, conso journalière = a + b × DJU, ajustée séparément pour les jours
-   ouvrés et le week-end (b ≥ 0 : le chauffage ne baisse pas quand il fait plus froid) ;
+Méthode (v2, voir `app/services/forecasting.py` et ses références) :
+1. sur les 365 derniers jours, plusieurs modèles de consommation journalière sont mis en concurrence
+   (signature linéaire v1, signature d'ordre 2, jours pertinents ; avec ou sans inertie et sol-air,
+   classes de fonctionnement déduites des données) et validés hors échantillon ; le meilleur est retenu,
+   le plus simple à précision équivalente ;
 2. du 1er janvier à la dernière donnée : consommation mesurée ;
-3. reste de l'année : a + b × DJU normaux ;
-4. intervalle : dispersion journalière du modèle (1,96 σ √n) + 10 % de la part climatique projetée
-   + 5 % du reste de l'année (changements d'usage que l'historique ne peut pas prévoir).
+3. reste de l'année : le modèle retenu, alimenté par la météo normale ;
+4. intervalle : erreur de validation (au plus forte sur une période de deux mois, plancher 3 %) et
+   sensibilité au climat (normales ± 1,5 °C), combinées quadratiquement.
 
 Une prévision est *proposée* : seul un humain la valide, et le client ne la voit qu'une fois validée.
 Elle est recalculée au plus une fois par mois (ou à la demande de l'auditeur) ; une projection plus
@@ -16,15 +18,21 @@ from __future__ import annotations
 
 import logging
 import math
-import statistics
-from dataclasses import dataclass
 from datetime import date, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import DeliveryPoint, Fluid, Prediction, PredictionKind, ReviewStatus, Site
-from app.providers.weather import NORMALS_SOURCE, WeatherProvider, WeatherUnavailableError, normal_dju
+from app.providers.weather import (
+    NORMALS_SOURCE,
+    WeatherProvider,
+    WeatherUnavailableError,
+    normal_mean_temperature,
+    normal_solar,
+)
+from app.services import forecasting
 from app.services.consent import has_active_consent
 from app.services.dashboard import data_as_of
 from app.services.drift import daily_kwh
@@ -33,37 +41,13 @@ from app.timeutils import daterange
 
 logger = logging.getLogger(__name__)
 
-ALGORITHM = "Projection annuelle v1 (signature énergétique ouvrés / week-end × DJU normaux)"
+ALGORITHM = ("Projection annuelle v2 (classes de fonctionnement, inertie, sol-air, jours pertinents ; "
+             "sélection par validation hors échantillon)")
 FIT_DAYS = 365
 MIN_FIT_DAYS = 60
-CLIMATE_UNCERTAINTY = 0.10
-USAGE_UNCERTAINTY = 0.05  # occupation, horaires, équipements : non prévisibles par la signature
+CLIMATE_SHIFT = 1.5  # °C : écart plausible d'une saison à la normale
+MIN_MODEL_ERROR = 0.03  # changements d'usage que l'historique ne peut pas révéler
 FLUID_LABELS = {Fluid.ELEC: "électricité", Fluid.GAS: "gaz"}
-
-
-@dataclass(frozen=True)
-class Signature:
-    intercept: float
-    slope: float
-    sigma: float
-    n: int
-
-    def predict(self, dju: float) -> float:
-        return max(0.0, self.intercept + self.slope * dju)
-
-
-def fit_signature(points: list[tuple[float, float]]) -> Signature | None:
-    """Moindres carrés conso = a + b × DJU, avec b ≥ 0 (moyenne seule si les DJU varient trop peu)."""
-    if len(points) < 5:
-        return None
-    xs, ys = [x for x, _ in points], [y for _, y in points]
-    mean_x, mean_y = statistics.fmean(xs), statistics.fmean(ys)
-    var_x = sum((x - mean_x) ** 2 for x in xs)
-    slope = max(0.0, sum((x - mean_x) * (y - mean_y) for x, y in points) / var_x) if var_x >= 1.0 else 0.0
-    intercept = mean_y - slope * mean_x
-    residuals = [y - (intercept + slope * x) for x, y in points]
-    sigma = math.sqrt(sum(r * r for r in residuals) / max(1, len(points) - 2))
-    return Signature(intercept, slope, sigma, len(points))
 
 
 def _site_daily(db: Session, points: list[DeliveryPoint], start: date, end: date) -> dict[date, float]:
@@ -71,6 +55,10 @@ def _site_daily(db: Session, points: list[DeliveryPoint], start: date, end: date
     series = [daily_kwh(db, dp.id, start, end) for dp in points]
     days = set(series[0]).intersection(*series[1:]) if series else set()
     return {day: sum(s[day] for s in series) for day in days}
+
+
+def _pct(value: float, digits: int = 1) -> str:
+    return f"{fr(value * 100, digits)} %"
 
 
 def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], as_of: date,
@@ -83,26 +71,25 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
     fit = {d: v for d, v in history.items() if d >= fit_start}
     if len(fit) < MIN_FIT_DAYS:
         return None
+    weather_start = min(fit_start, jan1) - timedelta(days=max(forecasting.INERTIA_CHOICES))
     try:
-        dju = weather.daily_dju(min(fit_start, jan1), as_of)
+        temperature = weather.daily_temperature(weather_start, as_of)
+        solar = weather.daily_solar(weather_start, as_of)
     except WeatherUnavailableError:
         logger.warning("Météo indisponible : projection %s ignorée pour le site #%s", year, site.id)
         return None
-    workdays = fit_signature([(dju[d], v) for d, v in fit.items() if d in dju and d.weekday() < 5])
-    weekends = fit_signature([(dju[d], v) for d, v in fit.items() if d in dju and d.weekday() >= 5])
-    if workdays is None or weekends is None:
+    remaining = list(daterange(as_of + timedelta(days=1), dec31)) if as_of < dec31 else []
+    # Passé : météo observée (normale si un jour manque) ; avenir : météo normale.
+    climate = forecasting.Climate(
+        {d: temperature.get(d, normal_mean_temperature(d)) for d in daterange(weather_start, dec31)},
+        {d: solar.get(d, normal_solar(d)) for d in daterange(weather_start, dec31)} if solar else {},
+    )
+    forecast = forecasting.build_forecast(fit, climate, base=settings.dju_base_temperature,
+                                          cooling=fluid == Fluid.ELEC)
+    if forecast is None:
         return None
 
-    def model(day: date, degree_days: float) -> float:
-        return (workdays if day.weekday() < 5 else weekends).predict(degree_days)
-
-    # Qualité du modèle sur l'historique (R²).
-    fitted = [(v, model(d, dju[d])) for d, v in fit.items() if d in dju]
-    mean_actual = statistics.fmean(v for v, _ in fitted)
-    ss_tot = sum((v - mean_actual) ** 2 for v, _ in fitted)
-    r2 = 1 - sum((v - p) ** 2 for v, p in fitted) / ss_tot if ss_tot > 0 else 0.0
-
-    # Année en cours : mesuré, jours manquants reconstitués, reste projeté aux DJU normaux.
+    # Année en cours : mesuré, jours manquants reconstitués, reste projeté aux normales.
     monthly: dict[int, dict[str, float]] = {m: {"measured": 0.0, "predicted": 0.0} for m in range(1, 13)}
     measured = reconstituted_kwh = 0.0
     reconstituted_days = 0
@@ -111,24 +98,24 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
             measured += history[day]
             monthly[day.month]["measured"] += history[day]
         else:
-            value = model(day, dju.get(day, normal_dju(day)))
+            value = forecast.predict(day, climate) or 0.0
             reconstituted_kwh += value
             reconstituted_days += 1
             monthly[day.month]["predicted"] += value
-    rest = climate_part = variance = 0.0
-    rest_dju = 0.0
-    remaining = list(daterange(as_of + timedelta(days=1), dec31)) if as_of < dec31 else []
+    rest = 0.0
     for day in remaining:
-        degree_days = normal_dju(day)
-        signature = workdays if day.weekday() < 5 else weekends
-        value = signature.predict(degree_days)
+        value = forecast.predict(day, climate) or 0.0
         rest += value
-        rest_dju += degree_days
-        climate_part += signature.slope * degree_days
-        variance += signature.sigma ** 2
         monthly[day.month]["predicted"] += value
     predicted = measured + reconstituted_kwh + rest
-    margin = 1.96 * math.sqrt(variance) + CLIMATE_UNCERTAINTY * climate_part + USAGE_UNCERTAINTY * rest
+
+    # Intervalle : erreur du modèle (validation) et sensibilité au climat, indépendantes.
+    climate_margin = 0.0
+    for delta in (-CLIMATE_SHIFT, CLIMATE_SHIFT):
+        shifted = climate.shifted(remaining, delta)
+        climate_margin = max(climate_margin, abs(sum(forecast.predict(d, shifted) or 0.0 for d in remaining) - rest))
+    model_error = max(forecast.chosen.max_block_error, MIN_MODEL_ERROR)
+    margin = math.hypot(model_error * rest, climate_margin)
 
     previous = _site_daily(db, points, date(year - 1, 1, 1), date(year - 1, 12, 31))
     reference = sum(previous.values()) if len(previous) >= 360 else None
@@ -136,22 +123,52 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
     for day, value in previous.items():
         reference_monthly[day.month] += value
 
+    chosen = forecast.chosen
+    config = chosen.config
     a = Assessment(algorithm=ALGORITHM)
-    label = FLUID_LABELS[fluid]
-    a.step(f"Données : consommation journalière d'{label} du site {site.name} ({len(points)} compteur(s)), "
-           f"{len(fit)} jours sur les {FIT_DAYS} derniers, jusqu'au {as_of:%d/%m/%Y}.")
-    a.step(f"Modèle : signature énergétique conso = a + b × DJU. Jours ouvrés : a = {fr(workdays.intercept)} kWh, "
-           f"b = {fr(workdays.slope, 1)} kWh par DJU ; week-end : a = {fr(weekends.intercept)} kWh, "
-           f"b = {fr(weekends.slope, 1)} kWh par DJU. R² = {fr(r2, 2)} sur l'historique.")
+    a.step(f"Données : consommation journalière d'{FLUID_LABELS[fluid]} du site {site.name} "
+           f"({len(points)} compteur(s)), {len(fit)} jours sur les {FIT_DAYS} derniers, jusqu'au {as_of:%d/%m/%Y}.")
+    if forecast.classes.learned:
+        a.step(f"Classes de fonctionnement déduites des données (Paudel, 2016) : {forecast.classes.describe()}.")
+    else:
+        a.step("Classes de fonctionnement : jours ouvrés et week-end (historique trop court pour les déduire).")
+    a.step(f"Validation hors échantillon (Catalina et al., 2009) : {forecast.validation_blocks} périodes "
+           f"d'environ {forecast.block_days} jours, chacune retirée de l'apprentissage puis prédite. Meilleure erreur "
+           "journalière (CV(RMSE)) par famille : "
+           + " ; ".join(f"{forecasting.FAMILY_LABELS[family]} {_pct(e.cv_rmse)}"
+                        for family, e in sorted(forecast.by_family.items(),
+                                                key=lambda item: forecasting.FAMILY_RANK[item[0]])) + ".")
+    best = min(e.cv_rmse for e in forecast.by_family.values())
+    simpler = " Les variantes plus complexes n'améliorent pas la prévision de plus de 2 % : le modèle le plus " \
+              "simple est conservé." if chosen.cv_rmse > best else ""
+    a.step(f"Modèle retenu : {config.describe()}. Erreur journalière {_pct(chosen.cv_rmse)} ; écart sur le total "
+           f"d'une période : {_pct(chosen.mean_block_error)} en moyenne, {_pct(chosen.max_block_error)} au plus."
+           + simpler)
+    if config.family != "v1":
+        if config.inertia:
+            a.step(f"Inertie : la consommation répond à la température moyenne des {config.inertia + 1} derniers jours "
+                   "(Paudel, 2016 : 1 à 2 jours pour un bâtiment conventionnel, 3 pour un bâtiment basse "
+                   "consommation).")
+        else:
+            a.step("Inertie : tenir compte des jours précédents n'améliore pas la prévision ; la consommation suit "
+                   "la température du jour.")
+    if not forecast.solar_available:
+        a.step("Apports solaires : rayonnement indisponible pour cet historique ; température sol-air non testée.")
+    elif config.solar:
+        a.step("Apports solaires : la température sol-air (température + 0,6 × rayonnement / 23, Catalina et al., "
+               "2009) améliore la prévision ; elle est retenue.")
+    else:
+        a.step("Apports solaires : la température sol-air a été testée sans améliorer la prévision ; non retenue.")
     a.step(f"Consommé du 1er janvier au {as_of:%d/%m/%Y} : {fr(measured)} kWh mesurés"
            + (f", plus {fr(reconstituted_kwh)} kWh reconstitués pour {reconstituted_days} jour(s) sans donnée."
               if reconstituted_days else "."))
     if remaining:
-        a.step(f"Reste de l'année ({len(remaining)} jours) : {fr(rest)} kWh projetés avec les DJU normaux "
-               f"({fr(rest_dju)} DJU ; {NORMALS_SOURCE}).")
+        a.step(f"Reste de l'année ({len(remaining)} jours) : {fr(rest)} kWh projetés avec la météo normale "
+               f"({NORMALS_SOURCE}).")
     a.step(f"Projection {year} : {fr(predicted)} kWh, intervalle {fr(max(0.0, predicted - margin))} – "
-           f"{fr(predicted + margin)} kWh (dispersion journalière du modèle, ± 10 % sur la part liée au climat, "
-           "± 5 % sur le reste de l'année pour les changements d'usage).")
+           f"{fr(predicted + margin)} kWh : erreur du modèle ({_pct(model_error)} du reste de l'année, au plus forte "
+           f"en validation, plancher 3 %) et sensibilité au climat (normales ± {fr(CLIMATE_SHIFT, 1)} °C : "
+           f"± {fr(climate_margin)} kWh), combinées quadratiquement.")
     if reference is not None:
         a.step(f"Comparaison : {year - 1} = {fr(reference)} kWh, soit {fr_pct((predicted - reference) / reference * 100)} "
                "(écart brut, non corrigé du climat).")
@@ -159,12 +176,18 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
         a.step(f"Comparaison : année {year - 1} incomplète, pas de référence.")
     a.step("Statut : proposition de la plateforme, à valider avant d'être montrée au client ou utilisée dans un rapport.")
 
-    if r2 >= 0.8:
-        a.factor(f"Le modèle explique bien la consommation passée (R² {fr(r2, 2)})", 0.1)
-    elif r2 >= 0.5:
-        a.factor(f"Le modèle explique correctement la consommation passée (R² {fr(r2, 2)})", 0.05)
+    if chosen.cv_rmse <= 0.10:
+        a.factor(f"Erreur de validation faible ({_pct(chosen.cv_rmse)} par jour, sur des périodes non apprises)", 0.15)
+    elif chosen.cv_rmse <= 0.20:
+        a.factor(f"Erreur de validation modérée ({_pct(chosen.cv_rmse)} par jour)", 0.05)
+    elif chosen.cv_rmse <= 0.30:
+        a.factor(f"Erreur de validation notable ({_pct(chosen.cv_rmse)} par jour)", -0.05)
     else:
-        a.factor(f"Consommation passée mal expliquée par le modèle (R² {fr(r2, 2)})", -0.1)
+        a.factor(f"Erreur de validation élevée ({_pct(chosen.cv_rmse)} par jour)", -0.15)
+    if chosen.max_block_error <= 0.05:
+        a.factor(f"Écart maximal sur le total d'une période : {_pct(chosen.max_block_error)} (≤ 5 %)", 0.05)
+    elif chosen.max_block_error > 0.15:
+        a.factor(f"Écart maximal sur le total d'une période : {_pct(chosen.max_block_error)}", -0.1)
     share = (as_of - jan1).days / ((dec31 - jan1).days + 1)
     if share >= 0.75:
         a.factor(f"{fr(share * 100)} % de l'année déjà mesurés", 0.15)
@@ -180,7 +203,7 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
     if reconstituted_days:
         a.factor(f"{reconstituted_days} jour(s) sans donnée depuis le 1er janvier, reconstitués par le modèle", -0.05)
     if remaining:
-        a.factor("DJU normaux simplifiés, non spécifiques au site", -0.05)
+        a.factor("Météo normale simplifiée, non spécifique au site", -0.05)
     if str(getattr(weather, "source", "")).startswith("MOCK"):
         a.factor("Historique météo simulé (démonstration)", -0.05)
 
@@ -202,6 +225,15 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
                   "predicted": round(v["predicted"], 1),
                   "reference": round(reference_monthly[m], 1) if reference is not None else None}
                  for m, v in monthly.items()],
+        # Pour la famille retenue, la variante retenue ; pour les autres, leur meilleure variante.
+        model_comparison=[
+            {"family": family, "label": forecasting.FAMILY_LABELS[family], "config": e.config.describe(),
+             "cv_rmse": round(e.cv_rmse, 4), "max_block_error": round(e.max_block_error, 4),
+             "chosen": e is chosen}
+            for family, e in sorted(((f, chosen if f == config.family else best_of_family)
+                                     for f, best_of_family in forecast.by_family.items()),
+                                    key=lambda item: forecasting.FAMILY_RANK[item[0]])
+        ],
     )
     apply_assessment(db, prediction, a, fluid, as_of)
     return prediction

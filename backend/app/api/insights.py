@@ -29,7 +29,8 @@ def prediction_out(db: Session, prediction: Prediction) -> PredictionOut:
         site_name=prediction.site.name, fluid=prediction.fluid, kind=prediction.kind, year=prediction.year,
         data_as_of=prediction.data_as_of, measured_kwh=prediction.measured_kwh,
         predicted_kwh=prediction.predicted_kwh, low_kwh=prediction.low_kwh, high_kwh=prediction.high_kwh,
-        reference_kwh=prediction.reference_kwh, monthly=prediction.monthly or [], status=prediction.status,
+        reference_kwh=prediction.reference_kwh, monthly=prediction.monthly or [],
+        model_comparison=prediction.model_comparison or [], status=prediction.status,
         review_comment=prediction.review_comment, created_at=prediction.created_at,
         **explanation_fields(db, prediction, prediction.reviewed_by, prediction.reviewed_at),
     )
