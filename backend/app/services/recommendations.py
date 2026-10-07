@@ -5,9 +5,10 @@ Elle est proposée avec son raisonnement, son gain estimé et son niveau de conf
 écartée ou déclarée appliquée par l'auditeur ou le responsable énergie. La plateforme n'agit jamais
 sur les équipements.
 
-Règles d'expert, sans apprentissage automatique :
-- talon anormal → arrêt ou ralenti hors occupation de l'équipement dont la puissance correspond à l'excès,
-  en écartant ceux qui desservent uniquement des zones occupées 24 h/24 ;
+Règles d'expert, sans apprentissage automatique, partagées avec la contextualisation des anomalies (F2b) :
+l'équipement visé est l'équipement suspect désigné par le contexte de l'anomalie.
+- talon de nuit ou consommation en inoccupation → arrêt ou ralenti hors occupation de l'équipement dont la
+  puissance correspond à l'excès, en écartant ceux qui desservent uniquement des zones occupées 24 h/24 ;
 - écart climatique (ou seuil journalier de gaz) → contrôle de la régulation du générateur qui alimente les zones ;
 - dépassement de puissance → délestage ou décalage de l'équipement capable d'expliquer le pic ;
 - graphe incomplet → identifier l'équipement en cause (confiance faible).
@@ -16,13 +17,10 @@ from __future__ import annotations
 
 import logging
 import re
-import statistics
-from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.models import (
     AssetNode,
     AssetNodeKind,
@@ -36,7 +34,15 @@ from app.models import (
     User,
 )
 from app.services import assets
-from app.services.drift import DRIFT_LABELS
+from app.services.anomaly_context import (
+    heating_season,
+    peak_candidates,
+    rank_by_power,
+    schedule_candidates,
+    season_dju,
+    usual_peak,
+)
+from app.services.drift import DRIFT_LABELS, night_period, off_hours_period
 from app.services.validation import Assessment, apply_assessment, fr, fr_kw, notify, validator_label
 
 logger = logging.getLogger(__name__)
@@ -51,13 +57,6 @@ KIND_LABELS = {
 }
 
 
-def _power_share(power_kw: float | None, excess_kw: float) -> float | None:
-    """Part de l'excès que la puissance nominale de l'équipement peut expliquer (1 = correspondance parfaite)."""
-    if not power_kw or excess_kw <= 0:
-        return None
-    return min(power_kw, excess_kw) / max(power_kw, excess_kw)
-
-
 def _names(nodes: list[AssetNode]) -> str:
     return ", ".join(n.name for n in nodes) if nodes else "non renseignées"
 
@@ -69,19 +68,7 @@ def _chains(a: Assessment, graph: assets.SiteGraph, node: AssetNode) -> None:
 
 
 def _off_hours(drift: Drift) -> str:
-    night = f"la nuit ({settings.inactive_night_start_hour} h – {settings.inactive_night_end_hour} h)"
-    return "le week-end" if drift.day.weekday() >= 5 else night
-
-
-def _season(db: Session, drift: Drift) -> float | None:
-    """DJU du jour de l'anomalie (None si la météo est indisponible)."""
-    from app.services import integrations
-
-    try:
-        return integrations.weather_provider(db).daily_dju(drift.day, drift.day).get(drift.day)
-    except Exception:  # météo indisponible : on raisonne sans la saison
-        logger.warning("DJU indisponibles pour la recommandation de la dérive #%s", drift.id)
-        return None
+    return off_hours_period(drift.day) if drift.kind == DriftKind.OFF_HOURS else night_period()
 
 
 def _investigate(a: Assessment, drift: Drift, reason: str, when: str) -> tuple:
@@ -100,8 +87,7 @@ def _investigate(a: Assessment, drift: Drift, reason: str, when: str) -> tuple:
 
 def _match_power(a: Assessment, candidates: list[AssetNode], target_kw: float, what: str) -> tuple[AssetNode, float | None]:
     """Équipement dont la puissance nominale correspond le mieux à `target_kw`, avec l'explication du choix."""
-    scored = sorted(((eq, _power_share(eq.power_kw, target_kw)) for eq in candidates),
-                    key=lambda c: c[1] if c[1] is not None else 0.3, reverse=True)
+    scored = rank_by_power(candidates, target_kw)
     best, share = scored[0]
     if share is None:
         a.factor("Puissance nominale de l'équipement inconnue : correspondance non vérifiable", -0.1)
@@ -129,18 +115,10 @@ def _list_consumers(a: Assessment, consumers: list[AssetNode]) -> None:
 def _baseload_rule(a: Assessment, graph: assets.SiteGraph, drift: Drift, consumers: list[AssetNode]) -> tuple:
     excess_kw = drift.measured_value - drift.reference_value
     when = _off_hours(drift)
-    a.step(f"Excès mesuré {when} : {fr(excess_kw)} kW au-dessus du talon habituel.")
+    a.step(f"Excès mesuré {when} : {fr(excess_kw)} kW au-dessus du niveau attendu.")
     if not consumers:
         return _investigate(a, drift, "aucun équipement n'est relié à ce compteur.", when)
-    candidates, excluded = [], []
-    for eq in consumers:
-        zones = graph.downstream(eq.id, AssetNodeKind.ZONE)
-        if not assets.category(eq).off_hours_ok:
-            excluded.append(f"{eq.name} (fonctionnement continu attendu)")
-        elif zones and all(z.always_occupied for z in zones):
-            excluded.append(f"{eq.name} (dessert uniquement des zones occupées 24 h/24 : {_names(zones)})")
-        else:
-            candidates.append(eq)
+    candidates, excluded = schedule_candidates(graph, consumers)
     _list_consumers(a, consumers)
     if excluded:
         a.step("Écartés d'après le graphe : " + " ; ".join(excluded) + ".")
@@ -155,8 +133,8 @@ def _baseload_rule(a: Assessment, graph: assets.SiteGraph, drift: Drift, consume
     return (
         RecommendationKind.SCHEDULE_OFF_HOURS, best,
         f"Arrêter « {best.name} » hors occupation ({drift.delivery_point.site.name})",
-        f"Programmer l'arrêt ou le ralenti de « {best.name} » la nuit ({settings.inactive_night_start_hour} h – "
-        f"{settings.inactive_night_end_hour} h) et le week-end, via la GTB ou l'horloge de l'équipement. "
+        f"Programmer l'arrêt ou le ralenti de « {best.name} » {night_period()}, le week-end et hors des horaires "
+        "d'occupation, via la GTB ou l'horloge de l'équipement. "
         f"Avant d'intervenir, vérifier avec l'exploitant qu'aucun usage des zones desservies ({_names(zones)} ; "
         f"usages : {_names(usages)}) ne l'exige en dehors des heures d'occupation.",
         explained,
@@ -165,8 +143,7 @@ def _baseload_rule(a: Assessment, graph: assets.SiteGraph, drift: Drift, consume
 
 def _control_rule(a: Assessment, db: Session, graph: assets.SiteGraph, drift: Drift,
                   consumers: list[AssetNode]) -> tuple:
-    dju = _season(db, drift)
-    heating = dju is None or dju > 1 or drift.delivery_point.fluid == Fluid.GAS
+    heating, dju = heating_season(db, drift)
     if dju is not None:
         a.step(f"Saison : {fr(dju, 1)} DJU ce jour-là, besoin de {'chauffage' if heating else 'refroidissement'}.")
     if not consumers:
@@ -215,27 +192,12 @@ def _control_rule(a: Assessment, db: Session, graph: assets.SiteGraph, drift: Dr
             action, 1.0)
 
 
-def _usual_peak(db: Session, drift: Drift) -> tuple[float | None, int]:
-    """Médiane des pics journaliers des 28 jours précédents, même type de jour (ouvré / week-end)."""
-    from app.services.drift import half_hour_powers
-
-    workday = drift.day.weekday() < 5
-    peaks: dict = {}
-    for t, kw in half_hour_powers(db, drift.delivery_point_id, drift.day - timedelta(days=28),
-                                  drift.day - timedelta(days=1)):
-        if (t.weekday() < 5) == workday:
-            peaks[t.date()] = max(peaks.get(t.date(), 0.0), kw)
-    if len(peaks) < 5:
-        return None, len(peaks)
-    return statistics.median(peaks.values()), len(peaks)
-
-
 def _peak_rule(a: Assessment, db: Session, graph: assets.SiteGraph, drift: Drift, consumers: list[AssetNode]) -> tuple:
     excess_kw = drift.measured_value - drift.reference_value
     match = re.search(r"à (\d{2}:\d{2})", drift.details)
     when = f"vers {match.group(1)}" if match else "au moment du pic"
     a.step(f"Excès au pic : {fr(excess_kw)} kW au-dessus du seuil, {when}.")
-    usual, days = _usual_peak(db, drift)
+    usual, days = usual_peak(db, drift)
     jump = excess_kw
     if usual is not None and drift.measured_value > usual:
         jump = drift.measured_value - usual
@@ -244,14 +206,7 @@ def _peak_rule(a: Assessment, db: Session, graph: assets.SiteGraph, drift: Drift
                "supplémentaires ont été appelés.")
     if not consumers:
         return _investigate(a, drift, "aucun équipement n'est relié à ce compteur.", when)
-    dju = _season(db, drift)
-    candidates, excluded = [], []
-    for eq in consumers:
-        usages = {u.category for u in graph.usages_served(eq.id)}
-        if dju is not None and dju < 1 and usages and usages <= {"HEATING"}:
-            excluded.append(f"{eq.name} (chauffage seul, hors saison : {fr(dju, 1)} DJU)")
-        else:
-            candidates.append(eq)
+    candidates, excluded = peak_candidates(graph, consumers, season_dju(db, drift))
     _list_consumers(a, consumers)
     if excluded:
         a.step("Écartés d'après le graphe : " + " ; ".join(excluded) + ".")
@@ -293,7 +248,7 @@ def propose_for_drift(db: Session, drift: Drift) -> Recommendation | None:
         a.factor(f"Confiance de l'anomalie d'origine ({fr(drift.confidence * 100)} %)",
                  round((drift.confidence - 0.5) / 2, 2))
 
-    if drift.kind == DriftKind.BASELOAD:
+    if drift.kind in (DriftKind.BASELOAD, DriftKind.OFF_HOURS):
         kind, target, title, action, share = _baseload_rule(a, graph, drift, consumers)
     elif drift.kind == DriftKind.THRESHOLD and dp.fluid == Fluid.ELEC:
         kind, target, title, action, share = _peak_rule(a, db, graph, drift, consumers)

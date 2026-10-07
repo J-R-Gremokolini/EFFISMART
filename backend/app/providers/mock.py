@@ -5,7 +5,7 @@ Caractéristiques des données générées (brief §3.2) :
 - creux du week-end : aucune occupation samedi et dimanche ;
 - saisonnalité : besoin de chauffage selon la température (cohérente avec `MockWeatherProvider`) ;
 - talon de nuit : consommation de base permanente ;
-- anomalies injectables (`AnomalySpec`) pour démontrer et tester F2a.
+- anomalies injectables (`AnomalySpec`), une par détecteur F2a, pour démontrer et tester F2.
 
 Les points de démonstration ont en plus une physique de bâtiment réaliste (`DEMO_BEHAVIOURS`) :
 inertie thermique, apports solaires (température sol-air), température d'équilibre propre au bâtiment,
@@ -33,7 +33,8 @@ from app.timeutils import LOCAL_TZ, UTC, daterange, yesterday_local
 
 
 class AnomalyKind(str, enum.Enum):
-    WEEKEND_ON = "WEEKEND_ON"  # équipement resté allumé le week-end → talon anormal
+    WEEKEND_ON = "WEEKEND_ON"  # équipement en marche le week-end de 6 h à 22 h → consommation en inoccupation
+    NIGHT_ON = "NIGHT_ON"  # équipement resté en marche la nuit (22 h – 6 h) → talon de nuit anormal
     POWER_SPIKE = "POWER_SPIKE"  # pic de puissance l'après-midi → dépassement de seuil
     OVERCONSUMPTION = "OVERCONSUMPTION"  # surconsommation en occupation → écart climatique
 
@@ -69,11 +70,13 @@ def ordinal_multiple_of(n: int) -> Callable[[date], bool]:
 # Règles calendaires stables : identiques au seed et aux ingestions quotidiennes.
 DEFAULT_ANOMALIES: list[AnomalySpec] = [
     AnomalySpec("30001000000003", AnomalyKind.WEEKEND_ON, iso_week_multiple_of(3), 0.35,
-                "Groupe froid resté allumé le week-end"),
+                "Groupe froid en marche le week-end (programmation de semaine)"),
     AnomalySpec("30001000000005", AnomalyKind.POWER_SPIKE, ordinal_multiple_of(11), 0.8,
                 "Pic de puissance l'après-midi"),
     AnomalySpec("30001000000006", AnomalyKind.OVERCONSUMPTION, iso_week_multiple_of(7), 0.45,
                 "Consigne de chauffage/climatisation déréglée"),
+    AnomalySpec("30001000000006", AnomalyKind.NIGHT_ON, iso_week_multiple_of(5), 0.12,
+                "Éclairage des bureaux resté allumé la nuit"),
     AnomalySpec("21000000000008", AnomalyKind.OVERCONSUMPTION, iso_week_multiple_of(8), 0.4,
                 "Chaudière mal réglée"),
 ]
@@ -126,6 +129,9 @@ class BuildingBehaviour:
     cooling_ratio: float = 0.0
     weekly: tuple[float, ...] = (1, 1, 1, 1, 1, 1, 1)  # électricité (le week-end reste inoccupé)
     gas_weekly: tuple[float, ...] = (1, 1, 1, 1, 1, 0.6, 0.6)
+    # Équipement resté allumé hors occupation pendant une période (fraction de la pointe), puis corrigé.
+    off_hours_extra_ratio: float = 0.0
+    off_hours_extra_period: tuple[date, date] | None = None
 
     @property
     def weights(self) -> tuple[float, ...]:
@@ -150,10 +156,13 @@ DEMO_BEHAVIOURS: dict[str, BuildingBehaviour] = {
     "21000000000008": BuildingBehaviour(time_constant_h=70, solar_factor=0.5, balance_temperature=17,
                                         curvature=0.03, gas_weekly=(1, 1, 1, 1, 1, 0.9, 0.9)),
     # Entrepôt : bardage métallique (peu d'inertie), chauffé hors gel à 12 °C, réassort du lundi.
+    # Historique « avant / après » : éclairage resté allumé la nuit et le week-end du 3 novembre 2025 au
+    # 5 avril 2026, corrigé le 6 avril (LED et détecteurs de présence ; cf. app/seed.py).
     "30001000000004": BuildingBehaviour(time_constant_h=12, solar_factor=0.2, balance_temperature=12,
                                         weekly=(1.15, 1, 1, 1, 1, 1, 1)),
     "30001000000005": BuildingBehaviour(time_constant_h=12, solar_factor=0.2, balance_temperature=12,
-                                        weekly=(1.15, 1, 1, 1, 1, 1, 1)),
+                                        weekly=(1.15, 1, 1, 1, 1, 1, 1), off_hours_extra_ratio=0.19,
+                                        off_hours_extra_period=(date(2025, 11, 3), date(2026, 4, 5))),
     # Bureaux : façades vitrées, pompe à chaleur réversible, vendredi en télétravail.
     "30001000000006": BuildingBehaviour(time_constant_h=40, solar_factor=0.9, balance_temperature=16,
                                         cooling_threshold=22, cooling_ratio=0.03,
@@ -251,6 +260,9 @@ class MockDataProvider:
         heating_kw_per_dju = profile.peak_kw * profile.heating_share / 15
         cooling_kw_per_degree = profile.peak_kw * b.cooling_ratio
         activity = b.weekly[day.weekday()]
+        period = b.off_hours_extra_period
+        off_hours_extra = (profile.peak_kw * b.off_hours_extra_ratio
+                           if period is not None and period[0] <= day <= period[1] else 0.0)
 
         # Itération en UTC : gère naturellement les jours de 46/50 pas (changement d'heure).
         slot = datetime.combine(day, time.min, tzinfo=LOCAL_TZ).astimezone(UTC)
@@ -258,8 +270,11 @@ class MockDataProvider:
         measurements = []
         while slot < day_end:
             local = slot.astimezone(LOCAL_TZ)
-            occ = occupancy(local) * activity
+            raw_occupancy = occupancy(local)
+            occ = raw_occupancy * activity
             kw = base_kw + usage_kw * occ + heating_kw_per_dju * dju * (0.5 + 0.5 * occ)
+            if off_hours_extra and raw_occupancy == 0:
+                kw += off_hours_extra
             if cooling:
                 kw += cooling_kw_per_degree * cooling * (0.3 + 0.7 * occ)
             kw *= rng.uniform(0.95, 1.05)
@@ -280,7 +295,9 @@ class MockDataProvider:
     def _elec_anomaly_kw(anomaly: AnomalySpec, profile: ElecProfile, local: datetime, occ: float) -> float:
         extra = profile.peak_kw * anomaly.intensity
         if anomaly.kind == AnomalyKind.WEEKEND_ON:
-            return extra if local.weekday() >= 5 else 0.0
+            return extra if local.weekday() >= 5 and 6 <= local.hour < 22 else 0.0
+        if anomaly.kind == AnomalyKind.NIGHT_ON:
+            return extra if local.hour >= 22 or local.hour < 6 else 0.0
         if anomaly.kind == AnomalyKind.POWER_SPIKE:
             return extra if local.weekday() < 5 and 13 <= local.hour < 16 else 0.0
         if anomaly.kind == AnomalyKind.OVERCONSUMPTION:

@@ -16,6 +16,7 @@ from app.local import configure_local_environment
 configure_local_environment()  # avant tout import de app.config
 
 from datetime import date, timedelta  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 import altair as alt  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -30,6 +31,7 @@ from app.local import catch_up, prepare_database  # noqa: E402
 from app.models import (  # noqa: E402
     AssetNodeKind,
     DeadlineStatus,
+    DeclaredSource,
     ConnectorAuth,
     DeliveryPoint,
     DeliveryStatus,
@@ -54,11 +56,13 @@ from app.models import (  # noqa: E402
 )
 from app.repositories import ResourceNotFound, TenantRepository, sees_unvalidated  # noqa: E402
 from app.security import verify_password  # noqa: E402
-from app.services import assets, dashboard, integrations, onboarding, regulatory, validation  # noqa: E402
+from app.services import anomaly_context, assets, dashboard, integrations, onboarding, regulatory, validation  # noqa: E402
 from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
+from app.services import energy_data  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
+from app.services import savings as savings_service  # noqa: E402
 from app.services.consent import ConsentRequiredError, grant_consent, revoke_consent  # noqa: E402
 from app.services.delivery_points import active_consent  # noqa: E402
 from app.services.exports import ExportEngine, build_zip  # noqa: E402
@@ -75,8 +79,11 @@ PERIOD_LABELS = {"7d": "7 jours", "30d": "30 jours", "12m": "12 mois", "custom":
 DRIFT_KIND_LABELS = {
     "THRESHOLD": "Dépassement de seuil",
     "CLIMATE_DEVIATION": "Écart climatique (N-1 / DJU)",
-    "BASELOAD": "Talon anormal",
+    "BASELOAD": "Talon de nuit anormal",
+    "OFF_HOURS": "Consommation en inoccupation",
 }
+# F2b : localisation de l'anomalie dans le graphe des équipements.
+LOCALISATION_TONES = {"precise": "success", "probable": "success", "incertaine": "warning", "absente": "neutral"}
 # Principe P1 : une sortie de la plateforme est « à valider » tant qu'un humain n'a pas décidé.
 DRIFT_STATUS_LABELS = validation.DRIFT_STATUS_LABELS
 DRIFT_STATUS_TONES = {DriftStatus.OPEN: "warning", DriftStatus.QUALIFIED: "success", DriftStatus.IGNORED: "neutral"}
@@ -97,7 +104,8 @@ DEADLINE_STATUS_LABELS = {
 }
 DEADLINE_STATUS_TONES = {DeadlineStatus.UPCOMING: "neutral", DeadlineStatus.DUE_SOON: "warning",
                          DeadlineStatus.DONE: "success"}
-EXPORT_LABELS = {ExportFormat.OPERAT: "OPERAT (Décret Tertiaire)", ExportFormat.VSME: "VSME (ESG)"}
+EXPORT_LABELS = {ExportFormat.OPERAT: "OPERAT (Décret Tertiaire)",
+                 ExportFormat.VSME: "VSME, module B3 : énergie et émissions de GES"}
 EXPORT_STATUS_LABELS = {ExportStatus.PENDING: "En cours", ExportStatus.DONE: "Prêt", ExportStatus.FAILED: "Échec"}
 EXPORT_STATUS_TONES = {ExportStatus.PENDING: "neutral", ExportStatus.DONE: "success", ExportStatus.FAILED: "danger"}
 DOCUMENT_KIND_LABELS = documents_service.KIND_LABELS
@@ -131,7 +139,7 @@ PAGE_RECOMMENDATIONS = "Recommandations"
 PAGE_PREDICTIONS = "Prévisions"
 PAGE_ASSETS = "Équipements"
 PAGE_REGULATORY = "Réglementaire"
-PAGE_EXPORTS = "Exports"
+PAGE_EXPORTS = "Données RSE"
 PAGE_DOCUMENTS = "Documents"
 PAGE_INTEGRATIONS = "Intégrations"
 PAGE_MANAGE = "Patrimoine & consentements"
@@ -385,7 +393,8 @@ def page_portfolio(db: Session, repo: TenantRepository, user: User) -> None:
 
 def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> None:
     ui.page_header(org.name, "Tableau de bord",
-                   "Consommations, coûts et émissions de tous les points de livraison consentis.")
+                   "Consommations, indicateurs de performance, coûts et émissions, et évolution avant / après "
+                   "recommandations.")
     period = st.session_state.get("period", "30d")  # choisie dans la barre du haut
     start = end = None
     if period == "custom":
@@ -403,6 +412,11 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
     data = dashboard.organization_dashboard(db, org, period, start, end)
     data_as_of_banner(data["data_as_of"])
     p_start, p_end = data["period"]["start"], data["period"]["end"]
+    degraded = [p for p in data["delivery_points"] if p["data_level"] == "N0"]
+    if degraded:
+        st.info("Mode dégradé (données N0) pour " + ", ".join(f"{p['site_name']} ({p['external_ref']})" for p in degraded)
+                + " : consommations issues des factures et relevés, réparties au prorata des jours. Ni courbe de "
+                "charge, ni détection d'anomalies, ni prévision journalière sans compteur communicant (N1).")
 
     # Période précédente de même durée, pour les variations des cartes KPI.
     length = (p_end - p_start).days + 1
@@ -411,6 +425,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
     )["totals"]
     totals = data["totals"]
     note = f"vs {length} j préc."
+    total_note = note + (f", dont {fmt_energy(totals['n0_kwh'])} de factures (N0)" if totals["n0_kwh"] else "")
     series = daily_series(db, dashboard.consented_delivery_points(db, org.id), p_start, p_end)
     elec, gas = series[Fluid.ELEC], series[Fluid.GAS]
     total = [a + b for a, b in zip(elec, gas)]
@@ -420,7 +435,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
     co2 = [a * factors.get(Fluid.ELEC, 0) + b * factors.get(Fluid.GAS, 0) for a, b in zip(elec, gas)]
     ui.kpi_grid(
         [
-            {"label": "Consommation totale", "value": fmt_energy(totals["total_kwh"]), "note": note, "icon": "total", "hero": True,
+            {"label": "Consommation totale", "value": fmt_energy(totals["total_kwh"]), "note": total_note, "icon": "total", "hero": True,
              "pct": variation(totals["total_kwh"], previous["total_kwh"]), "spark": total},
             {"label": "Électricité", "value": fmt_energy(totals["elec_kwh"]), "icon": "elec",
              "pct": variation(totals["elec_kwh"], previous["elec_kwh"]), "spark": elec},
@@ -487,10 +502,15 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                     st.caption("Période longue : courbe agrégée au jour (pas 30 min affiché jusqu'à 31 jours).")
             else:
                 st.caption("Aucune mesure sur la période.")
-        if missing:
+        without_data = [p for p in missing if p["data_level"] != "N0"]
+        if degraded:
+            st.caption("Pas de courbe pour " + ", ".join(p["external_ref"] for p in degraded)
+                       + " : seules les factures (N0) sont disponibles.")
+        if without_data:
             st.warning(
                 "Consentement requis, aucune donnée collectée pour : "
-                + ", ".join(f"{p['site_name']} ({p['external_ref']})" for p in missing)
+                + ", ".join(f"{p['site_name']} ({p['external_ref']})" for p in without_data)
+                + ". À défaut, l'auditeur peut saisir les factures (page « Documents »)."
             )
 
     left, right = st.columns([2, 1])
@@ -529,6 +549,9 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
         else:
             st.caption("Aucune donnée.")
 
+    performance_section(db, org, data["data_as_of"] or yesterday_local())
+    savings_section(db, repo, repo.user, org)
+
     if sees_unvalidated(repo.user):
         pending = validation.pending_outputs(repo, org.id)
         st.header(f"À valider ({len(pending)})")
@@ -552,7 +575,9 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                 ui.feed([
                     (fmt_date(d.day),
                      f"{ui.badge(DRIFT_KIND_LABELS[d.kind.value], 'danger')} {ui.e(d.delivery_point.site.name)} : "
-                     f"{ui.e(d.details)} <b>{ui.e(fmt_pct(d.deviation_pct))}</b>")
+                     f"{ui.e(d.details)} <b>{ui.e(fmt_pct(d.deviation_pct))}</b>"
+                     + (f"<div class='es-output-meta'>{ui.e(context)}</div>"
+                        if (context := anomaly_context.short_text(d.context)) else ""))
                     for d in drifts
                 ])
 
@@ -563,6 +588,147 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
             for f in data["emission_factors"]
         )
     )
+
+
+LEVEL_BADGES = {"N1": ("N1 compteurs", "success"), "N0": ("N0 factures", "warning")}
+
+
+def performance_section(db: Session, org: Organization, end: date) -> None:
+    """F1 — indicateurs de performance sur 12 mois glissants, par site."""
+    perf = dashboard.performance(db, org, end)
+    totals = perf["totals"]
+    st.header("Indicateurs de performance (12 derniers mois)")
+    ui.kpi_grid([
+        {"label": "Intensité énergétique", "icon": "total", "note": "sites dont la surface est connue",
+         "value": f"{fmt_number(totals['kwh_m2'])} kWh/m²/an" if totals["kwh_m2"] else "—"},
+        {"label": "Coût annuel estimé", "value": fmt_eur(totals["cost_eur"]), "icon": "cost", "note": "prix indicatifs"},
+        {"label": "Émissions annuelles", "value": fmt_emissions(totals["kgco2e"]), "icon": "co2",
+         "note": "scopes 1 et 2"},
+    ])
+    ui.table(
+        ["Site", "Surface", "Consommation", "kWh/m²/an", "€/m²/an", "kgCO₂e/m²/an", "Données"],
+        [[ui.e(s["name"]), f"{fmt_number(s['surface_m2'])} m²" if s["surface_m2"] else "—", fmt_energy(s["kwh"]),
+          fmt_number(s["kwh_m2"]) if s["kwh_m2"] is not None else "—",
+          fmt_number(s["eur_m2"], 1) if s["eur_m2"] is not None else "—",
+          fmt_number(s["kgco2e_m2"], 1) if s["kgco2e_m2"] is not None else "—",
+          " ".join(ui.badge(*LEVEL_BADGES[level]) for level in s["levels"]) or ui.badge("aucune", "neutral")]
+         for s in perf["sites"]],
+        numeric={1, 2, 3, 4, 5},
+    )
+    st.caption(f"Du {fmt_date(perf['start'])} au {fmt_date(perf['end'])}. Intensité = consommation d'énergie finale "
+               "sur 12 mois rapportée à la surface. N1 : compteurs communicants ; N0 : factures et relevés.")
+
+
+def _savings_view(measurement: dict) -> SimpleNamespace:
+    """Adapte une mesure d'économies au volet « raisonnement, confiance et hypothèses »."""
+    return SimpleNamespace(
+        reasoning=measurement["reasoning"], confidence=measurement["confidence"],
+        confidence_factors=measurement["confidence_factors"], algorithm=measurement["method"],
+        gain_basis=("Économie = consommation attendue sans l'action − consommation mesurée, sur la période de suivi ; "
+                    "annualisée au même rythme (× 365 / jours de suivi). Incertitude : écart moyen du modèle de "
+                    "référence sur des périodes non apprises. Prix et facteurs d'émission indicatifs."),
+    )
+
+
+def savings_chart(measurement: dict) -> None:
+    rows = []
+    for week in measurement["weekly"]:
+        label = fmt_date(date.fromisoformat(week["week"]))
+        rows.append({"Semaine": label, "Série": "Attendu sans l'action", "kWh": week["expected"]})
+        rows.append({"Semaine": label, "Série": "Mesuré", "kWh": week["actual"]})
+    if not rows:
+        return
+    order = [fmt_date(date.fromisoformat(w["week"])) for w in measurement["weekly"]]
+    chart = alt.Chart(pd.DataFrame(rows)).mark_line(point=True, strokeWidth=2.5).encode(
+        x=alt.X("Semaine:N", sort=order, title=None, axis=alt.Axis(labelAngle=-45, labelOverlap=True)),
+        y=alt.Y("kWh:Q", title="kWh par semaine", axis=alt.Axis(format="~s")),
+        color=alt.Color("Série:N", title=None, scale=alt.Scale(domain=["Attendu sans l'action", "Mesuré"],
+                                                               range=[ui.MUTED, ui.PRIMARY])),
+        strokeDash=alt.StrokeDash("Série:N", legend=None, scale=alt.Scale(domain=["Attendu sans l'action", "Mesuré"],
+                                                                           range=[[5, 4], [1, 0]])),
+        tooltip=["Semaine", "Série", alt.Tooltip("kWh:Q", format=",.0f")],
+    ).properties(height=220)
+    st.altair_chart(style_chart(chart), width="stretch")
+    st.caption("Pointillés : consommation attendue sans l'action (modèle de référence et météo réelle) ; "
+               "trait plein : mesurée. L'écart entre les deux est l'économie.")
+
+
+def savings_block(db: Session, repo: TenantRepository, user: User, rec, key: str) -> None:
+    """Mesure avant / après d'une recommandation appliquée. Les valideurs voient la mesure à jour et la
+    valident ; les autres comptes client ne voient que la mesure validée, figée (principe P1)."""
+    applied_on = to_local(rec.applied_at).date()
+    snapshot = rec.savings_snapshot
+    live = savings_service.measure(db, rec) if sees_unvalidated(user) else None
+    measurement = live.as_dict() if live is not None else snapshot
+    with st.container(border=True):
+        if snapshot:
+            who = db.get(User, rec.savings_validated_by)
+            status_html = ui.status(f"Mesure validée le {to_local(rec.savings_validated_at):%d/%m/%Y}", "success")
+            validated = (f"<div class='es-output-meta'>Validée par {ui.e(who.email if who else 'compte supprimé')} : "
+                         f"suivi jusqu'au {fmt_date(date.fromisoformat(snapshot['reporting_end']))}."
+                         + (" La mesure ci-dessous est à jour, plus récente que la version validée." if live else "")
+                         + "</div>")
+        else:
+            status_html = ui.status("Mesure à valider" if measurement else "Mesure en attente", "warning")
+            validated = ""
+        ui.render(f"<div class='es-output-head'>{ui.badge('Avant / après')} {status_html}"
+                  + (f" {confidence_badge(measurement['confidence'])}" if measurement else "") + "</div>"
+                  f"<div class='es-output-title'>{ui.e(rec.title)}</div>"
+                  f"<div class='es-output-meta'>Appliquée le {fmt_date(applied_on)}.</div>{validated}")
+        if measurement is None:
+            available = savings_service.availability(rec)
+            st.caption("Mesure en cours de validation par votre auditeur ou votre responsable énergie."
+                       if not sees_unvalidated(user) else
+                       f"Mesure possible à partir du {fmt_date(available)} (14 jours de suivi après l'application), "
+                       "avec les données du compteur concerné.")
+            return
+        saved, pct = measurement["saved_kwh"], measurement["saved_pct"] * 100
+        estimated = measurement.get("estimated_gain_kwh")
+        ui.render(
+            f"<div class='es-output-gain'>Économie mesurée : <b>{ui.e(fmt_energy(saved))}</b> "
+            f"({ui.e(fmt_pct(-pct).lstrip('+'))} de la consommation attendue, ± {ui.e(fmt_energy(measurement['uncertainty_kwh']))}) "
+            f"sur {measurement['reporting_days']} jours, soit <b>{ui.e(fmt_energy(measurement['annualized_kwh']))} et "
+            f"{ui.e(fmt_eur(measurement['annualized_eur']))} par an</b>.</div>"
+            f"<div class='es-output-meta'>Attendu sans l'action : {ui.e(fmt_energy(measurement['expected_kwh']))} ; "
+            f"mesuré : {ui.e(fmt_energy(measurement['actual_kwh']))}."
+            + (f" Gain estimé à la proposition : {ui.e(fmt_energy(estimated))} par an." if estimated else "")
+            + "</div>"
+        )
+        savings_chart(measurement)
+        explanation_block(_savings_view(measurement))
+        if live is not None and validation.can_validate(user):
+            label = "Valider la mesure à jour" if snapshot else "Valider la mesure"
+            with st.popover(label, key=f"{key}-pop", type="primary"):
+                st.markdown(f"**{label} ?**")
+                st.caption("Vous confirmez cette mesure après examen de son raisonnement : elle devient visible par "
+                           "tout le client, figée telle quelle.")
+                if st.button("Confirmer", key=f"{key}-confirm", type="primary"):
+                    try:
+                        validation.validate_savings(db, repo, user, rec.id)
+                    except validation.ValidationError as exc:
+                        st.error(str(exc))
+                    else:
+                        integrations.dispatch_in_background()
+                        flash("Mesure des économies validée : elle est maintenant visible par le client.")
+                        st.rerun()
+
+
+def savings_section(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    """F1 — évolution avant / après recommandations."""
+    recs = repo.list_recommendations(org.id, [ReviewStatus.APPLIED])
+    st.header("Avant / après recommandations")
+    if not recs:
+        ui.empty_state("Aucune recommandation appliquée",
+                       "Les économies seront mesurées dès 14 jours après une application déclarée.")
+        return
+    validated = [r for r in recs if r.savings_snapshot]
+    if validated:
+        kwh = sum(r.savings_snapshot["annualized_kwh"] for r in validated)
+        eur = sum(r.savings_snapshot["annualized_eur"] for r in validated)
+        st.caption(f"Économies mesurées et validées : {fmt_energy(kwh)} et {fmt_eur(eur)} par an "
+                   f"({len(validated)} action(s) sur {len(recs)}).")
+    for rec in recs:
+        savings_block(db, repo, user, rec, key=f"sv-{rec.id}")
 
 
 # --- Principe P1 : sorties de la plateforme expliquées, validées par un humain --------------------------
@@ -766,6 +932,60 @@ def model_table(prediction: Prediction) -> None:
                "Paudel (2016).")
 
 
+def context_html(db: Session, repo: TenantRepository, drift) -> str:
+    """F2b : équipement suspect, zones et usages potentiellement impactés, en clair sous l'anomalie."""
+    ctx = drift.context
+    if not ctx:
+        return ""
+    located = ctx["localisation"] != "absente"
+    head = (f"{ui.badge('Contexte physique')} "
+            f"{ui.badge(anomaly_context.LOCALISATION_LABELS[ctx['localisation']], LOCALISATION_TONES[ctx['localisation']])}"
+            + (f" <span class='es-output-meta'>{ui.e(ctx['nature_label'])}</span>" if located else ""))
+    parts = [f"<div class='es-output-head'>{head}</div>", f"<div class='es-output-action'>{ui.e(ctx['summary'])}</div>"]
+    impacted = ctx["impacted"]
+    details = []
+    if impacted["equipment"]:
+        details.append("Équipements en aval : " + ", ".join(impacted["equipment"]))
+    if impacted["usages"]:
+        details.append("Usages concernés : " + ", ".join(impacted["usages"]))
+    if details:
+        parts.append(f"<div class='es-output-meta'>{ui.e(' ; '.join(details))}.</div>")
+    statuses = None if sees_unvalidated(repo.user) else (DriftStatus.QUALIFIED,)
+    linked = anomaly_context.related(db, drift, statuses)
+    if linked:
+        items = " ; ".join(f"{DRIFT_KIND_LABELS[d.kind.value].lower()} du {fmt_date(d.day)} "
+                           f"({FLUID_LABELS[d.delivery_point.fluid].lower()} {d.delivery_point.external_ref})"
+                           for d in linked)
+        parts.append(f"<div class='es-output-meta'>À examiner ensemble (mêmes zones ou même équipement, à un jour "
+                     f"près ; une cause commune est possible) : {ui.e(items)}.</div>")
+    if ctx.get("after_validation"):
+        parts.append("<div class='es-output-meta'>Contexte établi après la validation de l'anomalie, détectée avant "
+                     "la mise en contexte par le graphe.</div>")
+    return f"<div class='es-output-context'>{''.join(parts)}</div>"
+
+
+def context_graph(db: Session, drift) -> None:
+    """F2b : propagation d'impact, surlignée sur le graphe du site, et équipements examinés."""
+    ctx = drift.context
+    if not ctx or ctx["localisation"] == "absente":
+        return
+    with st.expander("Propagation dans le graphe des équipements"):
+        graph = assets.load_site_graph(db, drift.delivery_point.site_id)
+        if graph.relations:
+            st.graphviz_chart(graph.to_dot(set(ctx["highlight_ids"])), width="stretch")
+            st.caption("Surlignés : le compteur, l'équipement suspect et la chaîne physique en aval, jusqu'aux zones "
+                       "et aux usages. Graphe actuel du site.")
+        ui.table(["Équipement examiné", "Catégorie", "Pourquoi", ""],
+                 [[ui.e(s["name"]), ui.e(s["category"]), ui.e(s["reason"]),
+                   ui.status("Suspect", "warning") if s["retained"] else ""] for s in ctx["suspects"]])
+        if ctx["excluded"]:
+            st.caption("Écartés d'après le graphe : " + " ; ".join(ctx["excluded"]) + ".")
+        for chain in ctx["chains"]:
+            st.caption(chain)
+        st.caption("Hypothèse de la plateforme, validée avec l'anomalie. Tant que l'anomalie est à valider, elle "
+                   "suit les modifications du graphe ; elle est ensuite figée telle que validée.")
+
+
 def output_card(db: Session, repo: TenantRepository, user: User, kind: str, output, key: str) -> None:
     """Carte d'une sortie de la plateforme : quoi, pourquoi (raisonnement), combien (gain), avec quelle confiance."""
     with st.container(border=True):
@@ -776,7 +996,8 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                 status_html = ui.status(DRIFT_STATUS_LABELS[output.status], DRIFT_STATUS_TONES[output.status])
                 head = [ui.badge("Anomalie"), ui.badge(DRIFT_KIND_LABELS[output.kind.value])]
                 title = f"{dp.site.name}, {FLUID_LABELS[dp.fluid].lower()} {dp.external_ref}, le {fmt_date(output.day)}"
-                body = f"<div>{ui.e(output.details)} <b>({ui.e(fmt_pct(output.deviation_pct))})</b></div>"
+                body = (f"<div>{ui.e(output.details)} <b>({ui.e(fmt_pct(output.deviation_pct))})</b></div>"
+                        + context_html(db, repo, output))
                 meta = decision_html(db, output.detected_at, output.qualified_by, output.qualified_at, output.comment,
                                      DRIFT_STATUS_LABELS[output.status], output.status == DriftStatus.OPEN)
             else:
@@ -806,6 +1027,12 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                                  f"{ui.e(who.email if who else 'compte supprimé')} le {to_local(output.applied_at):%d/%m/%Y}"
                                  + (f" : « {ui.e(output.applied_comment)} »" if output.applied_comment else "")
                                  + ".</div>")
+                        snapshot = output.savings_snapshot
+                        meta += ("<div class='es-output-gain'>Économies mesurées et validées : <b>"
+                                 f"{ui.e(fmt_energy(snapshot['annualized_kwh']))} par an</b> (détail : tableau de bord, "
+                                 "« Avant / après »).</div>" if snapshot else
+                                 "<div class='es-output-meta'>Mesure des économies : tableau de bord, section "
+                                 "« Avant / après recommandations ».</div>")
                 else:
                     head = [ui.badge("Prévision")]
                     fluid = FLUID_LABELS[output.fluid].lower()
@@ -824,6 +1051,8 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
             if kind == "prediction":
                 prediction_chart(output)
                 model_table(output)
+            if kind == "drift":
+                context_graph(db, output)
             explanation_block(output)
         with actions:
             review_actions(db, repo, user, kind, output, key)
@@ -869,10 +1098,21 @@ def page_validation(db: Session, repo: TenantRepository, user: User, org: Organi
         st.rerun()
 
 
+def suspect_cell(drift) -> str:
+    ctx = drift.context
+    if not ctx or ctx["localisation"] == "absente":
+        return "<span class='sub'>Non localisée</span>"
+    names = ", ".join(s["name"] for s in ctx["suspects"] if s["retained"])
+    zones = ", ".join(z["name"] for z in ctx["impacted"]["zones"])
+    return ui.e(names) + (f"<span class='sub'>{ui.e(zones)}</span>" if zones else "")
+
+
 def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     ui.page_header(org.name, "Dérives de consommation",
-                   "Anomalies détectées par la plateforme, chacune avec son raisonnement, son gain estimé et son "
-                   "niveau de confiance, puis validées ou écartées par un humain. Aucune action automatique.")
+                   "Deux étages : la détection statistique (dépassement de seuil, écart climatique, talon de nuit, "
+                   "consommation en inoccupation), puis la mise en contexte par le graphe des équipements "
+                   "(équipement suspect, zones et usages potentiellement impactés). Chaque anomalie est validée ou "
+                   "écartée par un humain ; aucune action automatique.")
     if sees_unvalidated(user):
         filters = {"À valider": DriftStatus.OPEN, "Validées": DriftStatus.QUALIFIED,
                    "Écartées": DriftStatus.IGNORED, "Toutes": None}
@@ -885,13 +1125,14 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
         ui.empty_state("Aucune dérive", "Rien pour ce filtre : la consommation suit son rythme habituel.")
         return
     ui.table(
-        ["Date", "Type", "Point de livraison", "Écart", "Confiance", "Gain estimé", "Statut"],
+        ["Date", "Type", "Point de livraison", "Équipement suspect", "Écart", "Confiance", "Gain estimé", "Statut"],
         [
             [
                 fmt_date(d.day),
                 ui.e(DRIFT_KIND_LABELS[d.kind.value]),
                 f"{ui.e(d.delivery_point.site.name)}<span class='sub'>"
                 f"{ui.e(FLUID_LABELS[d.delivery_point.fluid])} {ui.e(d.delivery_point.external_ref)}</span>",
+                suspect_cell(d),
                 f"<b>{ui.e(fmt_pct(d.deviation_pct))}</b>",
                 confidence_badge(d.confidence),
                 ui.e(f"{fmt_eur(d.gain_eur)}/an") if d.gain_eur else "—",
@@ -899,7 +1140,7 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
             ]
             for d in drifts
         ],
-        numeric={3, 5},
+        numeric={4, 6},
     )
     st.header("Détail d'une anomalie")
     labels = {
@@ -1110,7 +1351,8 @@ def page_assets(db: Session, repo: TenantRepository, user: User, org: Organizati
     ui.page_header(org.name, "Équipements",
                    "Graphe physique : ce qui alimente quoi, ce qui produit quoi, quelles zones et quels usages sont "
                    "desservis. Ce n'est pas une arborescence de rangement : c'est le chemin réel de l'énergie, "
-                   "utilisé pour cibler les recommandations.")
+                   "utilisé pour localiser les anomalies (équipement suspect, zones touchées) et cibler les "
+                   "recommandations.")
     sites = {s.id: s for s in repo.list_sites(org.id)}
     if not sites:
         st.info("Aucun site pour ce client : créez-en un dans « Patrimoine & consentements ».")
@@ -1160,7 +1402,11 @@ def page_assets(db: Session, repo: TenantRepository, user: User, org: Organizati
 def page_regulatory(db: Session, repo: TenantRepository, user: User) -> None:
     guard_write(user)
     ui.page_header("", "Suivi réglementaire",
-                   "Échéances Décret Tertiaire, audit EED et VSME, et journal des actions par site.")
+                   "Calendrier de conformité (Décret Tertiaire, audit EED, VSME), rappels d'échéances et journal des "
+                   "actions par site et par obligation.")
+    days = ", ".join(f"J-{d}" if d else "le jour J" for d in settings.reminder_days)
+    st.caption(f"Rappels automatiques à {days}, puis en cas de retard : dans la cloche et par e-mail aux auditeurs "
+               "du client (« Mon compte » pour les désactiver).")
     orgs = {o.id: o.name for o in repo.list_organizations()}
     org_filter = st.selectbox("Organisation", [None, *orgs],
                               format_func=lambda i: "Toutes les organisations" if i is None else orgs[i])
@@ -1256,6 +1502,93 @@ def fmt_size(size: int) -> str:
     return f"{fmt_number(size / 1024 / 1024, 1)} Mo" if size >= 1024 * 1024 else f"{max(1, round(size / 1024))} Ko"
 
 
+def declared_section(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    """Données N0 : consommations saisies depuis les factures et relevés (mode dégradé F1, F4)."""
+    entries = energy_data.list_declared(db, repo, org.id)
+    points = {dp.id: dp for dp in repo.list_delivery_points(org.id)}
+
+    def point_label(dp_id: int) -> str:
+        dp = points[dp_id]
+        return f"{dp.site.name}, {FLUID_LABELS[dp.fluid].lower()} {dp.external_ref}"
+
+    st.header("Consommations des factures et relevés (N0)")
+    st.caption("Données N0 : la consommation d'une période, lue sur une facture ou un relevé d'index. Elles "
+               "complètent les compteurs communicants (N1) les jours sans mesure, au prorata des jours, et "
+               "alimentent le tableau de bord et les données RSE.")
+    if energy_data.can_edit(user) and points:
+        docs = {d.id: d for d in repo.list_documents(org.id)}
+        tab_form, tab_csv = st.tabs(["Saisir une facture", "Importer un tableur CSV"], key="n0_tabs")
+        with tab_form, st.form("declared", clear_on_submit=True):
+            left, right = st.columns(2)
+            dp_id = left.selectbox("Point de livraison", list(points), format_func=point_label)
+            source = right.selectbox("Justificatif", list(DeclaredSource), format_func=energy_data.SOURCE_LABELS.get)
+            left, right = st.columns(2)
+            start = left.date_input("Début de période", value=None, format="DD/MM/YYYY")
+            end = right.date_input("Fin de période", value=None, format="DD/MM/YYYY")
+            left, right = st.columns(2)
+            kwh = left.number_input("Consommation (kWh)", min_value=0.0, step=100.0, value=None)
+            amount = right.number_input("Montant TTC (€, facultatif)", min_value=0.0, step=10.0, value=None)
+            document_id = st.selectbox("Document déposé correspondant (facultatif)", [None, *docs],
+                                       format_func=lambda i: "Aucun" if i is None else docs[i].original_name)
+            if st.form_submit_button("Enregistrer la consommation", type="primary"):
+                if start is None or end is None or kwh is None:
+                    st.error("Renseignez la période et la consommation.")
+                else:
+                    try:
+                        energy_data.add_declared(db, repo, user, dp_id, period_start=start, period_end=end, kwh=kwh,
+                                                 amount_eur=amount, source=source, document_id=document_id)
+                    except energy_data.DeclaredError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("Consommation enregistrée (N0).")
+                        st.rerun()
+        with tab_csv:
+            st.caption("Une ligne par facture. En-tête attendu : point;debut;fin;kwh;montant (dates JJ/MM/AAAA ; "
+                       "« point » = numéro PRM ou PCE ; montant facultatif).")
+            upload = st.file_uploader("Fichier CSV", type=["csv"], key="n0_csv")
+            csv_docs = [d for d in docs.values() if d.original_name.lower().endswith(".csv")]
+            doc_id = st.selectbox("… ou un tableur CSV déposé par le client", [None, *(d.id for d in csv_docs)],
+                                  format_func=lambda i: "Aucun" if i is None else docs[i].original_name, key="n0_doc")
+            if st.button("Importer", key="n0_import", type="primary"):
+                if upload is None and doc_id is None:
+                    st.error("Choisissez un fichier ou un document déposé.")
+                else:
+                    try:
+                        content = upload.getvalue() if upload is not None else documents_service.read_content(docs[doc_id])
+                        created, errors = energy_data.import_csv(db, repo, user, org.id, content,
+                                                                 document_id=doc_id if upload is None else None)
+                    except (energy_data.DeclaredError, FileNotFoundError) as exc:
+                        st.error(str(exc) or "Fichier indisponible.")
+                    else:
+                        for message in errors:
+                            st.warning(message)
+                        if created:
+                            flash(f"{created} consommation(s) importée(s) (N0)."
+                                  + (f" {len(errors)} ligne(s) refusée(s)." if errors else ""))
+                            if not errors:
+                                st.rerun()
+    if not entries:
+        st.caption("Aucune consommation saisie pour l'instant.")
+        return
+    ui.table(
+        ["Point de livraison", "Période", "Consommation", "Montant", "Justificatif"],
+        [[ui.e(point_label(e.delivery_point_id)) if e.delivery_point_id in points else "—",
+          f"{fmt_date(e.period_start)} → {fmt_date(e.period_end)}", fmt_energy(e.kwh),
+          fmt_eur(e.amount_eur) if e.amount_eur is not None else "—", ui.e(energy_data.SOURCE_LABELS[e.source])]
+         for e in entries],
+        numeric={2, 3},
+    )
+    if energy_data.can_edit(user):
+        labels = {e.id: f"{point_label(e.delivery_point_id)}, {fmt_date(e.period_start)} → {fmt_date(e.period_end)}"
+                  for e in entries if e.delivery_point_id in points}
+        with st.popover("Supprimer une saisie", key="n0_delete_pop"):
+            entry_id = st.selectbox("Saisie", list(labels), format_func=labels.get, key="n0_delete_choice")
+            if st.button("Confirmer la suppression", key="n0_delete", type="primary"):
+                energy_data.delete_declared(db, repo, user, entry_id)
+                flash("Saisie supprimée.")
+                st.rerun()
+
+
 def page_documents(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     """Dépôt de factures et de relevés : le client dépose, l'auditeur traite."""
     is_client = user.role == Role.CLIENT_VIEWER
@@ -1304,6 +1637,8 @@ def page_documents(db: Session, repo: TenantRepository, user: User, org: Organiz
                               + (" Votre auditeur est prévenu." if is_client else ""))
                         if not errors:
                             st.rerun()
+
+    declared_section(db, repo, user, org)
 
     st.header("Documents déposés")
     filters = {"À traiter": DocumentStatus.RECEIVED, "Traités": DocumentStatus.PROCESSED,
@@ -1401,7 +1736,7 @@ def show_once(key: str, title: str, value: str) -> None:
 def integrations_sources(db: Session, user: User) -> None:
     is_admin = user.role == Role.ADMIN
     if not is_admin:
-        st.caption("Ces sources sont réglées par l'administrateur de la plateforme : EffiSmart signe les contrats "
+        st.caption("Ces sources et services (dont l'envoi des e-mails) sont réglés par l'administrateur de la plateforme : EffiSmart signe les contrats "
                    "Enedis et GRDF. Vous voyez leur état.")
     for kind, spec in integrations.PLATFORM_SPECS.items():
         row = integrations.get_platform(db, kind)
@@ -1425,6 +1760,11 @@ def integrations_sources(db: Session, user: User) -> None:
                     if "options" in field:
                         values[name] = st.selectbox(field["label"], field["options"],
                                                     index=field["options"].index(current[name]))
+                    elif field.get("type") == "text":
+                        values[name] = st.text_input(field["label"], value=str(current[name] or ""))
+                    elif field.get("type") == "int":
+                        values[name] = st.number_input(field["label"], value=int(current[name]), step=1,
+                                                       min_value=1, max_value=65535)
                     else:
                         values[name] = st.number_input(field["label"], value=float(current[name]), format="%.4f")
                 for name, label in spec["secrets"].items():
@@ -1659,7 +1999,7 @@ def integrations_webhooks(db: Session, repo: TenantRepository, user: User) -> No
 def page_integrations(db: Session, repo: TenantRepository, user: User) -> None:
     ui.page_header("", "Intégrations",
                    "Sources de données, connecteurs, accès des logiciels partenaires et webhooks.")
-    tabs = st.tabs(["Sources de données", "Connecteurs", "API partenaires", "Webhooks"])
+    tabs = st.tabs(["Sources et services", "Connecteurs", "API partenaires", "Webhooks"])
     with tabs[0]:
         integrations_sources(db, user)
     if user.role != Role.AUDITOR:
@@ -1677,9 +2017,17 @@ def page_integrations(db: Session, repo: TenantRepository, user: User) -> None:
 
 
 def page_exports(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
-    ui.page_header(org.name, "Exports des données énergie", "Déclaration OPERAT et reporting ESG VSME.")
+    ui.page_header(org.name, "Données énergie pour vos rapports RSE",
+                   "Consommations, coûts indicatifs et émissions (scopes 1 et 2), prêts pour la déclaration OPERAT "
+                   "et le module B3 du VSME, sans ressaisie.")
+    ui.banner("<span>EffiSmart fournit la <b>brique énergie</b> de vos rapports RSE. Le rapport de durabilité "
+              "complet, avec ses volets social et gouvernance, reste hors de son périmètre.</span>")
+    st.caption("Produits automatiquement : l'année écoulée dès le 1er janvier, et l'année en cours jusqu'au dernier "
+               "mois complet, mise à jour chaque mois. Sources : compteurs communicants (N1) et, à défaut, factures "
+               "et relevés (N0), indiquées dans chaque fichier.")
     if can_write(user):
-        st.caption("Un même calcul alimente les deux gabarits. Formats provisoires V1 : JSON + CSV.")
+        st.caption("Vous pouvez aussi produire un jeu sur une période choisie. Un même calcul alimente les deux "
+                   "gabarits ; formats provisoires V1 : JSON + CSV.")
         last_year = today_local().year - 1
         with st.form("export"):
             left, right = st.columns(2)
@@ -1697,13 +2045,10 @@ def page_exports(db: Session, repo: TenantRepository, user: User, org: Organizat
                         ExportEngine().run(db, org, start, end, formats, user.id)
                     flash("Exports générés.")
                     st.rerun()
-    else:
-        st.caption("Les exports sont générés par votre auditeur ; vous pouvez les télécharger ici.")
-
-    st.header("Exports disponibles")
+    st.header("Jeux de données disponibles")
     jobs = repo.list_export_jobs(org.id)
     if not jobs:
-        st.info("Aucun export pour l'instant.")
+        st.info("Aucun jeu de données pour l'instant : il sera produit dès que des consommations seront disponibles.")
     for job in jobs:
         with st.container(border=True):
             info, action = st.columns([4, 1], vertical_alignment="center")
@@ -1718,7 +2063,8 @@ def page_exports(db: Session, repo: TenantRepository, user: User, org: Organizat
                     f"{ui.badge(EXPORT_STATUS_LABELS[job.status], EXPORT_STATUS_TONES[job.status])}</div>"
                     f"<div style='margin-top:6px;font-size:14px;color:var(--color-muted)'>"
                     f"Du {fmt_date(job.period_start)} au {fmt_date(job.period_end)}, "
-                    f"créé le {to_local(job.created_at).strftime('%d/%m/%Y à %H:%M')}</div>"
+                    + ("produit automatiquement" if job.automatic else "produit à la demande")
+                    + f" le {to_local(job.created_at).strftime('%d/%m/%Y à %H:%M')}</div>"
                     f"<div style='font-size:13px;color:var(--color-muted);margin-top:4px'>"
                     f"Facteurs : {ui.e(factors)}</div>"
                 )
@@ -1910,6 +2256,15 @@ def sidebar(repo: TenantRepository, user: User) -> str:
     return page
 
 
+def _set_email_preference(user_id: int) -> None:
+    """Préférence personnelle (pas une donnée métier) : modifiable par tout compte, y compris client."""
+    with SessionLocal() as db:
+        account = db.get(User, user_id)
+        if account is not None:
+            account.email_notifications = bool(st.session_state.get("es-email-pref"))
+            db.commit()
+
+
 def _on_search() -> None:
     """Recherche de la barre du haut : ouvre la page ou le tableau de bord du client choisi."""
     choice = st.session_state.get("es_search")
@@ -1994,19 +2349,32 @@ def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organ
                     st.caption("La plateforme propose (anomalies, recommandations, prévisions), chaque fois avec "
                                "son raisonnement, son gain estimé et son niveau de confiance. L'auditeur ou le "
                                "responsable énergie décide ; aucune action n'est automatique.")
+                    st.caption("Alertes à deux étages : la plateforme détecte d'abord, par la statistique, les "
+                               "dépassements de seuil, les écarts à l'historique corrigé du climat, les talons de "
+                               "nuit anormaux et la consommation en inoccupation ; puis elle replace l'anomalie dans "
+                               "le graphe des équipements : équipement suspect, zones et usages potentiellement "
+                               "impactés.")
                     st.caption("Page « Équipements » : le graphe physique relie compteurs, équipements, fluides, "
-                               "zones et usages ; il sert à cibler les recommandations.")
+                               "zones et usages ; il sert à localiser les anomalies et à cibler les recommandations.")
+                    st.caption("Niveaux de données : N1 = compteurs communicants (Linky, Gazpar) ; N0 = factures "
+                               "et relevés saisis dans « Documents » (mode dégradé : totaux mensuels, sans courbe "
+                               "ni détection d'anomalies).")
                     st.caption("Données de démonstration : fournisseur simulé (MockDataProvider).")
 
             # Action principale : nouvel export (écriture réservée à l'auditeur).
             if can_write(user) and org is not None:
-                if st.button("Créer un export", type="primary", icon=":material/add:", key="es-new-export"):
+                if st.button("Données RSE", type="primary", icon=":material/description:", key="es-new-export",
+                             help="Données énergie pour les rapports RSE (OPERAT, VSME)"):
                     goto(PAGE_EXPORTS, org.id)
 
             # Compte : initiales, rôle, mise à jour des données, déconnexion.
             with st.container(key="es-avatar"):
                 with st.popover("Mon compte", help="Mon compte"):
                     ui.render(ui.user_html(user.email, role_label(user)))
+                    st.toggle("Recevoir les alertes par e-mail", value=user.email_notifications, key="es-email-pref",
+                              on_change=_set_email_preference, args=(user.id,),
+                              help="Alertes à valider ou validées, décisions et rappels d'échéances, envoyés dès "
+                                   "leur création. Les alertes restent toujours visibles dans la cloche.")
                     if can_write(user) and st.button("Mettre à jour les données", type="primary", width="stretch",
                                                      help="Récupère les jours manquants jusqu'à la veille"):
                         with st.spinner("Mise à jour…"):

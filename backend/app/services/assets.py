@@ -9,8 +9,9 @@ Un nœud peut avoir plusieurs sources (une CTA alimentée en eau chaude ET en ea
 cibles (une chaudière qui produit l'eau de chauffage et l'eau chaude sanitaire). La grammaire
 `ALLOWED_RELATIONS` refuse les liens physiquement absurdes (une zone qui « produit » un compteur…).
 
-Le graphe sert au raisonnement des recommandations : quels équipements consomment l'énergie d'un
-compteur, quelles zones et quels usages ils desservent, lesquels sont occupés 24 h/24.
+Le graphe sert au raisonnement des anomalies contextualisées (F2b) et des recommandations : quels
+équipements consomment l'énergie d'un compteur, quelles zones et quels usages ils desservent, lesquels
+sont occupés 24 h/24. Modifier le graphe met à jour le contexte des anomalies encore à valider.
 """
 from __future__ import annotations
 
@@ -378,6 +379,13 @@ def _require_editor(user: User) -> None:
         raise AssetPermissionError("Le graphe des équipements est tenu par l'auditeur ; l'espace client le consulte.")
 
 
+def _graph_changed(db: Session, site_id: int) -> None:
+    """F2b : les anomalies encore à valider suivent le graphe ; les décisions passées restent figées."""
+    from app.services import anomaly_context  # import local : anomaly_context s'appuie sur ce module
+
+    anomaly_context.refresh_open(db, site_id)
+
+
 def _check_fields(kind: AssetNodeKind, category_code: str, name: str, power_kw: float | None,
                   surface_m2: float | None) -> str:
     name = (name or "").strip()
@@ -409,6 +417,7 @@ def create_node(
     )
     db.add(node)
     db.commit()
+    _graph_changed(db, site.id)
     return node
 
 
@@ -426,6 +435,7 @@ def update_node(
     node.always_occupied = bool(always_occupied) and node.kind == K.ZONE
     node.notes = (notes or "").strip() or None
     db.commit()
+    _graph_changed(db, node.site_id)
     return node
 
 
@@ -440,8 +450,10 @@ def delete_node(db: Session, repo: TenantRepository, user: User, node_id: int) -
     # Les recommandations gardent leur texte ; seul le lien vers l'équipement disparaît.
     for rec in db.scalars(select(Recommendation).where(Recommendation.equipment_id == node.id)):
         rec.equipment_id = None
+    site_id = node.site_id
     db.delete(node)
     db.commit()
+    _graph_changed(db, site_id)
 
 
 def create_relation(
@@ -467,6 +479,7 @@ def create_relation(
                              kind=kind, created_by=user.id)
     db.add(relation)
     db.commit()
+    _graph_changed(db, source.site_id)
     return relation
 
 
@@ -476,5 +489,7 @@ def delete_relation(db: Session, repo: TenantRepository, user: User, relation_id
         AssetRelation.id == relation_id, repo.org_clause(AssetRelation.organization_id)))
     if relation is None:
         raise ResourceNotFound()
+    site_id = db.get(AssetNode, relation.source_id).site_id
     db.delete(relation)
     db.commit()
+    _graph_changed(db, site_id)

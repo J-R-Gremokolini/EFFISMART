@@ -26,7 +26,7 @@ from app.repositories import ResourceNotFound, TenantRepository
 from app.services import integrations, validation
 from app.services.consent import has_active_consent
 from app.services.dashboard import consented_delivery_points, data_as_of
-from app.services.drift import daily_kwh
+from app.services.energy_data import combined_daily
 from app.timeutils import month_start, yesterday_local
 
 class UTF8JSONResponse(JSONResponse):
@@ -110,22 +110,25 @@ def consumption(
     scope: PartnerScope = Depends(partner_scope),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Consommation en kWh par jour ou par mois et par énergie (points consentis uniquement)."""
+    """Consommation en kWh par jour ou par mois et par énergie : compteurs consentis (N1) et, les jours sans
+    mesure, factures et relevés (N0) ; `n0_kwh` indique la part issue des factures."""
     org = scope.organization(org_id)
-    points = consented_delivery_points(db, org.id)
-    end = end or data_as_of(db, [p.id for p in points]) or yesterday_local()
+    points = scope.repo.list_delivery_points(org.id)
+    end = end or data_as_of(db, [p.id for p in consented_delivery_points(db, org.id)]) or yesterday_local()
     start = start or end - timedelta(days=29)
     if start > end:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "start doit précéder end.")
+        raise HTTPException(422, "start doit précéder end.")
     if (end - start).days > 731:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Période limitée à 2 ans par requête.")
+        raise HTTPException(422, "Période limitée à 2 ans par requête.")
     totals: dict[str, dict[str, float]] = {}
     for dp in points:
-        for day, kwh in daily_kwh(db, dp.id, start, end).items():
+        for day, (kwh, level) in combined_daily(db, dp, start, end).items():
             key = day.isoformat() if granularity == "day" else month_start(day).strftime("%Y-%m")
-            bucket = totals.setdefault(key, {f.value: 0.0 for f in Fluid})
+            bucket = totals.setdefault(key, {**{f.value: 0.0 for f in Fluid}, "N0": 0.0})
             bucket[dp.fluid.value] += kwh
-    rows = [{"period": k, **{f"{fluid.lower()}_kwh": round(v, 3) for fluid, v in values.items()}}
+            if level == "N0":
+                bucket["N0"] += kwh
+    rows = [{"period": k, **{f"{name.lower()}_kwh": round(v, 3) for name, v in values.items()}}
             for k, values in sorted(totals.items())]
     return {"organization_id": org.id, "start": start, "end": end, "granularity": granularity,
             "unit": "kWh", "data": rows}

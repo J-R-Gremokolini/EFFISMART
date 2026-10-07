@@ -47,6 +47,7 @@ def drift_out(db: Session, drift: Drift) -> DriftOut:
         status=drift.status,
         comment=drift.comment,
         detected_at=drift.detected_at,
+        context=drift.context,
         **explanation_fields(db, drift, drift.qualified_by, drift.qualified_at),
     )
 

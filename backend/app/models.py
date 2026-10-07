@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    true,
 )
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -89,9 +90,12 @@ class ExportStatus(str, enum.Enum):
 
 
 class DriftKind(str, enum.Enum):
-    THRESHOLD = "THRESHOLD"
-    CLIMATE_DEVIATION = "CLIMATE_DEVIATION"
-    BASELOAD = "BASELOAD"
+    """Détecteurs F2a (seuils et dérive), purement statistiques."""
+
+    THRESHOLD = "THRESHOLD"  # dépassement de seuil
+    CLIMATE_DEVIATION = "CLIMATE_DEVIATION"  # écart à l'historique corrigé du climat (DJU)
+    BASELOAD = "BASELOAD"  # talon de nuit anormal
+    OFF_HOURS = "OFF_HOURS"  # consommation en période d'inoccupation (hors nuit)
 
 
 class DriftStatus(str, enum.Enum):
@@ -140,6 +144,8 @@ class User(Base):
     # Responsable énergie du client (CLIENT_VIEWER uniquement) : voit les sorties algorithmiques
     # non validées de son organisation et peut les valider ou les écarter (principe P1).
     is_energy_manager: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # Notification immédiate par e-mail (F2, F3) : réglable par chaque utilisateur dans « Mon compte ».
+    email_notifications: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -230,6 +236,38 @@ class Consent(Base):
     granted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
 
 
+class DeclaredSource(str, enum.Enum):
+    INVOICE = "INVOICE"  # facture du fournisseur
+    METER_READING = "METER_READING"  # relevé d'index fait sur place
+    OTHER = "OTHER"
+
+
+class DeclaredConsumption(Base):
+    """Donnée de niveau N0 : consommation d'une période issue d'une facture ou d'un relevé.
+
+    Elle complète les données de niveau N1 (compteurs communicants) : chaque jour sans mesure N1 reçoit
+    sa part de la période, au prorata des jours (mode dégradé). Pas de courbe ni de détection d'anomalies
+    sur des données N0.
+    """
+
+    __tablename__ = "declared_consumptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    delivery_point_id: Mapped[int] = mapped_column(ForeignKey("delivery_points.id"), index=True)
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    kwh: Mapped[float] = mapped_column(Float)
+    amount_eur: Mapped[float | None] = mapped_column(Float)  # montant TTC de la facture, si connu
+    source: Mapped[DeclaredSource] = mapped_column(_enum(DeclaredSource), default=DeclaredSource.INVOICE)
+    document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id"))  # justificatif déposé
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    delivery_point: Mapped[DeliveryPoint] = relationship()
+
+
 class Measurement(Base):
     """Série temporelle de consommation — hypertable TimescaleDB."""
 
@@ -254,6 +292,8 @@ class RegulatoryDeadline(Base):
     due_date: Mapped[date] = mapped_column(Date)
     status: Mapped[DeadlineStatus] = mapped_column(_enum(DeadlineStatus), default=DeadlineStatus.UPCOMING)
     notes: Mapped[str | None] = mapped_column(Text)
+    # Dernier rappel envoyé, en jours avant l'échéance (60, 30, 7, 0 ; -1 = en retard). Remis à zéro si la date change.
+    reminder_level: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     site: Mapped[Site] = relationship()
@@ -300,6 +340,8 @@ class ExportJob(Base):
     factors_used: Mapped[list | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    # F4 : jeu de données produit automatiquement par la plateforme (année écoulée, année en cours).
+    automatic: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -349,6 +391,8 @@ class Drift(ExplainedOutput, Base):
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     qualified_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # F2b : qualification et propagation d'impact par le graphe physique (P2), figées à la validation.
+    context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
 
     delivery_point: Mapped[DeliveryPoint] = relationship()
 
@@ -442,6 +486,10 @@ class Recommendation(ExplainedOutput, Base):
     applied_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_comment: Mapped[str | None] = mapped_column(Text)
+    # F1 « avant / après » : mesure des économies, figée au moment où un humain la valide (principe P1).
+    savings_snapshot: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    savings_validated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    savings_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     site: Mapped[Site] = relationship()
     delivery_point: Mapped[DeliveryPoint | None] = relationship()
@@ -532,6 +580,7 @@ class IntegrationKind(str, enum.Enum):
     ENEDIS_DATACONNECT = "ENEDIS_DATACONNECT"
     GRDF_ADICT = "GRDF_ADICT"
     OPEN_METEO = "OPEN_METEO"
+    SMTP = "SMTP"  # serveur d'envoi des e-mails de notification
 
 
 class PlatformIntegration(Base):
@@ -640,6 +689,25 @@ class WebhookDelivery(Base):
     attempts: Mapped[int] = mapped_column(default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_status_code: Mapped[int | None] = mapped_column()
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OutgoingEmail(Base):
+    """File d'envoi des e-mails de notification (F2 alertes, F3 rappels) : réessais comme les webhooks."""
+
+    __tablename__ = "outgoing_emails"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    to_address: Mapped[str] = mapped_column(String(254))
+    subject: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[DeliveryStatus] = mapped_column(_enum(DeliveryStatus), default=DeliveryStatus.PENDING)
+    attempts: Mapped[int] = mapped_column(default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    channel: Mapped[str | None] = mapped_column(String(16))  # « smtp » ou « outbox » (dossier local de démo)
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

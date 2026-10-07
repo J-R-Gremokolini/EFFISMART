@@ -7,7 +7,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import ActionLog, DeadlineStatus, Obligation, RegulatoryDeadline, Site
+from app.models import (
+    ActionLog,
+    AuditorClientLink,
+    DeadlineStatus,
+    Notification,
+    Obligation,
+    RegulatoryDeadline,
+    Role,
+    Site,
+    User,
+)
+from app.repositories import active_links_clause
 from app.timeutils import today_local, utcnow
 
 OBLIGATION_LABELS = {
@@ -94,6 +105,44 @@ def log_action(
     return action
 
 
+def _reminder_level(days_left: int) -> int | None:
+    """Seuil de rappel atteint : le plus petit seuil ≥ jours restants ; -1 = en retard."""
+    if days_left < 0:
+        return -1
+    reached = [t for t in settings.reminder_days if days_left <= t]
+    return min(reached) if reached else None
+
+
+def send_reminders(db: Session, today: date | None = None) -> int:
+    """F3 — rappels d'échéance aux auditeurs du client (application et e-mail), à J-60, J-30, J-7, le jour J,
+    puis une fois en retard. Un seul rappel par seuil, même après une longue absence. Renvoie le nombre envoyé."""
+    from app.services.mailer import enqueue  # import local : le service d'e-mail charge la session de base
+
+    today = today or today_local()
+    sent = 0
+    for deadline in db.scalars(select(RegulatoryDeadline).where(RegulatoryDeadline.status != DeadlineStatus.DONE)):
+        days_left = (deadline.due_date - today).days
+        level = _reminder_level(days_left)
+        if level is None or (deadline.reminder_level is not None and deadline.reminder_level <= level):
+            continue
+        deadline.reminder_level = level
+        site = deadline.site
+        when = ("aujourd'hui" if days_left == 0 else f"en retard de {-days_left} jour(s)" if days_left < 0
+                else f"dans {days_left} jour(s)")
+        message = (f"Rappel d'échéance : {OBLIGATION_LABELS[deadline.obligation]}, {site.name}, le "
+                   f"{deadline.due_date:%d/%m/%Y} ({when})")
+        auditors = db.scalars(select(User).where(
+            User.role == Role.AUDITOR,
+            User.auditor_id.in_(select(AuditorClientLink.auditor_id).where(
+                AuditorClientLink.organization_id == site.organization_id, *active_links_clause()))))
+        for user in auditors:
+            db.add(Notification(user_id=user.id, organization_id=site.organization_id, message=message))
+            enqueue(db, user, message, site.organization.name)
+        sent += 1
+    db.commit()
+    return sent
+
+
 def refresh_statuses(db: Session, today: date | None = None) -> int:
     """Job quotidien : fait passer les échéances en DUE_SOON. Renvoie le nombre de changements."""
     changed = 0
@@ -116,6 +165,8 @@ def update_deadline(
     notes: str | None = None,
 ) -> RegulatoryDeadline:
     if due_date is not None:
+        if due_date != deadline.due_date:
+            deadline.reminder_level = None  # nouvelle date : le cycle de rappels repart
         deadline.due_date = due_date
     if notes is not None:
         deadline.notes = notes

@@ -1,9 +1,16 @@
-"""F4 — Moteur d'export multi-format (OPERAT + VSME).
+"""F4 — Données énergie pour les rapports RSE (OPERAT + VSME).
+
+EffiSmart fournit la brique énergie (consommations, coûts indicatifs, émissions des scopes 1 et 2) ;
+il ne produit pas le rapport de durabilité complet, dont les volets social et gouvernance sont hors
+de son périmètre.
 
 Architecture :
-- `DataAssembler` : socle commun, agrège conso, coûts et émissions sur la période ;
+- `DataAssembler` : socle commun, agrège conso, coûts et émissions sur la période, à partir des
+  compteurs (N1) et, à défaut, des factures et relevés (N0) ;
 - `Formatter`     : gabarits de sortie interchangeables (`OperatFormatter`, `VsmeFormatter`) ;
-- `ExportEngine`  : assemble UNE fois, puis rend chaque format demandé.
+- `ExportEngine`  : assemble UNE fois, puis rend chaque format demandé ;
+- `produce_automatic` : jeux de données produits sans intervention (année écoulée, année en cours
+  mise à jour chaque mois), téléchargeables par le client.
 
 Ajouter un format = ajouter un `Formatter` dans `FORMATTERS`, sans toucher au socle.
 
@@ -19,7 +26,7 @@ import logging
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -39,7 +46,8 @@ from app.models import (
 )
 from app.services.consent import active_consent_clause
 from app.services.dashboard import emission_factors_at, estimated_price
-from app.timeutils import local_day_bounds, to_local, utcnow
+from app.services.energy_data import declared_daily
+from app.timeutils import local_day_bounds, month_start, to_local, today_local, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,7 @@ FLUID_LABELS = {Fluid.ELEC: "ELECTRICITE", Fluid.GAS: "GAZ_NATUREL"}
 @dataclass
 class FluidTotals:
     kwh: float = 0.0
+    n0_kwh: float = 0.0  # dont : factures et relevés (N0)
     cost_eur: float = 0.0
     kgco2e: float = 0.0
     monthly_kwh: dict[str, float] = field(default_factory=lambda: defaultdict(float))
@@ -101,25 +110,41 @@ class DataAssembler:
         assembled_at = utcnow()
         t0, t1 = local_day_bounds(start, end)
         sites: list[SiteEnergy] = []
+        consented = set(db.scalars(select(DeliveryPoint.id).where(active_consent_clause())))
         for site in db.scalars(select(Site).where(Site.organization_id == org.id).order_by(Site.id)):
             by_fluid: dict[Fluid, FluidTotals] = {}
-            points = db.scalars(
-                select(DeliveryPoint).where(DeliveryPoint.site_id == site.id, active_consent_clause())
-            )
-            for dp in points:
+            for dp in db.scalars(select(DeliveryPoint).where(DeliveryPoint.site_id == site.id)):
+                measured_days: set[date] = set()
+                n1_kwh, n1_monthly = 0.0, defaultdict(float)
+                if dp.id in consented:  # N1 : compteurs, uniquement avec consentement actif
+                    rows = db.execute(
+                        select(Measurement.time, Measurement.value_kwh).where(
+                            Measurement.delivery_point_id == dp.id,
+                            Measurement.time >= t0,
+                            Measurement.time < t1,
+                        )
+                    )
+                    for t, kwh in rows:
+                        local_day = to_local(t).date()
+                        measured_days.add(local_day)
+                        n1_kwh += kwh
+                        n1_monthly[local_day.strftime("%Y-%m")] += kwh
+                n0 = declared_daily(db, dp, start, end, measured_days)  # N0 : factures, jours sans mesure
+                if not measured_days and not n0:
+                    continue
                 totals = by_fluid.setdefault(dp.fluid, FluidTotals())
                 totals.delivery_points.append(dp.external_ref)
-                totals.data_sources.add(dp.provider.value)
-                rows = db.execute(
-                    select(Measurement.time, Measurement.value_kwh).where(
-                        Measurement.delivery_point_id == dp.id,
-                        Measurement.time >= t0,
-                        Measurement.time < t1,
-                    )
-                )
-                for t, kwh in rows:
+                if measured_days:
+                    totals.data_sources.add(f"N1 compteurs ({dp.provider.value})")
+                if n0:
+                    totals.data_sources.add("N0 factures et relevés")
+                totals.kwh += n1_kwh
+                for month, kwh in n1_monthly.items():
+                    totals.monthly_kwh[month] += kwh
+                for day, kwh in n0.items():
                     totals.kwh += kwh
-                    totals.monthly_kwh[to_local(t).strftime("%Y-%m")] += kwh
+                    totals.n0_kwh += kwh
+                    totals.monthly_kwh[day.strftime("%Y-%m")] += kwh
             for fluid, totals in by_fluid.items():
                 totals.cost_eur = totals.kwh * estimated_price(fluid)
                 if fluid in factors:
@@ -175,13 +200,23 @@ def _csv_bytes(header: list[str], rows: list[list]) -> bytes:
 
 
 def _common_header(data: AssembledData, fmt: str) -> dict:
+    total = data.total_kwh()
+    n0 = sum(t.n0_kwh for s in data.sites for t in s.by_fluid.values())
     return {
         "format": fmt,
         "format_version": "effismart-v1-provisoire",
         "avertissement": "Gabarit provisoire V1 : structure à aligner sur le gabarit officiel.",
+        "perimetre": ("Données énergie pour les rapports RSE : consommations, coûts indicatifs et émissions des "
+                      "scopes 1 et 2. Le rapport de durabilité complet (volets social et gouvernance) n'est pas "
+                      "produit par EffiSmart."),
         "organisation": {"nom": data.organization_name, "siren": data.siren},
         "periode": {"debut": data.period_start, "fin": data.period_end},
         "genere_le": data.assembled_at,
+        "niveau_des_donnees": {
+            "N1_compteurs_kwh": round(total - n0, 1),
+            "N0_factures_et_releves_kwh": round(n0, 1),
+            "part_N0": round(n0 / total, 4) if total else 0,
+        },
         "facteurs_emission_utilises": data.emission_factors_used,
     }
 
@@ -300,8 +335,10 @@ class ExportEngine:
         end: date,
         formats: list[ExportFormat],
         user_id: int | None = None,
+        automatic: bool = False,
+        data: AssembledData | None = None,
     ) -> list[ExportJob]:
-        data = self.assembler.assemble(db, org, start, end)  # socle calculé une seule fois
+        data = data or self.assembler.assemble(db, org, start, end)  # socle calculé une seule fois
         jobs = []
         for fmt in self._ordered(formats):
             job = ExportJob(
@@ -312,6 +349,7 @@ class ExportEngine:
                 status=ExportStatus.PENDING,
                 factors_used=data.emission_factors_used,
                 created_by=user_id,
+                automatic=automatic,
             )
             db.add(job)
             db.flush()
@@ -330,6 +368,39 @@ class ExportEngine:
             jobs.append(job)
         db.commit()
         return jobs
+
+
+def _has_energy_data(data: AssembledData) -> bool:
+    return data.total_kwh() > 0
+
+
+def produce_automatic(db: Session, today: date | None = None) -> list[ExportJob]:
+    """F4 « sans ressaisie » : pour chaque organisation, la plateforme produit d'elle-même
+    - le jeu de l'année civile écoulée, une fois (dès le 1er janvier) ;
+    - le jeu de l'année en cours jusqu'au dernier mois complet, renouvelé chaque mois.
+    Le client les télécharge depuis son espace, sans écrire quoi que ce soit (lecture seule F5)."""
+    today = today or today_local()
+    current_month = month_start(today)
+    previous_year = (date(today.year - 1, 1, 1), date(today.year - 1, 12, 31))
+    year_to_date = (date(today.year, 1, 1), current_month - timedelta(days=1))  # jusqu'au dernier mois complet
+    periods = [previous_year] + ([year_to_date] if year_to_date[1] >= year_to_date[0] else [])
+    created: list[ExportJob] = []
+    engine = ExportEngine()
+    for org in db.scalars(select(Organization).order_by(Organization.id)):
+        for start, end in periods:
+            exists = db.scalar(select(ExportJob.id).where(
+                ExportJob.organization_id == org.id, ExportJob.automatic.is_(True),
+                ExportJob.period_start == start, ExportJob.period_end == end,
+                ExportJob.status == ExportStatus.DONE))
+            if exists:
+                continue
+            data = engine.assembler.assemble(db, org, start, end)
+            if not _has_energy_data(data):
+                continue
+            created += engine.run(db, org, start, end, list(ExportFormat), automatic=True, data=data)
+    if created:
+        logger.info("%d jeu(x) de données RSE produit(s) automatiquement.", len(created))
+    return created
 
 
 def build_zip(job: ExportJob) -> bytes:

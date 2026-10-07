@@ -14,7 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
 from app.db import SessionLocal
-from app.services import predictions, regulatory
+from app.services import exports, predictions, regulatory
 from app.services.drift import run_detection
 from app.services.ingestion import ingest_all_for_day
 from app.timeutils import today_local
@@ -30,15 +30,19 @@ def run_daily_pipeline(today: date | None = None) -> None:
         logger.info("Pipeline quotidien : %d mesures ingérées pour le %s", count, yesterday)
         run_detection(db, yesterday)
         regulatory.refresh_statuses(db, today)
+        regulatory.send_reminders(db, today)
         predictions.refresh_predictions(db)
+        exports.produce_automatic(db, today)
 
 
 def dispatch_webhooks() -> None:
-    """Toutes les minutes : envoie les webhooks en attente (sorties validées, nouveaux documents)."""
-    from app.services import integrations
+    """Toutes les minutes : envoie les webhooks (sorties validées, nouveaux documents) et les e-mails
+    de notification en attente."""
+    from app.services import integrations, mailer
 
     with SessionLocal() as db:
         integrations.dispatch_pending(db)
+        mailer.dispatch_pending(db)
 
 
 def start_scheduler() -> BackgroundScheduler:

@@ -9,16 +9,19 @@ Principes ajoutés après le brief :
 - graphe physique des équipements pour 3 sites (les Boulangeries Martin restent sans graphe,
   pour montrer une recommandation « identifier la cause ») ;
 - un responsable énergie (Clinique du Parc) qui valide les sorties de la plateforme ;
-- toutes les sorties (anomalies, prévisions) sont créées « à valider » : aucune validation simulée.
+- toutes les sorties (anomalies, prévisions) sont créées « à valider ». Seule exception, signalée comme
+  « Historique de démonstration » : l'éclairage de l'entrepôt de Genas, resté allumé la nuit de novembre
+  2025 à avril 2026, dont l'anomalie a été validée et la recommandation appliquée le 6 avril 2026 ; il
+  sert à montrer la mesure des économies avant / après (F1).
 
 Usage : ``python -m app.seed``
 """
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -33,21 +36,35 @@ from app.models import (
     AuditorClientLink,
     Consent,
     DeliveryPoint,
+    Drift,
+    DriftStatus,
     EmissionFactor,
     Fluid,
+    Notification,
     Obligation,
     Organization,
+    OutgoingEmail,
     ProviderKind,
+    ReviewStatus,
     Role,
     Site,
     User,
 )
 from app.security import hash_password
-from app.services import assets, drift_explanations, predictions, recommendations, regulatory
+from app.services import (
+    anomaly_context,
+    assets,
+    drift_explanations,
+    exports,
+    integrations,
+    predictions,
+    recommendations,
+    regulatory,
+)
 from app.services.consent import grant_consent
-from app.services.drift import run_detection
+from app.services.drift import detect_baseload, run_detection
 from app.services.ingestion import ingest_delivery_point
-from app.timeutils import today_local, utcnow, yesterday_local
+from app.timeutils import LOCAL_TZ, today_local, utcnow, yesterday_local
 
 logger = logging.getLogger("effismart.seed")
 
@@ -327,6 +344,51 @@ def _ensure_demo_energy_managers(db: Session) -> None:
     db.commit()
 
 
+DEMO_HISTORY_REF = "30001000000005"
+DEMO_HISTORY_ANOMALY_DAY = date(2025, 11, 8)
+DEMO_HISTORY_NOTE = "Historique de démonstration : "
+
+
+def _local_dt(day: date, hour: int) -> datetime:
+    return datetime.combine(day, time(hour), tzinfo=LOCAL_TZ)
+
+
+def _create_demo_history(db: Session) -> None:
+    """Décisions humaines passées, simulées et signalées comme telles, pour la mesure avant / après (F1)."""
+    dp = db.scalar(select(DeliveryPoint).where(DeliveryPoint.external_ref == DEMO_HISTORY_REF))
+    auditor = db.scalar(select(User).where(User.email == "auditeur@effismart.demo"))
+    if dp is None or auditor is None or db.scalar(select(Drift.id).where(
+            Drift.delivery_point_id == dp.id, Drift.day == DEMO_HISTORY_ANOMALY_DAY)):
+        return
+    last_notification = db.scalar(select(func.max(Notification.id))) or 0
+    candidate = detect_baseload(db, dp, DEMO_HISTORY_ANOMALY_DAY, integrations.weather_provider(db))
+    if candidate is None:
+        logger.warning("Historique de démonstration : talon de nuit non détecté le %s.", DEMO_HISTORY_ANOMALY_DAY)
+        return
+    drift = Drift(delivery_point_id=dp.id, kind=candidate.kind, day=DEMO_HISTORY_ANOMALY_DAY,
+                  measured_value=round(candidate.measured, 2), reference_value=round(candidate.reference, 2),
+                  deviation_pct=round(candidate.deviation_pct, 1), unit=candidate.unit, details=candidate.details,
+                  detected_at=_local_dt(date(2025, 11, 9), 6))
+    db.add(drift)
+    db.flush()
+    drift_explanations.explain_drift(db, dp, drift, candidate)
+    drift.status, drift.qualified_by = DriftStatus.QUALIFIED, auditor.id
+    drift.qualified_at = _local_dt(date(2025, 11, 10), 9)
+    drift.comment = DEMO_HISTORY_NOTE + "éclairage de l'entrepôt resté allumé la nuit et le week-end."
+    rec = recommendations.propose_for_drift(db, drift)
+    rec.created_at = drift.qualified_at
+    rec.status, rec.reviewed_by = ReviewStatus.APPLIED, auditor.id
+    rec.reviewed_at = _local_dt(date(2025, 11, 12), 10)
+    rec.review_comment = DEMO_HISTORY_NOTE + "passage aux LED avec détection de présence, travaux prévus fin mars."
+    rec.applied_by, rec.applied_at = auditor.id, _local_dt(date(2026, 4, 6), 8)
+    rec.applied_comment = DEMO_HISTORY_NOTE + "LED et détecteurs de présence installés, horloge reprogrammée."
+    # Ces décisions sont passées : pas d'alerte « à valider » dans la cloche d'aujourd'hui.
+    for notification in db.scalars(select(Notification).where(Notification.id > last_notification)):
+        db.delete(notification)
+    db.commit()
+    logger.info("Historique de démonstration créé : « %s ».", rec.title)
+
+
 def upgrade(db: Session) -> None:
     """Mise à niveau idempotente d'une base existante (principes P1 et graphe physique)."""
     created = assets.sync_meter_nodes(db)
@@ -338,10 +400,15 @@ def upgrade(db: Session) -> None:
     explained = drift_explanations.backfill_explanations(db)
     if explained:
         logger.info("%d anomalie(s) existante(s) expliquée(s).", explained)
+    contextualized = anomaly_context.backfill(db)
+    if contextualized:
+        logger.info("%d anomalie(s) existante(s) replacée(s) dans le graphe des équipements (F2b).", contextualized)
     proposed = recommendations.propose_missing(db)
     if proposed:
         logger.info("%d recommandation(s) proposée(s) pour des anomalies déjà validées.", proposed)
     predictions.refresh_predictions(db)
+    regulatory.send_reminders(db)
+    exports.produce_automatic(db)
 
 
 def seed() -> None:
@@ -365,7 +432,11 @@ def seed() -> None:
             run_detection(db, day)
             day += timedelta(days=1)
         regulatory.refresh_statuses(db)
+        _create_demo_history(db)
         upgrade(db)
+        # Jeu de démonstration : pas d'e-mails pour des alertes « historiques » créées par le seed.
+        db.execute(delete(OutgoingEmail))
+        db.commit()
         logger.info("Seed terminé. Connexion : auditeur@effismart.demo / %s", DEMO_PASSWORD)
 
 

@@ -13,15 +13,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import DeliveryPoint, Drift, DriftKind, Fluid
-from app.services import assets
-from app.services.validation import Assessment, apply_assessment, fr, fr_kw
+from app.services import anomaly_context
+from app.services.validation import Assessment, apply_assessment, fr
 
 logger = logging.getLogger(__name__)
 
 ALGORITHMS = {
     DriftKind.THRESHOLD: "F2a « dépassement de seuil » v1",
     DriftKind.CLIMATE_DEVIATION: "F2a « écart climatique » v1 (régression N-1 × DJU)",
-    DriftKind.BASELOAD: "F2a « talon anormal » v1 (médiane des créneaux inoccupés)",
+    DriftKind.BASELOAD: "F2a « talon de nuit » v2 (moyenne de la nuit, médiane des nuits précédentes)",
+    DriftKind.OFF_HOURS: "F2a « consommation en inoccupation » v1 (talon du jour + écart habituel)",
 }
 RECURRENCE_WINDOW_DAYS = 90
 
@@ -120,19 +121,35 @@ def explain_drift(db: Session, dp: DeliveryPoint, drift: Drift, candidate=None) 
             a.factor(f"Peu de jours comparables en N-1 ({facts['n_points']})", -0.05)
         if str(facts.get("weather_source", "")).startswith("MOCK"):
             a.factor("DJU issus de la météo simulée (démonstration)", -0.05)
-    else:  # BASELOAD
-        a.step(f"Mesure : puissance moyenne de {fr(drift.measured_value)} kW sur les {facts['inactive_slots']} "
-               f"créneaux de 30 min inoccupés ({facts['period']}).")
-        a.step(f"Référence : talon médian de {fr(drift.reference_value)} kW sur les créneaux inoccupés des "
+    elif drift.kind == DriftKind.BASELOAD:
+        a.step(f"Mesure : puissance moyenne de {fr(drift.measured_value)} kW sur les {facts['night_slots']} "
+               f"créneaux de 30 min de {facts['period']}.")
+        a.step(f"Référence : talon médian de {fr(drift.reference_value)} kW sur les nuits des "
                f"{facts['reference_days']} jours précédents ({facts['reference_slots']} mesures).")
         a.step(f"Écart : {drift.deviation_pct:+.0f} % pour une tolérance de {_pct(facts['tolerance'])}, soit "
-               f"{fr(facts['excess_kw'])} kW en trop pendant {fr(facts['inactive_slots'] * 0.5, 1)} h.")
+               f"{fr(facts['excess_kw'])} kW en trop pendant {fr(facts['night_slots'] * 0.5, 1)} h.")
         _margin_factor(a, drift.deviation_pct, facts["tolerance"])
         cv = facts.get("reference_cv")
         if cv is not None and cv < 0.15:
             a.factor(f"Talon de référence stable (variation {_pct(cv)})", 0.1)
         elif cv is not None and cv > 0.35:
             a.factor(f"Talon de référence variable (variation {_pct(cv)})", -0.1)
+    else:  # OFF_HOURS
+        origin = "classe déduite des données" if facts.get("classes_learned") else "classe par défaut"
+        a.step(f"Mesure : puissance moyenne de {fr(drift.measured_value)} kW sur les {facts['off_slots']} "
+               f"créneaux de 30 min inoccupés hors nuit ({facts['period']}).")
+        a.step(f"Référence : {fr(drift.reference_value)} kW attendus = talon de nuit du jour même "
+               f"({fr(facts['talon'])} kW) + écart habituel entre inoccupation et nuit ({fr(facts['usual_gap'], 1)} kW, "
+               f"médiane de {facts['comparable_days']} jours comparables des {facts['window']} jours précédents : "
+               f"jours « {facts['day_class']} », {origin}). Partir du talon du jour évite de signaler deux fois "
+               "le même excès : un talon trop haut relève du détecteur « talon de nuit ».")
+        a.step(f"Écart : {drift.deviation_pct:+.0f} % pour une tolérance de {_pct(facts['tolerance'])}, soit "
+               f"{fr(facts['excess_kw'])} kW en trop pendant {fr(facts['off_slots'] * 0.5, 1)} h.")
+        _margin_factor(a, drift.deviation_pct, facts["tolerance"])
+        if facts["comparable_days"] >= 6:
+            a.factor(f"Référence établie sur {facts['comparable_days']} jours comparables", 0.05)
+        elif facts["comparable_days"] < 4:
+            a.factor(f"Peu de jours comparables ({facts['comparable_days']})", -0.05)
 
     if cov is not None:
         if cov >= 0.98:
@@ -148,16 +165,7 @@ def explain_drift(db: Session, dp: DeliveryPoint, drift: Drift, candidate=None) 
     elif occurrences == 1:
         a.factor("Première occurrence : peut être ponctuelle (événement, maintenance)", -0.05)
 
-    graph = assets.load_site_graph(db, site.id)
-    meter = graph.meter_for(dp.id)
-    consumers = graph.direct_consumers(meter.id) if meter else []
-    if consumers:
-        listed = ", ".join(f"{c.name} ({fr_kw(c.power_kw)})" if c.power_kw else c.name for c in consumers)
-        a.step(f"Graphe physique : ce compteur alimente {listed}. Une fois l'anomalie validée, la plateforme "
-               "proposera une recommandation ciblée, elle aussi à valider.")
-    else:
-        a.step("Graphe physique : aucun équipement n'est modélisé derrière ce compteur ; la cause ne pourra pas "
-               "être localisée tant que le graphe du site n'est pas complété.")
+    # F2b : qualification et propagation d'impact par le graphe physique, ajoutées par `anomaly_context`.
     a.step("Statut : proposition de la plateforme, à valider par l'auditeur ou le responsable énergie. "
            "Aucune action n'est déclenchée automatiquement.")
 
@@ -173,6 +181,7 @@ def explain_drift(db: Session, dp: DeliveryPoint, drift: Drift, candidate=None) 
     else:
         a.gain_basis = "Gain non chiffrable : le détail du calcul n'est pas disponible."
     apply_assessment(db, drift, a, dp.fluid, drift.day)
+    anomaly_context.contextualize(db, drift)
 
 
 def backfill_explanations(db: Session) -> int:

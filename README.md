@@ -1,8 +1,9 @@
 # EffiSmart — V1
 
 SaaS de suivi énergétique et de conformité réglementaire pour PME/ETI, piloté par l'auditeur énergétique.
-Cette V1 implémente strictement le brief technique : F1 (dashboard), F2a (dérives), F3 (réglementaire),
-F4 (exports OPERAT + VSME), F5 (espace client en lecture seule), sur données **mock** réalistes.
+Cette V1 implémente le brief technique et le périmètre F1–F5 de l'étude de marché : F1 (tableau de bord),
+F2 (alertes à deux étages : F2a seuils et dérive, F2b anomalies contextualisées), F3 (réglementaire),
+F4 (données énergie RSE : OPERAT + VSME), F5 (espace client en lecture seule), sur données **mock** réalistes.
 
 ## Démarrage rapide : version 100 % Python (sans Docker)
 
@@ -126,7 +127,7 @@ Les points de démonstration ont une physique de bâtiment réaliste (`DEMO_BEHA
 | Atelier central (Boulangeries Martin) | fours : chauffage seulement sous 15 °C ; inertie ~1 jour ; gaz : production le samedi, fermé le dimanche |
 | Boutique Bellecour | vitrine plein sud (forts apports solaires), construction légère, fermée le lundi |
 | Clinique du Parc | béton lourd (inertie ~3 jours), besoin de chauffage non linéaire, groupe froid au-delà de 21 °C |
-| Entrepôt Genas | bardage métallique (peu d'inertie), chauffé hors gel sous 12 °C, réassort du lundi |
+| Entrepôt Genas | bardage métallique (peu d'inertie), chauffé hors gel sous 12 °C, réassort du lundi ; éclairage resté allumé la nuit et le week-end du 3/11/2025 au 5/04/2026, corrigé le 6/04 (scénario « avant / après ») |
 | Bureaux Part-Dieu | façades vitrées, pompe à chaleur réversible (climatisation au-delà de 22 °C), vendredi en télétravail |
 
 Les autres points (créés par l'utilisateur, tests) gardent le comportement standard : DJU base 18 °C du jour.
@@ -134,13 +135,94 @@ Anomalies récurrentes de la démo (`DEFAULT_ANOMALIES`) :
 
 | Point | Anomalie | Dérive attendue |
 |---|---|---|
-| 30001000000003 (Clinique) | groupe froid allumé le week-end (semaines ISO multiples de 3) | Talon anormal |
+| 30001000000003 (Clinique) | groupe froid en marche le week-end de 6 h à 22 h (semaines ISO multiples de 3) | Consommation en inoccupation |
 | 30001000000005 (Logistique) | pic de puissance l'après-midi (1 jour sur 11) | Dépassement de seuil |
 | 30001000000006 (Logistique) | surconsommation en occupation (semaines multiples de 7) | Écart climatique |
+| 30001000000006 (Logistique) | éclairage des bureaux resté allumé la nuit (semaines multiples de 5) | Talon de nuit anormal |
 | 21000000000008 (Clinique, gaz) | chaudière déréglée (semaines multiples de 8) | Écart climatique |
 
 Le point 30001000000004 est volontairement **sans consentement** pour illustrer l'étape d'onboarding
 (onglet « Patrimoine & consentements »).
+
+## Périmètre F1–F5 confirmé par l'étude de marché
+
+| Code | Fonctionnalité | Bénéficiaire | Données | Dans EffiSmart |
+|---|---|---|---|---|
+| F1 | Tableau de bord de pilotage : consommations, indicateurs de performance, évolution avant / après recommandations | Auditeur + client | N1 (N0 dégradé) | « Tableau de bord » : KPI, courbe, mois ; intensité kWh/m², €/m², kgCO₂e/m² sur 12 mois ; section « Avant / après recommandations » |
+| F2a | Alertes : seuils et dérive (V1), purement statistiques | Auditeur + client | N1 | 4 détecteurs ; alerte dans la cloche **et par e-mail** dès la détection (valideurs), puis à la validation (tout le client) |
+| F2b | Anomalies contextualisées (V2) : qualification et propagation d'impact par le graphe P2 | Auditeur + client | N1 + graphe | équipement suspect, zones et usages potentiellement impactés, sur chaque anomalie, dans l'alerte et l'e-mail |
+| F3 | Suivi réglementaire : calendrier, rappels d'échéances, historique des actions | Auditeur | N0 | « Réglementaire » ; **rappels automatiques** à J-60, J-30, J-7, le jour J, puis en retard (cloche et e-mail) |
+| F4 | Données énergie pour les rapports RSE, produites sans ressaisie | Client | N0 / N1 | « Données RSE » : OPERAT et VSME B3 **produits automatiquement** (année écoulée, année en cours chaque mois) |
+| F5 | Espace client : tableau de bord en lecture seule, suivi en autonomie | Client | N1 | espace client (lecture seule ; le responsable énergie valide en plus) |
+
+EffiSmart fournit la **brique énergie** des rapports RSE ; il ne produit pas le rapport de durabilité complet,
+dont les volets social et gouvernance sont hors de son périmètre.
+
+**Niveaux de données** (`app/services/energy_data.py`) :
+
+- **N1** : compteurs communicants (Linky, Gazpar, connecteurs), courbe 30 min ou relevé journalier, avec
+  consentement ;
+- **N0** : factures et relevés d'index. L'auditeur les saisit, ou importe un tableur CSV
+  (`point;debut;fin;kwh;montant`), depuis la page « Documents », souvent à partir d'un dépôt du client.
+
+Jour par jour, la mesure N1 prime ; un jour sans mesure reçoit sa part des périodes N0, au prorata des jours.
+En mode dégradé (N0 seul), le tableau de bord, les indicateurs et les données RSE fonctionnent, mais sans
+courbe de charge, sans détection d'anomalies et sans prévision journalière. Chaque fichier RSE indique la part
+issue des factures.
+
+**Avant / après recommandations** (`app/services/savings.py`, méthode inspirée de l'IPMVP option C) :
+
+- **période de référence** : depuis la première anomalie validée qui a motivé l'action ;
+- **modèle de référence** : le moteur de prévision v2, appris sur cette seule période ;
+- **suivi** : à partir du lendemain de l'application déclarée, au moins 14 jours ;
+- **calcul** : économie = consommation attendue sans l'action (météo réelle) − consommation mesurée ;
+- **contrôle** : si le suivi sort de la plage de températures de la référence, la plateforme signale
+  l'extrapolation et baisse sa confiance.
+
+Comme toute sortie algorithmique (principe 1), la mesure n'est visible du client qu'une fois validée, figée
+telle que validée. Démo : éclairage de l'entrepôt de Genas, 56 MWh économisés en 6 mois (−14 %).
+
+**F2 : alertes à deux étages**. « Alertes automatiques » et « alertes sur les anomalies » sont une même
+fonctionnalité à deux niveaux de maturité.
+
+*F2a, seuils et dérive* (`app/services/drift.py`) : quatre détecteurs purement statistiques, sans IA,
+entièrement faisables en N1.
+
+| Détecteur | Mesure | Référence |
+|---|---|---|
+| Dépassement de seuil | pic de puissance (élec.) ou consommation du jour (gaz) | 90 % de la puissance souscrite, ou seuil fixé par point |
+| Écart à l'historique corrigé du climat | consommation du jour | même période N-1, régression sur les DJU, jours de la même classe de fonctionnement |
+| Talon de nuit anormal | puissance moyenne de 22 h à 6 h | médiane des nuits des 28 jours précédents |
+| Consommation en période d'inoccupation | puissance moyenne hors nuit : le week-end de 6 h à 22 h ; les jours ouvrés, avant 7 h et après 20 h | talon de nuit **du jour même** + écart habituel des jours comparables |
+
+Partir du talon du jour évite de signaler deux fois un même excès : un équipement resté en marche nuit et
+jour relève du talon de nuit ; un équipement qui ne tourne qu'en journée le week-end relève de l'inoccupation.
+Horaires réglables (`EFFISMART_OCCUPANCY_START_HOUR`, `EFFISMART_OCCUPANCY_END_HOUR`, `EFFISMART_INACTIVE_NIGHT_*`).
+
+*F2b, anomalies contextualisées* (`app/services/anomaly_context.py`) : l'anomalie est replacée dans le graphe
+physique du site (principe 2).
+
+1. **Qualification** : nature probable (équipement resté en marche la nuit, fonctionnement hors occupation,
+   dérive de régulation, appel de puissance) et équipement suspect. Les règles physiques sont celles des
+   recommandations : catégorie, puissance nominale comparée à l'excès, zones occupées 24 h/24, saison. La
+   recommandation visera donc l'équipement suspect.
+2. **Propagation d'impact** : depuis l'équipement suspect, la plateforme suit les relations en aval
+   (produit → alimente → dessert → accueille) : « Dérive détectée sur « Chaudière » ; zones potentiellement
+   impactées : Atelier 2, Bureaux R+1. »
+3. **Anomalies à examiner ensemble** : deux anomalies du même site, à un jour près, qui touchent les mêmes
+   zones ou le même équipement sont rapprochées (une cause commune est possible, pas certaine).
+
+Le contexte figure sur la carte de l'anomalie (avec le graphe surligné), dans son raisonnement, dans l'alerte
+et l'e-mail, dans les webhooks et l'API (`context`). C'est une hypothèse (principe 1) : elle suit le graphe tant
+que l'anomalie est à valider, puis elle est figée telle que validée. Sans graphe derrière le compteur,
+l'anomalie reste signalée par F2a mais « non localisée ».
+
+**E-mails** (`app/services/mailer.py`) :
+
+- **serveur** : SMTP réglé par l'administrateur (« Intégrations », « Envoi des e-mails ») ;
+- **sans serveur** : en version locale, chaque e-mail est écrit dans `backend/data/outbox/` (fichier .eml) ;
+- **préférence** : chaque utilisateur coupe ses e-mails dans « Mon compte », l'alerte reste dans la cloche ;
+- **envoi** : file d'envoi avec réessais, traitée à chaque alerte et chaque minute par le planificateur.
 
 ## Principe 1 : la plateforme propose, un humain décide
 
@@ -152,7 +234,7 @@ l'exposition en responsabilité. Code : `app/services/validation.py`.
 
 | Sortie | Produite par | Raisonnement | Gain estimé |
 |---|---|---|---|
-| Anomalie (dérive) | détecteurs F2a | donnée analysée, référence et méthode, écart, récurrence, équipements du compteur | excès du jour × occurrences par an (rythme observé sur 90 jours) |
+| Anomalie (dérive) | détecteurs F2a, contexte F2b | donnée analysée, référence et méthode, écart, récurrence, équipement suspect et zones impactées | excès du jour × occurrences par an (rythme observé sur 90 jours) |
 | Recommandation | une anomalie **validée** + le graphe physique | équipements candidats, exclusions, correspondance de puissance, chaîne physique | gain de l'anomalie × part attribuable à l'équipement |
 | Prévision | moteur v2 : modèles mis en concurrence, validés hors échantillon (voir « Moteur de prévision ») | classes de fonctionnement, modèles comparés, inertie, sol-air, mesuré, projeté, intervalle, comparaison à N-1 | écart projeté à l'année précédente |
 
@@ -247,8 +329,9 @@ Compteur → alimente → Chaudière → produit → Eau chaude → alimente →
   partagé par plusieurs zones, une boucle de récupération de chaleur est tolérée.
 - **Pertinence physique** : une chaîne ne mène qu'aux usages que chacun de ses équipements peut servir (un
   groupe froid ne mène pas au chauffage, une CTA ne produit pas d'eau chaude sanitaire).
-- **Usage par les recommandations** : l'équipement visé est choisi dans le graphe. Un talon anormal de
-  52 kW le week-end désigne le groupe froid de 55 kW ; la salle serveurs, qui fonctionne en continu, est
+- **Usage par les anomalies (F2b) et les recommandations** : l'équipement suspect est choisi dans le graphe,
+  puis l'impact est propagé aux zones et usages en aval. Un excès de 52 kW le week-end désigne le groupe
+  froid de 55 kW ; la salle serveurs, qui fonctionne en continu, est
   écartée, comme tout équipement qui ne dessert que des zones occupées 24 h/24. Pour un pic de puissance,
   c'est la hausse par rapport au pic habituel qui est comparée aux puissances nominales. Les maillons
   manquants sont signalés, car ils empêchent de localiser une anomalie.
@@ -387,3 +470,12 @@ Toutes sont dans `backend/app/config.py`, surchargeables par variable d'environn
     comportant une anomalie restent dans l'apprentissage (les exclure serait une amélioration ultérieure) ;
     le détecteur « écart climatique » garde sa régression N-1 sur les DJU du jour, mais par classe de
     fonctionnement apprise (sans inertie ni sol-air : une alerte doit rester simple à vérifier).
+14. **Périmètre F1–F5** (migration `0006_scope_f1_f5`) :
+    - **N0 / N1** : les saisies N0 ne demandent pas de consentement Enedis / GRDF, puisque le client fournit
+      lui-même ses factures.
+    - **Indicateurs de performance** : bruts (kWh/m², €/m², kgCO₂e/m²) ; la correction climatique est
+      réservée aux prévisions et à la mesure avant / après, validées par un humain.
+    - **Estimation du gain d'une anomalie persistante** : elle est sous-évaluée, car le détecteur de talon ne
+      signale qu'un changement. La mesure avant / après corrige l'ordre de grandeur (entrepôt : 3 MWh/an
+      estimés, 112 MWh/an mesurés).
+    - **Démo** : seule exception à « aucune décision simulée », signalée par « Historique de démonstration ».

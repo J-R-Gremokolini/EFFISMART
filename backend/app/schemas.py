@@ -181,6 +181,8 @@ class DriftOut(ExplanationOut):
     status: DriftStatus
     comment: str | None
     detected_at: datetime
+    # F2b : qualification et propagation d'impact par le graphe des équipements (équipement suspect, zones…).
+    context: dict | None = None
 
 
 class DriftUpdate(BaseModel):

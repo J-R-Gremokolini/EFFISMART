@@ -25,6 +25,7 @@ def configure_local_environment() -> None:
     os.environ.setdefault("EFFISMART_EXPORT_DIR", str(DATA_DIR / "exports"))
     os.environ.setdefault("EFFISMART_DOCUMENT_DIR", str(DATA_DIR / "documents"))
     os.environ.setdefault("EFFISMART_SECRET_KEY_FILE", str(DATA_DIR / "secret.key"))
+    os.environ.setdefault("EFFISMART_MAIL_OUTBOX_DIR", str(DATA_DIR / "outbox"))
     os.environ.setdefault("EFFISMART_ENABLE_SCHEDULER", "false")
 
 
@@ -75,7 +76,7 @@ def catch_up() -> int:
 
     from app.db import SessionLocal
     from app.models import DeliveryPoint
-    from app.services import integrations, predictions, regulatory
+    from app.services import exports, integrations, mailer, predictions, regulatory
     from app.services.consent import active_consent_clause
     from app.services.dashboard import data_as_of
     from app.services.drift import run_detection
@@ -100,7 +101,10 @@ def catch_up() -> int:
                 run_detection(db, day, delivery_point_ids=[dp.id])
                 caught_up += 1
         regulatory.refresh_statuses(db)
+        regulatory.send_reminders(db)
         predictions.refresh_predictions(db)
+        exports.produce_automatic(db)
         integrations.dispatch_pending(db)
+        mailer.dispatch_pending(db)
     logger.info("Rattrapage terminé : %d jour(s) x point(s)", caught_up)
     return caught_up

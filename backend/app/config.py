@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     integrations_allow_private_urls: bool = False
     partner_api_rate_limit_per_minute: int = 120
     webhook_max_attempts: int = 5
+
+    # --- Notifications par e-mail (F2, F3) ---------------------------------
+    # Sans serveur SMTP activé, la version locale écrit les e-mails dans ce dossier (lisibles, jamais envoyés).
+    mail_outbox_dir: str = ""
+    mail_max_attempts: int = 5
+    public_url: str = "http://localhost:8501"  # lien inséré dans les e-mails
+    # F3 : rappels d'échéance, en jours avant la date (puis un rappel « en retard »).
+    reminder_days: list[int] = [60, 30, 7, 0]
     cors_origins: list[str] = ["http://localhost:5173"]
 
     # --- Données énergie ------------------------------------------------
@@ -65,10 +73,15 @@ class Settings(BaseSettings):
     threshold_ratio_of_subscribed_power: float = 0.9
     climate_deviation_tolerance: float = 0.20
     climate_regression_window_days: int = 28
+    # Talon de nuit : créneaux 22 h – 6 h, comparés à la médiane des nuits des 28 jours précédents.
     baseload_tolerance: float = 0.40
     baseload_reference_days: int = 28
     inactive_night_start_hour: int = 22
     inactive_night_end_hour: int = 6
+    # Inoccupation hors nuit : week-end de 6 h à 22 h, jours ouvrés avant l'arrivée et après le départ.
+    occupancy_start_hour: int = 7
+    occupancy_end_hour: int = 20
+    off_hours_tolerance: float = 0.30
     dju_base_temperature: float = 18.0
     notify_clients_on_drift: bool = True
     # Nombre de jours analysés rétroactivement après un nouveau consentement / au seed.

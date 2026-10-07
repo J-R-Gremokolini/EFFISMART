@@ -88,6 +88,21 @@ PLATFORM_SPECS: dict[IntegrationKind, dict] = {
                      "longitude": {"label": "Longitude", "default": 2.3522}},
         "secrets": {},
     },
+    IntegrationKind.SMTP: {
+        "label": "Envoi des e-mails (SMTP)",
+        "description": "Notification immédiate par e-mail : alertes à valider, décisions, rappels d'échéances "
+                       "réglementaires. Tant qu'aucun serveur n'est activé, la version locale écrit les e-mails "
+                       "dans le dossier backend/data/outbox au lieu de les envoyer.",
+        "settings": {
+            "host": {"label": "Serveur SMTP", "type": "text", "default": ""},
+            "port": {"label": "Port", "type": "int", "default": 587},
+            "security": {"label": "Sécurité", "options": ["starttls", "ssl", "aucune"], "default": "starttls"},
+            "sender": {"label": "Adresse d'expédition", "type": "text", "default": "alertes@effismart.local"},
+            "username": {"label": "Identifiant (facultatif)", "type": "text", "default": ""},
+        },
+        "secrets": {"password": "Mot de passe (facultatif)"},
+        "optional_secrets": True,
+    },
 }
 PROVIDER_TO_INTEGRATION = {
     ProviderKind.ENEDIS_DATACONNECT: IntegrationKind.ENEDIS_DATACONNECT,
@@ -144,13 +159,24 @@ def save_platform(db: Session, user: User, kind: IntegrationKind, *, enabled: bo
                 raise IntegrationError(f"{field['label']} : nombre attendu.") from exc
             if not (-90 <= value <= 90 if name == "latitude" else -180 <= value <= 180):
                 raise IntegrationError(f"{field['label']} hors limites.")
+        elif field.get("type") == "int":
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise IntegrationError(f"{field['label']} : nombre entier attendu.") from exc
+            if not 1 <= value <= 65535:
+                raise IntegrationError(f"{field['label']} hors limites.")
+        elif field.get("type") == "text":
+            value = str(value or "").strip()[:200]
         clean[name] = value
+    if kind == IntegrationKind.SMTP and enabled and (not clean.get("host") or "@" not in clean.get("sender", "")):
+        raise IntegrationError("Renseignez le serveur SMTP et une adresse d'expédition valide avant d'activer l'envoi.")
     stored = secret_store.decrypt(row.secrets_encrypted)
     for name in spec["secrets"]:
         new_value = (secrets_values.get(name) or "").strip()
         if new_value:
             stored[name] = new_value
-    if enabled and any(not stored.get(name) for name in spec["secrets"]):
+    if enabled and not spec.get("optional_secrets") and any(not stored.get(name) for name in spec["secrets"]):
         raise IntegrationError("Renseignez tous les identifiants avant d'activer cette source.")
     row.enabled = enabled
     row.settings = clean
@@ -180,6 +206,17 @@ def test_platform(db: Session, user: User, kind: IntegrationKind) -> tuple[bool,
     _require_admin(user)
     row = get_platform(db, kind)
     try:
+        if kind == IntegrationKind.SMTP:
+            from app.services import mailer
+
+            values = platform_settings(row)
+            values["password"] = secret_store.decrypt(row.secrets_encrypted).get("password", "")
+            if not values.get("host"):
+                raise RuntimeError("aucun serveur SMTP renseigné")
+            message = mailer.test_connection(values)
+            row.last_test_at, row.last_test_ok, row.last_test_message = utcnow(), True, message[:500]
+            db.commit()
+            return True, message
         instance = _platform_instance(row)
         if kind == IntegrationKind.OPEN_METEO:
             from app.timeutils import yesterday_local
@@ -373,6 +410,7 @@ WEBHOOK_EVENTS = {
     "drift.validated": "Anomalie validée",
     "recommendation.validated": "Recommandation validée",
     "recommendation.applied": "Recommandation déclarée appliquée",
+    "savings.validated": "Économies mesurées validées (avant / après)",
     "prediction.validated": "Prévision validée",
     "document.deposited": "Nouveau document déposé",
 }
@@ -526,12 +564,16 @@ def send_test(db: Session, user: User, webhook_id: int) -> WebhookDelivery:
 
 
 def dispatch_in_background() -> None:
-    """Envoi sans bloquer l'interface (mode local, après un dépôt ou une analyse)."""
+    """Envoi sans bloquer l'interface (mode local, après un dépôt, une décision ou une analyse) :
+    webhooks et e-mails de notification."""
+    from app.services import mailer
+
     def run() -> None:
         with SessionLocal() as db:
-            try:
-                dispatch_pending(db)
-            except Exception:
-                logger.exception("Envoi des webhooks impossible")
+            for name, dispatch in (("webhooks", dispatch_pending), ("e-mails", mailer.dispatch_pending)):
+                try:
+                    dispatch(db)
+                except Exception:
+                    logger.exception("Envoi des %s impossible", name)
 
-    threading.Thread(target=run, name="effismart-webhooks", daemon=True).start()
+    threading.Thread(target=run, name="effismart-envois", daemon=True).start()

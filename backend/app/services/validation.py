@@ -27,6 +27,7 @@ from app.models import (
     DriftStatus,
     Fluid,
     Notification,
+    Organization,
     Prediction,
     Recommendation,
     ReviewStatus,
@@ -214,11 +215,19 @@ def _recipients(db: Session, organization_id: int, *, validators_only: bool) -> 
 
 
 def notify(db: Session, organization_id: int, message: str, *, validators_only: bool,
-           exclude_user_id: int | None = None, drift_id: int | None = None) -> None:
-    """`validators_only` : sortie non validée, seuls ses valideurs sont prévenus. Pas de commit ici."""
+           exclude_user_id: int | None = None, drift_id: int | None = None, email: bool = True) -> None:
+    """Alerte dans l'application et, si l'utilisateur l'accepte, e-mail immédiat (F2). Pas de commit ici.
+
+    `validators_only` : sortie non validée, seuls ses valideurs sont prévenus.
+    """
+    from app.services import mailer  # import local : évite un cycle
+
+    organization = db.get(Organization, organization_id)
     for user in _recipients(db, organization_id, validators_only=validators_only):
         if user.id != exclude_user_id:
             db.add(Notification(user_id=user.id, drift_id=drift_id, organization_id=organization_id, message=message))
+            if email:
+                mailer.enqueue(db, user, message, organization.name if organization else None)
 
 
 # --- Décisions -----------------------------------------------------------------------------------------
@@ -234,6 +243,7 @@ def drift_payload(db: Session, drift: Drift) -> dict:
         "status": drift.status.value, "comment": drift.comment,
         "validated_by_role": validator_role(db.get(User, drift.qualified_by) if drift.qualified_by else None),
         "validated_at": drift.qualified_at.isoformat() if drift.qualified_at else None,
+        "context": drift.context,  # F2b : équipement suspect, zones et usages potentiellement impactés
         **explanation_dict(drift),
     }
 
@@ -269,7 +279,7 @@ def review_drift(
 ) -> tuple[Drift, Recommendation | None]:
     """Valide, écarte ou rouvre une anomalie. Une anomalie validée déclenche une recommandation *proposée*
     (elle-même à valider) ; renvoie cette recommandation, nouvelle ou existante."""
-    from app.services import integrations, recommendations  # imports locaux : évitent un cycle
+    from app.services import anomaly_context, integrations, recommendations  # imports locaux : évitent un cycle
     from app.services.drift import DRIFT_LABELS
 
     _require_validator(user)
@@ -285,9 +295,11 @@ def review_drift(
 
     recommendation = None
     if status == DriftStatus.QUALIFIED and previous != DriftStatus.QUALIFIED:
+        context = anomaly_context.short_text(drift.context)
         notify(db, organization_id,
                f"Anomalie validée par {validator_label(user)} : {DRIFT_LABELS[drift.kind].lower()} le "
-               f"{drift.day:%d/%m/%Y}, {dp.site.name} ({dp.external_ref})",
+               f"{drift.day:%d/%m/%Y}, {dp.site.name} ({dp.external_ref})"
+               + (f". {context[0].upper()}{context[1:]}" if context else ""),
                validators_only=False, exclude_user_id=user.id, drift_id=drift.id)
         integrations.enqueue_event(db, "drift.validated", organization_id, drift_payload(db, drift))
         recommendation = recommendations.propose_for_drift(db, drift)
@@ -315,6 +327,7 @@ def review_recommendation(
         rec.applied_comment = _clean_comment(comment, required=False)
     elif rec.status == ReviewStatus.APPLIED:  # retour à « validée » : la déclaration était erronée
         rec.applied_by = rec.applied_at = rec.applied_comment = None
+        rec.savings_snapshot = rec.savings_validated_by = rec.savings_validated_at = None
     else:
         comment = _clean_comment(comment, required=status == ReviewStatus.REJECTED,
                                  what="écartez cette recommandation")
@@ -333,6 +346,32 @@ def review_recommendation(
         notify(db, rec.organization_id, f"Recommandation appliquée (déclarée par {validator_label(user)}) : {rec.title}",
                validators_only=False, exclude_user_id=user.id)
         integrations.enqueue_event(db, "recommendation.applied", rec.organization_id, recommendation_payload(db, rec))
+    db.commit()
+    return rec
+
+
+def validate_savings(db: Session, repo: TenantRepository, user: User, recommendation_id: int) -> Recommendation:
+    """F1 « avant / après » : un humain valide la mesure des économies ; elle est figée telle que validée et
+    devient visible du client. Une nouvelle validation remplace la précédente (suivi plus long)."""
+    from app.services import integrations, savings
+
+    _require_validator(user)
+    rec = repo.get_recommendation(recommendation_id)
+    if rec.status != ReviewStatus.APPLIED:
+        raise ValidationError("Seule une recommandation déclarée appliquée a des économies à mesurer.")
+    measurement = savings.measure(db, rec)
+    if measurement is None:
+        raise ValidationError("Mesure impossible pour l'instant : il faut au moins 14 jours de suivi après "
+                              "l'application et les données du compteur concerné.")
+    rec.savings_snapshot = measurement.as_dict()
+    rec.savings_validated_by, rec.savings_validated_at = user.id, utcnow()
+    notify(db, rec.organization_id,
+           f"Économies mesurées validées par {validator_label(user)} : {fr(measurement.annualized_kwh)} kWh par an "
+           f"({rec.title})", validators_only=False, exclude_user_id=user.id)
+    integrations.enqueue_event(db, "savings.validated", rec.organization_id, {
+        **recommendation_payload(db, rec), "savings": rec.savings_snapshot,
+        "savings_validated_by_role": validator_role(user), "savings_validated_at": rec.savings_validated_at.isoformat(),
+    })
     db.commit()
     return rec
 

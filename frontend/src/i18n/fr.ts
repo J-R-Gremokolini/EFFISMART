@@ -87,7 +87,8 @@ export const fr = {
     kinds: {
       THRESHOLD: 'Dépassement de seuil',
       CLIMATE_DEVIATION: 'Écart climatique (N-1 / DJU)',
-      BASELOAD: 'Talon anormal',
+      BASELOAD: 'Talon de nuit anormal',
+      OFF_HOURS: 'Consommation en inoccupation',
     },
     statuses: { OPEN: 'Ouverte', QUALIFIED: 'Qualifiée', IGNORED: 'Ignorée' },
   },

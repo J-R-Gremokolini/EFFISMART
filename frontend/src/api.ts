@@ -2,7 +2,7 @@
 
 export type Role = 'AUDITOR' | 'CLIENT_VIEWER' | 'ADMIN';
 export type Fluid = 'ELEC' | 'GAS';
-export type DriftKind = 'THRESHOLD' | 'CLIMATE_DEVIATION' | 'BASELOAD';
+export type DriftKind = 'THRESHOLD' | 'CLIMATE_DEVIATION' | 'BASELOAD' | 'OFF_HOURS';
 export type DriftStatus = 'OPEN' | 'QUALIFIED' | 'IGNORED';
 export type Obligation = 'DECRET_TERTIAIRE_OPERAT' | 'AUDIT_EED' | 'VSME';
 export type DeadlineStatus = 'UPCOMING' | 'DUE_SOON' | 'DONE';
@@ -113,6 +113,8 @@ export interface Drift {
   status: DriftStatus;
   comment: string | null;
   detected_at: string;
+  // F2b : équipement suspect, zones et usages potentiellement impactés (graphe des équipements).
+  context?: { localisation: string; summary: string; nature_label: string } | null;
 }
 
 export interface Notification {

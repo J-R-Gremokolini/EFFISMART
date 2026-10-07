@@ -146,9 +146,10 @@ def project(db: Session, site: Site, fluid: Fluid, points: list[DeliveryPoint], 
            + simpler)
     if config.family != "v1":
         if config.inertia:
-            a.step(f"Inertie : la consommation répond à la température moyenne des {config.inertia + 1} derniers jours "
-                   "(Paudel, 2016 : 1 à 2 jours pour un bâtiment conventionnel, 3 pour un bâtiment basse "
-                   "consommation).")
+            previous_days = "de la veille" if config.inertia == 1 else f"des {config.inertia} jours précédents"
+            a.step(f"Inertie de {config.inertia} jour(s) : la consommation répond à la température moyenne du jour "
+                   f"et {previous_days} (Paudel, 2016 : 1 à 2 jours pour un bâtiment conventionnel, 3 pour un "
+                   "bâtiment basse consommation).")
         else:
             a.step("Inertie : tenir compte des jours précédents n'améliore pas la prévision ; la consommation suit "
                    "la température du jour.")

@@ -313,6 +313,8 @@ html, [data-testid="stMain"], [data-testid="stAppViewContainer"] { scroll-paddin
 .es-output-gain { font-size: 15px; color: var(--color-text-2); margin: 8px 0 4px; }
 .es-output-gain b { color: var(--color-text); }
 .es-output-meta { font-size: 13px; color: var(--color-muted); margin-top: 4px; }
+.es-output-context { border-left: 3px solid var(--color-accent); padding: 6px 0 6px 12px; margin: 10px 0 6px; }
+.es-output-context .es-output-head { margin-bottom: 4px; }
 ol.es-steps { margin: 4px 0 12px 20px; padding: 0; }
 ol.es-steps li { margin: 5px 0; font-size: 14px; color: var(--color-text-2); line-height: 1.5; }
 ul.es-factors { list-style: none; margin: 4px 0 8px; padding: 0; }

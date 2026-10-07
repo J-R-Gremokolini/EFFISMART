@@ -1,4 +1,4 @@
-"""F2a — Détection de dérives sur données mock avec anomalies injectées."""
+"""F2a — Seuils et dérive : détection sur données mock avec anomalies injectées."""
 from datetime import date, timedelta
 
 import pytest
@@ -46,27 +46,50 @@ def _kinds(drifts: list[Drift]) -> set[DriftKind]:
     return {d.kind for d in drifts}
 
 
-def test_weekend_equipment_left_on_raises_baseload_drift(db, dp):
-    """Critère d'acceptation : équipement allumé un week-end → dérive « talon anormal »."""
+def test_weekend_equipment_left_on_raises_off_hours_drift(db, dp):
+    """Critère d'acceptation : équipement en marche un samedi en journée → « consommation en période
+    d'inoccupation ». La nuit est normale : pas de talon de nuit anormal."""
     anomaly_day = date(2025, 6, 14)  # samedi
     _use_mock([AnomalySpec(REF, AnomalyKind.WEEKEND_ON, between(anomaly_day, anomaly_day), 0.35)])
     ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
 
     drifts = run_detection(db, anomaly_day, delivery_point_ids=[dp.id])
-    baseload = [d for d in drifts if d.kind == DriftKind.BASELOAD]
-    assert len(baseload) == 1
-    drift = baseload[0]
+    assert _kinds(drifts) == {DriftKind.OFF_HOURS}
+    drift = drifts[0]
     # Une dérive porte : type, date, point de livraison, écart chiffré, statut.
     assert drift.day == anomaly_day
     assert drift.delivery_point_id == dp.id
-    assert drift.deviation_pct > 40
+    assert drift.deviation_pct > 30
     assert drift.status == DriftStatus.OPEN
+    assert "talon de nuit du jour même" in " ".join(drift.reasoning)
 
 
-def test_normal_weekend_raises_no_baseload_drift(db, dp):
+def test_equipment_left_on_at_night_raises_night_baseload_drift(db, dp):
+    """Talon de nuit anormal un mercredi : signalé comme tel, et pas comme consommation en inoccupation."""
+    day = date(2025, 6, 11)
+    _use_mock([AnomalySpec(REF, AnomalyKind.NIGHT_ON, between(day, day), 0.2)])
+    ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
+    drifts = run_detection(db, day, delivery_point_ids=[dp.id])
+    assert _kinds(drifts) == {DriftKind.BASELOAD}
+    assert drifts[0].unit == "kW" and drifts[0].deviation_pct > 40
+
+
+def test_same_excess_day_and_night_is_reported_once(db, dp):
+    """Équipement resté en marche tout le samedi, nuit comprise : l'attendu en inoccupation part du talon du
+    jour, déjà trop haut ; seul le talon de nuit est signalé (un même excès, une seule alerte)."""
+    day = date(2025, 6, 14)
+    _use_mock([AnomalySpec(REF, AnomalyKind.WEEKEND_ON, between(day, day), 0.3),
+               AnomalySpec(REF, AnomalyKind.NIGHT_ON, between(day, day), 0.3)])
+    ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
+    assert _kinds(run_detection(db, day, delivery_point_ids=[dp.id])) == {DriftKind.BASELOAD}
+
+
+def test_normal_days_raise_no_night_or_off_hours_drift(db, dp):
     _use_mock([])
     ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
-    assert DriftKind.BASELOAD not in _kinds(run_detection(db, date(2025, 6, 7), delivery_point_ids=[dp.id]))
+    for day in (date(2025, 6, 7), date(2025, 6, 8), date(2025, 6, 10), date(2025, 6, 13)):
+        found = _kinds(run_detection(db, day, delivery_point_ids=[dp.id]))
+        assert not found & {DriftKind.BASELOAD, DriftKind.OFF_HOURS}, day
 
 
 def test_power_spike_raises_threshold_drift(db, dp):

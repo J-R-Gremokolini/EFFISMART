@@ -1,9 +1,14 @@
-"""F2a — Détection de dérives de consommation.
+"""F2a — Seuils et dérive : détection des anomalies de consommation (V1).
 
-Trois détecteurs purement statistiques (pas d'IA) :
+Quatre détecteurs purement statistiques, sans IA, entièrement faisables avec les données N1 (compteurs) :
 1. THRESHOLD         : dépassement d'un seuil de puissance (élec.) ou de conso journalière (gaz) ;
 2. CLIMATE_DEVIATION : écart à la même période N-1 corrigée des DJU ;
-3. BASELOAD          : talon anormal en période théorique d'inoccupation (nuit, week-end).
+3. BASELOAD          : talon de nuit anormal (22 h – 6 h) ;
+4. OFF_HOURS         : consommation en période d'inoccupation hors nuit (week-end, avant l'arrivée et après
+                       le départ). L'attendu part du talon de nuit du jour : un même excès n'est signalé qu'une fois.
+
+F2b (`anomaly_context`) replace ensuite chaque anomalie dans le graphe physique du site (principe P2) :
+équipement suspect, zones et usages potentiellement impactés.
 
 Principe P1 : une dérive est une anomalie *proposée*, expliquée (raisonnement, gain estimé,
 niveau de confiance) et validée ou écartée par un humain ; jamais le déclencheur d'une action automatique.
@@ -39,8 +44,12 @@ logger = logging.getLogger(__name__)
 DRIFT_LABELS = {
     DriftKind.THRESHOLD: "Dépassement de seuil",
     DriftKind.CLIMATE_DEVIATION: "Écart à l'historique corrigé du climat",
-    DriftKind.BASELOAD: "Talon anormal",
+    DriftKind.BASELOAD: "Talon de nuit anormal",
+    DriftKind.OFF_HOURS: "Consommation en période d'inoccupation",
 }
+MIN_NIGHT_SLOTS = 8  # au moins la moitié des créneaux de nuit pour juger le talon
+MIN_OFF_HOURS_SLOTS = 4
+MIN_COMPARABLE_DAYS = 3
 
 
 @dataclass(frozen=True)
@@ -105,14 +114,31 @@ def coverage(db: Session, dp: DeliveryPoint, day: date) -> float:
     return min(1.0, slot_count(db, dp.id, day) / expected) if expected else 0.0
 
 
-def is_inactive_slot(local_dt: datetime) -> bool:
-    """Période théorique d'inoccupation : week-end entier, et chaque nuit."""
+def is_night_slot(local_dt: datetime) -> bool:
+    """Nuit (22 h – 6 h par défaut), chaque jour de la semaine : le créneau du talon."""
     hour = local_dt.hour
-    return (
-        local_dt.weekday() >= 5
-        or hour >= settings.inactive_night_start_hour
-        or hour < settings.inactive_night_end_hour
-    )
+    return hour >= settings.inactive_night_start_hour or hour < settings.inactive_night_end_hour
+
+
+def is_off_hours_slot(local_dt: datetime) -> bool:
+    """Inoccupation hors nuit : le week-end en journée ; les jours ouvrés, avant l'arrivée et après le départ."""
+    if is_night_slot(local_dt):
+        return False
+    if local_dt.weekday() >= 5:
+        return True
+    return local_dt.hour < settings.occupancy_start_hour or local_dt.hour >= settings.occupancy_end_hour
+
+
+def off_hours_period(day: date) -> str:
+    night_end = settings.inactive_night_end_hour
+    if day.weekday() >= 5:
+        return f"le week-end, de {night_end} h à {settings.inactive_night_start_hour} h"
+    return (f"avant l'arrivée ({night_end} h – {settings.occupancy_start_hour} h) et après le départ "
+            f"({settings.occupancy_end_hour} h – {settings.inactive_night_start_hour} h)")
+
+
+def night_period() -> str:
+    return f"la nuit ({settings.inactive_night_start_hour} h – {settings.inactive_night_end_hour} h)"
 
 
 # --- Détecteurs ------------------------------------------------------------------
@@ -231,30 +257,29 @@ def detect_climate_deviation(
 
 
 def detect_baseload(db: Session, dp: DeliveryPoint, day: date, weather: WeatherProvider) -> DriftCandidate | None:
-    """Puissance moyenne en inoccupation du jour vs médiane des N jours précédents (élec. uniquement)."""
+    """Talon de nuit : puissance moyenne la nuit vs médiane des créneaux de nuit des N jours précédents (élec.)."""
     if dp.fluid != Fluid.ELEC:
         return None
-    today_slots = [kw for t, kw in half_hour_powers(db, dp.id, day, day) if is_inactive_slot(t)]
+    today_slots = [kw for t, kw in half_hour_powers(db, dp.id, day, day) if is_night_slot(t)]
     reference_slots = [
         kw
         for t, kw in half_hour_powers(
             db, dp.id, day - timedelta(days=settings.baseload_reference_days), day - timedelta(days=1)
         )
-        if is_inactive_slot(t)
+        if is_night_slot(t)
     ]
-    if not today_slots or len(reference_slots) < 48:
+    if len(today_slots) < MIN_NIGHT_SLOTS or len(reference_slots) < 48:
         return None
     measured = statistics.fmean(today_slots)
     reference = statistics.median(reference_slots)
     if reference <= 0 or measured <= reference * (1 + settings.baseload_tolerance):
         return None
-    period = "le week-end" if day.weekday() >= 5 else "la nuit"
     reference_mean = statistics.fmean(reference_slots)
     return DriftCandidate(
         DriftKind.BASELOAD, measured, reference, "kW",
-        f"Puissance moyenne de {measured:.0f} kW {period} pour un talon de référence de {reference:.0f} kW",
+        f"Puissance moyenne de {measured:.0f} kW la nuit pour un talon de référence de {reference:.0f} kW",
         facts={
-            "period": period, "inactive_slots": len(today_slots), "reference_slots": len(reference_slots),
+            "period": night_period(), "night_slots": len(today_slots), "reference_slots": len(reference_slots),
             "reference_days": settings.baseload_reference_days,
             "reference_cv": statistics.pstdev(reference_slots) / reference_mean if reference_mean > 0 else None,
             "tolerance": settings.baseload_tolerance, "excess_kw": measured - reference,
@@ -263,11 +288,64 @@ def detect_baseload(db: Session, dp: DeliveryPoint, day: date, weather: WeatherP
     )
 
 
-DETECTORS = (detect_threshold, detect_climate_deviation, detect_baseload)
+def detect_off_hours(db: Session, dp: DeliveryPoint, day: date, weather: WeatherProvider) -> DriftCandidate | None:
+    """Consommation en période d'inoccupation, hors nuit (élec.).
+
+    Bâtiment inoccupé, la puissance devrait rester proche du talon de nuit. Attendu = talon de nuit *du jour
+    même* + écart habituel entre inoccupation et nuit, médiane des jours comparables des 28 jours précédents
+    (56 s'il y en a moins de 3) : même type de jour (ouvré ou week-end) et même classe de fonctionnement,
+    déduite des données (un samedi de production n'est pas comparé à un dimanche fermé). Partir du talon du
+    jour évite de signaler deux fois le même excès : un talon trop haut relève du détecteur précédent.
+    """
+    if dp.fluid != Fluid.ELEC:
+        return None
+    span = 2 * settings.baseload_reference_days
+    slots: dict[date, tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
+    for t, kw in half_hour_powers(db, dp.id, day - timedelta(days=span), day):
+        if is_night_slot(t):
+            slots[t.date()][0].append(kw)
+        elif is_off_hours_slot(t):
+            slots[t.date()][1].append(kw)
+    usable = {d: (statistics.fmean(night), statistics.fmean(off)) for d, (night, off) in slots.items()
+              if len(night) >= MIN_NIGHT_SLOTS and len(off) >= MIN_OFF_HOURS_SLOTS}
+    if day not in usable:
+        return None
+    talon, measured = usable[day]
+    classes = learn_operation_classes(daily_kwh(db, dp.id, day - timedelta(days=span), day), min_class_days=8)
+    weekend, day_class = day.weekday() >= 5, classes.of(day)
+    for window in (settings.baseload_reference_days, span):
+        gaps = [off - night for d, (night, off) in usable.items()
+                if d < day and (day - d).days <= window and (d.weekday() >= 5) == weekend
+                and classes.of(d) == day_class]
+        if len(gaps) >= MIN_COMPARABLE_DAYS:
+            break
+    else:
+        return None
+    usual_gap = statistics.median(gaps)
+    expected = talon + usual_gap
+    if expected <= 0 or measured <= expected * (1 + settings.off_hours_tolerance):
+        return None
+    off_slots = len(slots[day][1])
+    period = off_hours_period(day)
+    return DriftCandidate(
+        DriftKind.OFF_HOURS, measured, expected, "kW",
+        f"Puissance moyenne de {measured:.0f} kW en inoccupation ({period}) pour {expected:.0f} kW attendus",
+        facts={
+            "period": period, "off_slots": off_slots, "talon": talon, "usual_gap": usual_gap,
+            "comparable_days": len(gaps), "window": window, "day_class": classes.label_of(day),
+            "classes_learned": classes.learned, "weekend": weekend, "tolerance": settings.off_hours_tolerance,
+            "excess_kw": measured - expected, "excess_kwh": (measured - expected) * off_slots * 0.5,
+            "coverage": coverage(db, dp, day),
+        },
+    )
+
+
+DETECTORS = (detect_threshold, detect_climate_deviation, detect_baseload, detect_off_hours)
 DETECTOR_BY_KIND = {
     DriftKind.THRESHOLD: detect_threshold,
     DriftKind.CLIMATE_DEVIATION: detect_climate_deviation,
     DriftKind.BASELOAD: detect_baseload,
+    DriftKind.OFF_HOURS: detect_off_hours,
 }
 
 
@@ -284,7 +362,7 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
     if delivery_point_ids is not None:
         stmt = stmt.where(DeliveryPoint.id.in_(delivery_point_ids))
     # Imports locaux : évitent un cycle drift ↔ intégrations / explications.
-    from app.services import drift_explanations, integrations, validation
+    from app.services import anomaly_context, drift_explanations, integrations, validation
 
     weather = integrations.weather_provider(db)
     created: list[Drift] = []
@@ -312,12 +390,14 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
             )
             db.add(drift)
             db.flush()
-            drift_explanations.explain_drift(db, dp, drift, candidate)
+            drift_explanations.explain_drift(db, dp, drift, candidate)  # F2b compris : contexte physique
             level = validation.confidence_level(drift.confidence)[0].lower()
+            context = anomaly_context.short_text(drift.context)
             validation.notify(
                 db, dp.site.organization_id,
                 f"À valider : {DRIFT_LABELS[drift.kind].lower()} le {drift.day:%d/%m/%Y}, {dp.site.name} "
-                f"({dp.external_ref}), écart de {drift.deviation_pct:+.0f} %, confiance {level}",
+                f"({dp.external_ref}), écart de {drift.deviation_pct:+.0f} %, confiance {level}"
+                + (f". {context[0].upper()}{context[1:]}" if context else ""),
                 validators_only=True, drift_id=drift.id,
             )
             created.append(drift)

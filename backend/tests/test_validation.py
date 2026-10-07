@@ -77,7 +77,7 @@ def _graph(db, world, dp) -> AssetNode:
 
 @pytest.fixture()
 def weekend_drift(db, world) -> Drift:
-    """Talon anormal un samedi (groupe froid resté allumé), sur un site dont le graphe est modélisé."""
+    """Consommation en inoccupation un samedi (groupe froid en marche), sur un site au graphe modélisé."""
     set_provider_factory(lambda provider, fluid: MockDataProvider(
         fluid=fluid, anomalies=[AnomalySpec(REF, AnomalyKind.WEEKEND_ON, between(DAY, DAY), 0.35)],
         available_until=UNTIL))
@@ -88,7 +88,7 @@ def weekend_drift(db, world) -> Drift:
     db.commit()
     _graph(db, world, dp)
     ingest_delivery_point(db, dp, date(2025, 5, 10), date(2025, 6, 20))
-    drifts = [d for d in run_detection(db, DAY, delivery_point_ids=[dp.id]) if d.kind == DriftKind.BASELOAD]
+    drifts = [d for d in run_detection(db, DAY, delivery_point_ids=[dp.id]) if d.kind == DriftKind.OFF_HOURS]
     assert len(drifts) == 1
     return drifts[0]
 
@@ -108,8 +108,8 @@ def test_every_anomaly_comes_with_reasoning_gain_and_confidence(weekend_drift):
     drift = weekend_drift
     assert drift.status == DriftStatus.OPEN  # proposée, pas décidée
     assert len(drift.reasoning) >= 5
-    assert any("talon médian" in step for step in drift.reasoning)
-    assert any("Groupe froid" in step for step in drift.reasoning)  # le graphe physique est cité
+    assert any("talon de nuit du jour même" in step for step in drift.reasoning)
+    assert any("Groupe froid" in step for step in drift.reasoning)  # le graphe physique est cité (F2b)
     assert validation.CONFIDENCE_FLOOR <= drift.confidence <= validation.CONFIDENCE_CEILING < 1
     assert drift.confidence_factors and all({"label", "delta"} <= set(f) for f in drift.confidence_factors)
     assert drift.gain_kwh > 0 and drift.gain_eur > 0 and drift.gain_kgco2e > 0
