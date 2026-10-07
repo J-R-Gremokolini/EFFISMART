@@ -82,6 +82,14 @@ DRIFT_KIND_LABELS = {
     "BASELOAD": "Talon de nuit anormal",
     "OFF_HOURS": "Consommation en inoccupation",
 }
+
+
+def drift_kind_lower(kind) -> str:
+    """Libellé en milieu de phrase : « écart climatique (N-1 / DJU) », sigles conservés."""
+    label = DRIFT_KIND_LABELS[kind.value]
+    return label[0].lower() + label[1:]
+
+
 # F2b : localisation de l'anomalie dans le graphe des équipements.
 LOCALISATION_TONES = {"precise": "success", "probable": "success", "incertaine": "warning", "absente": "neutral"}
 # Principe P1 : une sortie de la plateforme est « à valider » tant qu'un humain n'a pas décidé.
@@ -953,7 +961,7 @@ def context_html(db: Session, repo: TenantRepository, drift) -> str:
     statuses = None if sees_unvalidated(repo.user) else (DriftStatus.QUALIFIED,)
     linked = anomaly_context.related(db, drift, statuses)
     if linked:
-        items = " ; ".join(f"{DRIFT_KIND_LABELS[d.kind.value].lower()} du {fmt_date(d.day)} "
+        items = " ; ".join(f"{drift_kind_lower(d.kind)} du {fmt_date(d.day)} "
                            f"({FLUID_LABELS[d.delivery_point.fluid].lower()} {d.delivery_point.external_ref})"
                            for d in linked)
         parts.append(f"<div class='es-output-meta'>À examiner ensemble (mêmes zones ou même équipement, à un jour "
@@ -1016,7 +1024,7 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                             origin = repo.get_drift(output.drift_id)
                             others = len(output.supporting_drift_ids or [])
                             body += (f"<div class='es-output-meta'>Anomalie d'origine : "
-                                     f"{ui.e(DRIFT_KIND_LABELS[origin.kind.value].lower())} du {fmt_date(origin.day)}"
+                                     f"{ui.e(drift_kind_lower(origin.kind))} du {fmt_date(origin.day)}"
                                      + (f", appuyée par {others} autre(s) anomalie(s) validée(s)" if others else "")
                                      + ".</div>")
                         except ResourceNotFound:
@@ -1144,7 +1152,7 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
     )
     st.header("Détail d'une anomalie")
     labels = {
-        d.id: f"{fmt_date(d.day)}, {DRIFT_KIND_LABELS[d.kind.value].lower()}, {d.delivery_point.site.name} "
+        d.id: f"{fmt_date(d.day)}, {drift_kind_lower(d.kind)}, {d.delivery_point.site.name} "
               f"({fmt_pct(d.deviation_pct)}), {DRIFT_STATUS_LABELS[d.status].lower()}"
         for d in drifts
     }
