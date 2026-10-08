@@ -24,7 +24,7 @@ def today_local() -> date:
 
 
 def yesterday_local() -> date:
-    """Donnée la plus fraîche disponible : la veille (J+1), jamais du temps réel."""
+    """Donnée la plus fraîche disponible : la veille (données J+1)."""
     return today_local() - timedelta(days=1)
 
 

@@ -79,6 +79,23 @@ PLATFORM_SPECS: dict[IntegrationKind, dict] = {
         "settings": {},
         "secrets": {"client_id": "Identifiant client (client_id)", "client_secret": "Secret client (client_secret)"},
     },
+    IntegrationKind.ENEDIS_SGE: {
+        "label": "Enedis SGE-Tiers (accès industriel)",
+        "description": "Décision D10 : référencement SGE-Tiers lancé dès la semaine 1, en parallèle de Data Connect et "
+                       "de GRDF ADICT. Jalon administratif indépendant du développement, de plusieurs mois : le chemin "
+                       "critique le plus long du projet. Data Connect rend la plateforme opérationnelle en quelques "
+                       "semaines ; quand le parc de compteurs grossit, l'accès industriel est prêt.",
+        "settings": {
+            "referencing": {"label": "État du référencement",
+                            "options": ["à lancer", "dossier déposé", "en instruction", "référencé"],
+                            "default": "à lancer"},
+            "filed_on": {"label": "Dossier déposé le (JJ/MM/AAAA)", "type": "text", "default": ""},
+            "notes": {"label": "Suivi (interlocuteur, pièces demandées…)", "type": "text", "default": ""},
+        },
+        "secrets": {},
+        # Suivi administratif : la collecte par le SGE sera branchée une fois le référencement obtenu.
+        "tracking_only": True,
+    },
     IntegrationKind.OPEN_METEO: {
         "label": "Météo réelle (Open-Meteo)",
         "description": "Températures réelles pour les degrés-jours du détecteur « écart climatique ». Sans clé "
@@ -90,8 +107,8 @@ PLATFORM_SPECS: dict[IntegrationKind, dict] = {
     },
     IntegrationKind.SMTP: {
         "label": "Envoi des e-mails (SMTP)",
-        "description": "Notification immédiate par e-mail : alertes à valider, décisions, rappels d'échéances "
-                       "réglementaires. Tant qu'aucun serveur n'est activé, la version locale écrit les e-mails "
+        "description": "Notification par e-mail dès la détection quotidienne : alertes à valider, décisions, rappels "
+                       "d'échéances réglementaires. Tant qu'aucun serveur n'est activé, la version locale écrit les e-mails "
                        "dans le dossier backend/data/outbox au lieu de les envoyer.",
         "settings": {
             "host": {"label": "Serveur SMTP", "type": "text", "default": ""},
@@ -169,6 +186,8 @@ def save_platform(db: Session, user: User, kind: IntegrationKind, *, enabled: bo
         elif field.get("type") == "text":
             value = str(value or "").strip()[:200]
         clean[name] = value
+    if spec.get("tracking_only"):
+        enabled = False  # suivi administratif : aucune collecte à activer
     if kind == IntegrationKind.SMTP and enabled and (not clean.get("host") or "@" not in clean.get("sender", "")):
         raise IntegrationError("Renseignez le serveur SMTP et une adresse d'expédition valide avant d'activer l'envoi.")
     stored = secret_store.decrypt(row.secrets_encrypted)
@@ -205,6 +224,8 @@ def test_platform(db: Session, user: User, kind: IntegrationKind) -> tuple[bool,
     """Essai de connexion : authentification (Enedis, GRDF) ou lecture des températures d'hier (météo)."""
     _require_admin(user)
     row = get_platform(db, kind)
+    if PLATFORM_SPECS[kind].get("tracking_only"):
+        return False, "Suivi administratif : pas de connexion à tester avant l'obtention du référencement."
     try:
         if kind == IntegrationKind.SMTP:
             from app.services import mailer

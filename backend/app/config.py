@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 12 * 60
     enable_scheduler: bool = True
-    daily_job_hour: int = 6
+    # Courbe de charge de la veille publiée chaque jour entre 12 h et 16 h : traitement quotidien à 17 h.
+    daily_job_hour: int = 17
     export_dir: str = "./data/exports"
     # Dépôt de documents (factures, relevés) : stockage hors dépôt Git, taille maximale par fichier.
     document_dir: str = "./data/documents"

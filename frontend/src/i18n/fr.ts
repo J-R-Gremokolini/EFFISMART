@@ -1,5 +1,5 @@
 // Chaînes de l'interface, centralisées (une seule langue livrée en V1).
-// Règle produit : jamais de promesse de « temps réel » — la donnée est à J+1.
+// Règle produit : suivi J+1 sur données réseau certifiées (voir backend/app/vocabulary.py).
 export const fr = {
   app: { name: 'EffiSmart', tagline: 'Suivi énergétique & conformité' },
   common: {
@@ -34,7 +34,8 @@ export const fr = {
     manage: 'Patrimoine & consentements',
   },
   dataAsOf: (date: string) =>
-    `Données arrêtées au ${date}. Les gestionnaires de réseau publient les consommations à J+1.`,
+    `Données arrêtées au ${date}. Données J+1 : la courbe de charge de la veille est publiée chaque jour entre 12 h `
+    + 'et 16 h, le gaz à J+1 ou J+2.',
   noData: 'Aucune donnée disponible : vérifiez le consentement des points de livraison.',
   portfolio: {
     title: 'Portefeuille clients',

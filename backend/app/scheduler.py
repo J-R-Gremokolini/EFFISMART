@@ -1,5 +1,7 @@
-"""Job quotidien : ingestion de la veille, détection des dérives, statuts des échéances,
-projection annuelle (au plus une fois par mois de données). Toutes les sorties sont créées « à valider ».
+"""Traitement quotidien, à 17 h : la courbe de charge de la veille est publiée entre 12 h et 16 h (le gaz à J+1
+ou J+2). Ingestion des données J+1, détection quotidienne des dérives (veille et avant-veille, pour le gaz publié
+à J+2), statuts des échéances, projections (au plus une fois par mois de données). Toutes les sorties sont créées
+« à valider ».
 
 Lancement manuel : ``python -m app.scheduler``.
 Note : un seul processus applicatif doit porter le scheduler (uvicorn sans --workers).
@@ -16,7 +18,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.services import exports, load_shift, predictions, quarterly_reports, regulatory, trajectory
 from app.services.drift import run_detection
-from app.services.ingestion import ingest_all_for_day
+from app.services.ingestion import ingest_recent
 from app.timeutils import today_local
 
 logger = logging.getLogger(__name__)
@@ -26,9 +28,10 @@ def run_daily_pipeline(today: date | None = None) -> None:
     today = today or today_local()
     yesterday = today - timedelta(days=1)
     with SessionLocal() as db:
-        count = ingest_all_for_day(db, yesterday)
-        logger.info("Pipeline quotidien : %d mesures ingérées pour le %s", count, yesterday)
-        run_detection(db, yesterday)
+        count = ingest_recent(db, today)
+        logger.info("Pipeline quotidien : %d mesures ingérées jusqu'au %s", count, yesterday)
+        for day in (yesterday - timedelta(days=1), yesterday):  # idempotent : une dérive n'est créée qu'une fois
+            run_detection(db, day)
         regulatory.refresh_statuses(db, today)
         regulatory.send_reminders(db, today)
         predictions.refresh_predictions(db)

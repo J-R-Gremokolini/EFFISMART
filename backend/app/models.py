@@ -607,6 +607,7 @@ class IntegrationKind(str, enum.Enum):
     GRDF_ADICT = "GRDF_ADICT"
     OPEN_METEO = "OPEN_METEO"
     SMTP = "SMTP"  # serveur d'envoi des e-mails de notification
+    ENEDIS_SGE = "ENEDIS_SGE"  # décision D10 : accès industriel SGE-Tiers, référencement suivi dès la semaine 1
 
 
 class PlatformIntegration(Base):

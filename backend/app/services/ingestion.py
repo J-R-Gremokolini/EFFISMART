@@ -55,12 +55,30 @@ def ingest_delivery_point(db: Session, delivery_point: DeliveryPoint, start: dat
 
 
 def ingest_all_for_day(db: Session, day: date) -> int:
-    """Job quotidien : récupère la veille pour tous les points consentis."""
+    """Récupère un jour donné pour tous les points consentis."""
     points = db.scalars(select(DeliveryPoint).where(active_consent_clause())).all()
     total = 0
     for dp in points:
         try:
             total += ingest_delivery_point(db, dp, day, day)
+        except Exception:  # un point en échec ne bloque pas les autres
+            db.rollback()
+            logger.exception("Échec d'ingestion pour le point #%s", dp.id)
+    return total
+
+
+def ingest_recent(db: Session, today: date) -> int:
+    """Traitement quotidien (après la publication de 12 h – 16 h) : la veille pour l'électricité ; pour le gaz,
+    publié à J+1 ou J+2, la veille et l'avant-veille, relues pour compléter un jour encore absent la veille."""
+    from app.vocabulary import PUBLICATION_LAG_DAYS
+
+    yesterday = today - timedelta(days=1)
+    points = db.scalars(select(DeliveryPoint).where(active_consent_clause())).all()
+    total = 0
+    for dp in points:
+        start = today - timedelta(days=PUBLICATION_LAG_DAYS[dp.fluid])
+        try:
+            total += ingest_delivery_point(db, dp, start, yesterday)
         except Exception:  # un point en échec ne bloque pas les autres
             db.rollback()
             logger.exception("Échec d'ingestion pour le point #%s", dp.id)

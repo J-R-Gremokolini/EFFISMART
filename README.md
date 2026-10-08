@@ -1,6 +1,7 @@
 # EffiSmart — V1
 
-SaaS de suivi énergétique et de conformité réglementaire pour PME/ETI, piloté par l'auditeur énergétique.
+SaaS de suivi énergétique et de conformité réglementaire pour PME/ETI, piloté par l'auditeur énergétique :
+**suivi J+1 sur données réseau certifiées** (courbe de charge au pas de 30 min, détection quotidienne des dérives).
 Version 1 : le brief technique et le périmètre F1–F5 de l'étude de marché : F1 (tableau de bord),
 F2 (alertes à deux étages : F2a seuils et dérive, F2b anomalies contextualisées), F3 (réglementaire),
 F4 (données énergie RSE : OPERAT + VSME), F5 (espace client en lecture seule). Version 2 : F6 à F12 (suivi
@@ -72,11 +73,34 @@ Les tests tournent sur SQLite en mémoire (aucune base à lancer). Ils couvrent 
 l'isolation multi-tenant (`test_isolation.py`) et les garde-fous de rôle (`test_roles.py`, qui parcourt
 **toutes** les routes d'écriture : une nouvelle route non protégée fait échouer le test).
 
-### Job quotidien
+### Traitement quotidien
 
-Le scheduler (APScheduler, dans le processus API) exécute chaque jour à 6 h (Europe/Paris) :
-ingestion de la veille pour tous les points consentis → détection des dérives → statuts des échéances.
-Lancement manuel : `docker compose exec backend python -m app.scheduler`.
+Le scheduler (APScheduler, dans le processus API) exécute chaque jour à **17 h** (Europe/Paris), après la
+publication par Enedis de la courbe de charge de la veille (entre 12 h et 16 h) :
+- **Ingestion** : la veille pour l'électricité ; pour le gaz, publié à J+1 ou J+2, la veille et l'avant-veille,
+  relues pour compléter un jour encore absent la veille.
+- **Détection quotidienne des dérives**, sur la veille et l'avant-veille (sans doublon).
+- **Échéances**, puis projections, trajectoires, décalages de charge, données RSE et rapports trimestriels.
+
+Lancement manuel : `docker compose exec backend python -m app.scheduler`. Horaire réglable
+(`EFFISMART_DAILY_JOB_HOUR`).
+
+### Vocabulaire : la donnée la plus fraîche est celle de la veille
+
+La courbe de charge de la veille est disponible chaque jour entre 12 h et 16 h ; le gaz à J+1 ou J+2. Un suivi à
+la seconde suppose des capteurs sur site (IoT) ; le pas de 30 min suffit à tout ce que promet la V1. Parler de
+« suivi J+1 sur données réseau certifiées » est plus crédible face à un jury technique.
+
+| À bannir | À employer |
+|---|---|
+| « supervision en temps réel » | « suivi quotidien » / « données J+1 » |
+| « alertes en temps réel » | « détection quotidienne des dérives » |
+| « pilotage instantané » | « analyse de la courbe de charge au pas 30 min » |
+| « pilotage automatique » (décision D3) | « recommandation de décalage de charge » |
+
+Les textes de référence sont dans `backend/app/vocabulary.py`. `tests/test_vocabulary.py` fait échouer la suite
+de tests si un texte de l'application (services, interface Streamlit, front React) emploie une expression à
+bannir.
 
 ## Architecture
 
@@ -151,7 +175,7 @@ Le point 30001000000004 est volontairement **sans consentement** pour illustrer 
 | Code | Fonctionnalité | Bénéficiaire | Données | Dans EffiSmart |
 |---|---|---|---|---|
 | F1 | Tableau de bord de pilotage : consommations, indicateurs de performance, évolution avant / après recommandations | Auditeur + client | N1 (N0 dégradé) | « Tableau de bord » : KPI, courbe, mois ; intensité kWh/m², €/m², kgCO₂e/m² sur 12 mois ; section « Avant / après recommandations » |
-| F2a | Alertes : seuils et dérive (V1), purement statistiques | Auditeur + client | N1 | 4 détecteurs ; alerte dans la cloche **et par e-mail** dès la détection (valideurs), puis à la validation (tout le client) |
+| F2a | Alertes : seuils et dérive (V1), purement statistiques | Auditeur + client | N1 | détection quotidienne des dérives, 4 détecteurs ; alerte dans la cloche **et par e-mail** dès la détection (valideurs), puis à la validation (tout le client) |
 | F2b | Anomalies contextualisées (V2) : qualification et propagation d'impact par le graphe P2 | Auditeur + client | N1 + graphe | équipement suspect, zones et usages potentiellement impactés, sur chaque anomalie, dans l'alerte et l'e-mail |
 | F3 | Suivi réglementaire : calendrier, rappels d'échéances, historique des actions | Auditeur | N0 | « Réglementaire » ; **rappels automatiques** à J-60, J-30, J-7, le jour J, puis en retard (cloche et e-mail) |
 | F4 | Données énergie pour les rapports RSE, produites sans ressaisie | Client | N0 / N1 | « Données RSE » : OPERAT et VSME B3 **produits automatiquement** (année écoulée, année en cours chaque mois) |
@@ -478,6 +502,7 @@ Page « Intégrations » de l'interface, en quatre onglets. Code : `app/services
 |---|---|---|
 | Enedis Data Connect | courbe de charge élec. 30 min + contrat | client_id / client_secret, bac à sable ou production |
 | GRDF ADICT | consommations gaz journalières + contrat | client_id / client_secret |
+| Enedis SGE-Tiers | accès industriel, pour un grand parc (décision D10) | suivi du référencement : état, date de dépôt, notes ; collecte à brancher une fois référencé |
 | Open-Meteo | températures réelles → DJU du détecteur climatique | latitude / longitude |
 
 Seul l'administrateur active une source et saisit ses identifiants ; les auditeurs voient l'état en lecture
@@ -555,6 +580,18 @@ Toutes sont dans `backend/app/config.py`, surchargeables par variable d'environn
 | Facteurs d'émission | Seed ADEME Base Empreinte horodaté (élec. 0,052 ; gaz 0,227 kgCO₂e/kWh), **à vérifier** |
 | Passage en « échéance proche » | J-60 (`due_soon_days`) |
 | Échéance OPERAT | 30 septembre (`operat_due_month/day`) |
+
+### Décision D10 : les deux fronts en parallèle dès le départ
+
+Data Connect + GRDF ADICT **et** référencement SGE-Tiers sont lancés simultanément dès le démarrage. Data Connect
+rend la plateforme opérationnelle en quelques semaines pour signer les premiers auditeurs ; pendant ce temps, le
+référencement SGE-Tiers, qui prend plusieurs mois, mûrit en arrière-plan. Quand le parc de compteurs grossit,
+l'accès industriel est déjà prêt : le délai n'est pas subi, il est masqué derrière la V1.
+
+**Planning** : le référencement SGE-Tiers est un **jalon administratif à démarrer semaine 1**, indépendant du
+développement logiciel. C'est le chemin critique le plus long du projet, plus long que le code de la V1 lui-même.
+Son avancement se suit dans « Intégrations », carte « Enedis SGE-Tiers » (administrateur) : à lancer, dossier
+déposé, en instruction, référencé.
 
 ## Points ambigus : choix faits et signalés
 

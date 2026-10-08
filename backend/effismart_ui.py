@@ -76,6 +76,7 @@ from app.services.consent import ConsentRequiredError, grant_consent, revoke_con
 from app.services.delivery_points import active_consent  # noqa: E402
 from app.services.exports import ExportEngine, archive_name, build_zip, latest_jobs  # noqa: E402
 from app.services.ingestion import backfill_delivery_point  # noqa: E402
+from app.vocabulary import FRESHNESS, TAGLINE  # noqa: E402
 from app.timeutils import (  # noqa: E402
     LOCAL_TZ,
     add_months,
@@ -86,7 +87,7 @@ from app.timeutils import (  # noqa: E402
     yesterday_local,
 )
 
-# --- Libellés (UI en français ; jamais de promesse de « temps réel ») ------------------
+# --- Libellés (UI en français ; données J+1, voir app/vocabulary.py) ------------------
 
 APP_NAME = "EffiSmart"
 FLUID_LABELS = {Fluid.ELEC: "Électricité", Fluid.GAS: "Gaz"}
@@ -322,7 +323,7 @@ def login_page(db: Session) -> None:
     with center:
         ui.render(ui.logo_html(large=True))
         st.title("Connexion")
-        st.caption("Suivi énergétique & conformité réglementaire")
+        st.caption(f"Suivi énergétique & conformité réglementaire — {TAGLINE[0].lower()}{TAGLINE[1:]}")
         with st.form("login"):
             email = st.text_input("E-mail")
             password = st.text_input("Mot de passe", type="password")
@@ -345,10 +346,7 @@ def data_as_of_banner(as_of: date | None) -> None:
     if as_of is None:
         st.warning("Aucune donnée disponible : vérifiez le consentement des points de livraison.")
     else:
-        ui.banner(
-            f"<span>Données arrêtées au <b>{fmt_date(as_of)}</b>. "
-            "Les gestionnaires de réseau publient les consommations le lendemain.</span>"
-        )
+        ui.banner(f"<span>Données arrêtées au <b>{fmt_date(as_of)}</b>. {ui.e(FRESHNESS)}</span>")
 
 
 # --- Pages -----------------------------------------------------------------------------------
@@ -1242,7 +1240,8 @@ def suspect_cell(drift) -> str:
 
 def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     ui.page_header(org.name, "Dérives de consommation",
-                   "Deux étages : la détection statistique (dépassement de seuil, écart climatique, talon de nuit, "
+                   "Détection quotidienne des dérives sur les données J+1, en deux étages : la détection statistique "
+                   "(dépassement de seuil, écart climatique, talon de nuit, "
                    "consommation en inoccupation), puis la mise en contexte par le graphe des équipements "
                    "(équipement suspect, zones et usages potentiellement impactés). Chaque anomalie est validée ou "
                    "écartée par un humain ; aucune action automatique.")
@@ -1895,8 +1894,13 @@ def integrations_sources(db: Session, user: User) -> None:
                    "Enedis et GRDF. Vous voyez leur état.")
     for kind, spec in integrations.PLATFORM_SPECS.items():
         row = integrations.get_platform(db, kind)
+        tracking = spec.get("tracking_only", False)
         with st.container(border=True):
-            state = ui.status("Active", "success") if row.enabled else ui.status("Inactive", "neutral")
+            if tracking:
+                progress = integrations.platform_settings(row).get("referencing", "à lancer")
+                state = ui.status(f"Référencement : {progress}", "success" if progress == "référencé" else "warning")
+            else:
+                state = ui.status("Active", "success") if row.enabled else ui.status("Inactive", "neutral")
             ui.render(f"<div><b>{ui.e(spec['label'])}</b> &nbsp;{state}</div>"
                       f"<div style='margin-top:6px;font-size:14px;color:var(--color-muted)'>{ui.e(spec['description'])}</div>")
             if row.last_test_at:
@@ -1909,7 +1913,7 @@ def integrations_sources(db: Session, user: User) -> None:
             current = integrations.platform_settings(row)
             stored = integrations.secret_status(row)
             with st.form(f"platform-{kind.value}"):
-                enabled = st.toggle("Activer cette source", value=row.enabled)
+                enabled = False if tracking else st.toggle("Activer cette source", value=row.enabled)
                 values, secrets_values = {}, {}
                 for name, field in spec["settings"].items():
                     if "options" in field:
@@ -1935,7 +1939,7 @@ def integrations_sources(db: Session, user: User) -> None:
                         st.rerun()
                     except integrations.IntegrationError as exc:
                         st.error(str(exc))
-            if st.button("Tester la connexion", key=f"test-{kind.value}"):
+            if not tracking and st.button("Tester la connexion", key=f"test-{kind.value}"):
                 with st.spinner("Test en cours…"):
                     ok, message = integrations.test_platform(db, user, kind)
                 (st.success if ok else st.error)(message)
@@ -3123,8 +3127,9 @@ def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organ
             with st.container(key="es-help"):
                 with st.popover("Aide", icon=":material/support:", help="Aide"):
                     st.markdown("**Aide**")
-                    st.caption("Les gestionnaires de réseau (Enedis, GRDF) publient les consommations à J+1 : "
-                               "les données s'arrêtent toujours à la veille.")
+                    st.caption(f"{TAGLINE} (Enedis, GRDF). {FRESHNESS} Les données s'arrêtent donc toujours à la "
+                               "veille, à l'avant-veille pour le gaz. Détection quotidienne des dérives, analyse de "
+                               "la courbe de charge au pas de 30 min.")
                     st.caption("La plateforme propose (anomalies, recommandations, prévisions), chaque fois avec "
                                "son raisonnement, son gain estimé et son niveau de confiance. L'auditeur ou le "
                                "responsable énergie décide ; aucune action n'est automatique.")
