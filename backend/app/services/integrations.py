@@ -412,6 +412,7 @@ WEBHOOK_EVENTS = {
     "recommendation.applied": "Recommandation déclarée appliquée",
     "savings.validated": "Économies mesurées validées (avant / après)",
     "prediction.validated": "Prévision validée",
+    "trajectory.validated": "Trajectoire Décret Tertiaire validée",
     "document.deposited": "Nouveau document déposé",
 }
 # Abonnements créés avant le principe P1 : « drift.created » reçoit désormais les anomalies validées.

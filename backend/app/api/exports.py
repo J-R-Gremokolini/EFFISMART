@@ -1,4 +1,4 @@
-"""F4 — Exports OPERAT / VSME.
+"""F4 — Données énergie pour les rapports RSE (OPERAT / VSME).
 
 Choix V1 (ambiguïté signalée) : la génération crée un ExportJob, c'est donc une
 écriture réservée à l'auditeur ; le client (lecture seule, F5) télécharge ses exports.
@@ -11,7 +11,7 @@ from app.deps import get_repo, require_writer
 from app.models import ExportJob, User
 from app.repositories import TenantRepository
 from app.schemas import ExportIn, ExportJobOut
-from app.services.exports import ExportEngine, build_zip
+from app.services.exports import ExportEngine, archive_name, build_zip
 
 router = APIRouter(tags=["exports"])
 
@@ -43,7 +43,7 @@ def download_export(job_id: int, repo: TenantRepository = Depends(get_repo)) -> 
         content = build_zip(job)
     except FileNotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Fichier d'export indisponible") from None
-    filename = f"effismart_{job.format.value.lower()}_{job.period_start}_{job.period_end}.zip"
+    filename = archive_name(job)
     return Response(
         content,
         media_type="application/zip",

@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     occupancy_start_hour: int = 7
     occupancy_end_hour: int = 20
     off_hours_tolerance: float = 0.30
+    # F11 : écart au modèle de consommation. Seuil = max(15 %, 2,5 × erreur journalière du modèle).
+    model_deviation_min_tolerance: float = 0.15
+    model_deviation_sigma: float = 2.5
     dju_base_temperature: float = 18.0
     notify_clients_on_drift: bool = True
     # Nombre de jours analysés rétroactivement après un nouveau consentement / au seed.

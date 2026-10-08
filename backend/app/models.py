@@ -5,6 +5,9 @@ Auditor → (AuditorClientLink daté) → Organization → Site → DeliveryPoin
 
 Graphe physique d'un site (AssetNode / AssetRelation), distinct de cette hiérarchie de rangement :
 Compteur → alimente → Chaudière → produit → Eau chaude → alimente → CTA → dessert → Zone → accueille → Usage
+
+Version 2 : contrats de fourniture (F6, F12), variables d'ajustement (F7), plan 2D (F8), bibliothèque de
+gestes types et scénarios (F9), rapports trimestriels (F10), trajectoires Décret Tertiaire (F11).
 """
 from __future__ import annotations
 
@@ -96,6 +99,7 @@ class DriftKind(str, enum.Enum):
     CLIMATE_DEVIATION = "CLIMATE_DEVIATION"  # écart à l'historique corrigé du climat (DJU)
     BASELOAD = "BASELOAD"  # talon de nuit anormal
     OFF_HOURS = "OFF_HOURS"  # consommation en période d'inoccupation (hors nuit)
+    MODEL_DEVIATION = "MODEL_DEVIATION"  # F11 : écart au modèle de consommation (12 à 24 mois d'historique)
 
 
 class DriftStatus(str, enum.Enum):
@@ -160,6 +164,8 @@ class Organization(Base):
     address: Mapped[str | None] = mapped_column(String(300))
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Paris")
     currency: Mapped[str] = mapped_column(String(3), default="EUR")
+    # F7, passerelle ISO 50001 : une entreprise certifiée est exemptée de l'audit énergétique obligatoire.
+    iso50001_certified_until: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     sites: Mapped[list[Site]] = relationship(back_populates="organization", order_by="Site.id")
@@ -190,6 +196,13 @@ class Site(Base):
     address: Mapped[str | None] = mapped_column(String(300))
     surface_m2: Mapped[float | None] = mapped_column(Float)
     is_tertiary_decret: Mapped[bool] = mapped_column(Boolean, default=False)
+    # F7 : unité de production du site (ex. « tonnes de pain ») et année de la situation énergétique de
+    # référence (SER, ISO 50001).
+    production_unit: Mapped[str | None] = mapped_column(String(60))
+    energy_baseline_year: Mapped[int | None] = mapped_column()
+    # F11 : année et consommation de référence du Décret Tertiaire (déclarées sur OPERAT), en kWh d'énergie finale.
+    dt_reference_year: Mapped[int | None] = mapped_column()
+    dt_reference_kwh: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     organization: Mapped[Organization] = relationship(back_populates="sites")
@@ -437,6 +450,13 @@ class AssetNode(Base):
     # Zone occupée 24 h/24 (chambres, local serveur) : ses équipements fonctionnent légitimement la nuit.
     always_occupied: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     notes: Mapped[str | None] = mapped_column(Text)
+    # F8 : position sur le plan 2D du site, en % de la largeur et de la hauteur ; une zone est un rectangle.
+    plan_x: Mapped[float | None] = mapped_column(Float)
+    plan_y: Mapped[float | None] = mapped_column(Float)
+    plan_w: Mapped[float | None] = mapped_column(Float)
+    plan_h: Mapped[float | None] = mapped_column(Float)
+    # F12 : durée de fonctionnement quotidienne d'un équipement dont la charge peut être décalée (heures).
+    shift_hours: Mapped[float | None] = mapped_column(Float)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -466,6 +486,7 @@ class RecommendationKind(str, enum.Enum):
     HEATING_CONTROL = "HEATING_CONTROL"  # régulation : consignes, loi d'eau, programmation
     PEAK_SHAVING = "PEAK_SHAVING"  # délestage ou décalage des appels de puissance
     INVESTIGATE = "INVESTIGATE"  # graphe incomplet : identifier l'équipement en cause
+    LOAD_SHIFT = "LOAD_SHIFT"  # F12 : recommandation de décalage de charge vers les heures les moins chères
 
 
 class Recommendation(ExplainedOutput, Base):
@@ -727,3 +748,183 @@ class Notification(Base):
     organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"))
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# --- Version 2 ----------------------------------------------------------------------------------------------
+
+
+class TariffOption(str, enum.Enum):
+    BASE = "BASE"  # prix unique
+    HPHC = "HPHC"  # heures pleines / heures creuses
+    TEMPO = "TEMPO"  # prix par couleur de jour (bleu, blanc, rouge) et par plage (signal RTE)
+    DYNAMIC = "DYNAMIC"  # prix horaire indexé sur le marché (spot) + marge du fournisseur
+
+
+class SupplyContract(Base):
+    """F6 — Contrat de fourniture d'un point de livraison : la grille tarifaire qui chiffre ses consommations.
+
+    Prix complets (fourniture, acheminement, taxes) en €/kWh, saisis par l'auditeur d'après le contrat.
+    Le contrat en vigueur à une date est le plus récent dont `valid_from` la précède.
+    """
+
+    __tablename__ = "supply_contracts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    delivery_point_id: Mapped[int] = mapped_column(ForeignKey("delivery_points.id"), index=True)
+    supplier: Mapped[str] = mapped_column(String(120))
+    option: Mapped[TariffOption] = mapped_column(_enum(TariffOption))
+    subscription_eur_month: Mapped[float] = mapped_column(Float, default=0.0)
+    price_base: Mapped[float | None] = mapped_column(Float)
+    price_hp: Mapped[float | None] = mapped_column(Float)
+    price_hc: Mapped[float | None] = mapped_column(Float)
+    offpeak_start_hour: Mapped[int] = mapped_column(default=22)
+    offpeak_end_hour: Mapped[int] = mapped_column(default=6)
+    tempo_prices: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))  # {"BLEU": {"HP": …, "HC": …}, …}
+    dynamic_margin_eur_kwh: Mapped[float | None] = mapped_column(Float)
+    valid_from: Mapped[date] = mapped_column(Date)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    delivery_point: Mapped[DeliveryPoint] = relationship()
+
+
+class AdjustmentKind(str, enum.Enum):
+    PRODUCTION = "PRODUCTION"  # unités produites, dans l'unité propre au site
+    HEADCOUNT = "HEADCOUNT"  # effectif en équivalents temps plein (ETP)
+
+
+class AdjustmentVariable(Base):
+    """F7 — Variable d'ajustement mensuelle fournie par le client (production, effectif)."""
+
+    __tablename__ = "adjustment_variables"
+    __table_args__ = (UniqueConstraint("site_id", "kind", "month", name="uq_adjustment_site_kind_month"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    kind: Mapped[AdjustmentKind] = mapped_column(_enum(AdjustmentKind))
+    month: Mapped[date] = mapped_column(Date)  # premier jour du mois
+    value: Mapped[float] = mapped_column(Float)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SitePlan(Base):
+    """F8 — Plan 2D d'un site (image facultative) ; les éléments du graphe P2 y sont positionnés."""
+
+    __tablename__ = "site_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), unique=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(64))
+    stored_name: Mapped[str] = mapped_column(String(80))
+    aspect_ratio: Mapped[float] = mapped_column(Float, default=0.62)  # hauteur / largeur
+    uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ActionTemplate(Base):
+    """F9 — Geste type de la bibliothèque : économie relative sur un usage et investissement indicatif.
+
+    `auditor_id` vide : bibliothèque commune ; sinon, geste propre au cabinet.
+    """
+
+    __tablename__ = "action_templates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    auditor_id: Mapped[int | None] = mapped_column(ForeignKey("auditors.id"), index=True)
+    code: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(200))
+    usage: Mapped[str] = mapped_column(String(16))  # catégorie d'usage du graphe P2 (HEATING, LIGHTING…)
+    savings_pct: Mapped[float] = mapped_column(Float)  # part de la consommation de l'usage économisée (0 à 1)
+    investment_eur_m2: Mapped[float] = mapped_column(Float, default=0.0)
+    investment_eur: Mapped[float] = mapped_column(Float, default=0.0)
+    notes: Mapped[str | None] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SavingsScenario(Base):
+    """F9 — Scénario d'actions simulé pour un site ; le scénario retenu alimente la trajectoire (F11)."""
+
+    __tablename__ = "savings_scenarios"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    template_ids: Mapped[list] = mapped_column(JSON)
+    recommendation_ids: Mapped[list] = mapped_column(JSON)
+    usage_shares: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))  # répartitions ajustées
+    results: Mapped[dict] = mapped_column(JSON)  # résultats au moment de l'enregistrement
+    retained: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    site: Mapped[Site] = relationship()
+
+
+class Trajectory(ExplainedOutput, Base):
+    """F11 — Trajectoire Décret Tertiaire d'un site : où mène le rythme actuel en 2030, 2040, 2050.
+
+    Projection (principe P1) : visible par le client seulement une fois validée par un humain.
+    """
+
+    __tablename__ = "trajectories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    data_as_of: Mapped[date] = mapped_column(Date)
+    reference_year: Mapped[int] = mapped_column()
+    reference_kwh: Mapped[float] = mapped_column(Float)
+    current_kwh: Mapped[float] = mapped_column(Float)  # 12 derniers mois, corrigés du climat
+    annual_rate: Mapped[float] = mapped_column(Float)  # évolution annuelle moyenne depuis la référence
+    projected_2030_kwh: Mapped[float] = mapped_column(Float)
+    reduction_2030: Mapped[float] = mapped_column(Float)  # baisse projetée par rapport à la référence
+    reduction_2030_with_actions: Mapped[float | None] = mapped_column(Float)
+    points: Mapped[list] = mapped_column(JSON)  # [{"year", "trend", "objective", "with_actions"}]
+    status: Mapped[ReviewStatus] = mapped_column(_enum(ReviewStatus), default=ReviewStatus.PROPOSED)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[str | None] = mapped_column(Text)
+
+    site: Mapped[Site] = relationship()
+
+
+class ReportStatus(str, enum.Enum):
+    DRAFT = "DRAFT"  # projet produit par la plateforme, à relire et à enrichir
+    VALIDATED = "VALIDATED"  # relu, enrichi et validé par l'auditeur
+    DELIVERED = "DELIVERED"  # délivré au client, sous l'identité du cabinet
+
+
+class QuarterlyReport(Base):
+    """F10 — Rapport d'analyse trimestrielle (décision D2, option A) : outil de productivité de l'auditeur.
+
+    La plateforme en produit le projet ; l'auditeur l'enrichit, le valide et le délivre sous sa propre identité.
+    EffiSmart ne délivre jamais d'analyse en direct au client final.
+    """
+
+    __tablename__ = "quarterly_reports"
+    __table_args__ = (UniqueConstraint("organization_id", "year", "quarter", name="uq_report_org_quarter"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    auditor_id: Mapped[int | None] = mapped_column(ForeignKey("auditors.id"))  # cabinet signataire
+    year: Mapped[int] = mapped_column()
+    quarter: Mapped[int] = mapped_column()
+    status: Mapped[ReportStatus] = mapped_column(_enum(ReportStatus), default=ReportStatus.DRAFT)
+    sections: Mapped[list] = mapped_column(JSON)  # [{"key", "title", "platform_text", "rows", "auditor_text"}]
+    introduction: Mapped[str | None] = mapped_column(Text)  # synthèse de l'auditeur
+    conclusion: Mapped[str | None] = mapped_column(Text)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    validated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    organization: Mapped[Organization] = relationship()

@@ -105,6 +105,11 @@ def log_action(
     return action
 
 
+def iso50001_exempt(org, at: date) -> bool:
+    """F7, passerelle ISO 50001 : une entreprise certifiée est exemptée de l'audit énergétique obligatoire."""
+    return org.iso50001_certified_until is not None and org.iso50001_certified_until >= at
+
+
 def _reminder_level(days_left: int) -> int | None:
     """Seuil de rappel atteint : le plus petit seuil ≥ jours restants ; -1 = en retard."""
     if days_left < 0:
@@ -125,8 +130,10 @@ def send_reminders(db: Session, today: date | None = None) -> int:
         level = _reminder_level(days_left)
         if level is None or (deadline.reminder_level is not None and deadline.reminder_level <= level):
             continue
-        deadline.reminder_level = level
         site = deadline.site
+        if deadline.obligation == Obligation.AUDIT_EED and iso50001_exempt(site.organization, deadline.due_date):
+            continue  # F7 : certifiée ISO 50001, exemptée de l'audit énergétique
+        deadline.reminder_level = level
         when = ("aujourd'hui" if days_left == 0 else f"en retard de {-days_left} jour(s)" if days_left < 0
                 else f"dans {days_left} jour(s)")
         message = (f"Rappel d'échéance : {OBLIGATION_LABELS[deadline.obligation]}, {site.name}, le "

@@ -1,9 +1,11 @@
 # EffiSmart — V1
 
 SaaS de suivi énergétique et de conformité réglementaire pour PME/ETI, piloté par l'auditeur énergétique.
-Cette V1 implémente le brief technique et le périmètre F1–F5 de l'étude de marché : F1 (tableau de bord),
+Version 1 : le brief technique et le périmètre F1–F5 de l'étude de marché : F1 (tableau de bord),
 F2 (alertes à deux étages : F2a seuils et dérive, F2b anomalies contextualisées), F3 (réglementaire),
-F4 (données énergie RSE : OPERAT + VSME), F5 (espace client en lecture seule), sur données **mock** réalistes.
+F4 (données énergie RSE : OPERAT + VSME), F5 (espace client en lecture seule). Version 2 : F6 à F12 (suivi
+tri-axe, IPE ISO 50001, plan 2D, simulateur, rapport trimestriel assisté, prédiction et trajectoire Décret
+Tertiaire, optimisation tarifaire en mode conseil). Le tout sur données **mock** réalistes.
 
 ## Démarrage rapide : version 100 % Python (sans Docker)
 
@@ -156,7 +158,19 @@ Le point 30001000000004 est volontairement **sans consentement** pour illustrer 
 | F5 | Espace client : tableau de bord en lecture seule, suivi en autonomie | Client | N1 | espace client (lecture seule ; le responsable énergie valide en plus) |
 
 EffiSmart fournit la **brique énergie** des rapports RSE ; il ne produit pas le rapport de durabilité complet,
-dont les volets social et gouvernance sont hors de son périmètre.
+dont les volets social et gouvernance sont hors de son périmètre. La génération le dit dans chaque jeu
+(`app/services/exports.py`) :
+
+- **fichiers** `donnees_energie_operat.json` / `.csv` et `donnees_energie_vsme_b3.json` / `.csv`, jamais
+  « rapport » ;
+- **périmètre** écrit dans chaque JSON, avec ce qui reste à l'entreprise : pour le VSME, le module B3 est
+  fourni et les modules B1, B2, B4 à B7 (environnement hors énergie), B8 à B10 (social) et B11 (gouvernance)
+  sont listés « à compléter par l'entreprise » ; pour OPERAT, les catégories d'activité et indicateurs
+  d'intensité d'usage restent à saisir par l'assujetti sur la plateforme ;
+- **LISEZMOI.txt** dans chaque archive : périmètre, fichiers, origine des données (N1 / N0), facteurs
+  d'émission, ce qui reste à compléter ;
+- **gabarit versionné** (`format_version`) : quand il évolue, les jeux automatiques sont produits de nouveau ;
+  les versions remplacées restent conservées, seule la plus récente est proposée au téléchargement.
 
 **Niveaux de données** (`app/services/energy_data.py`) :
 
@@ -242,6 +256,101 @@ l'anomalie reste signalée par F2a mais « non localisée ».
 - **sans serveur** : en version locale, chaque e-mail est écrit dans `backend/data/outbox/` (fichier .eml) ;
 - **préférence** : chaque utilisateur coupe ses e-mails dans « Mon compte », l'alerte reste dans la cloche ;
 - **envoi** : file d'envoi avec réessais, traitée à chaque alerte et chaque minute par le planificateur.
+
+## Version 2 : fonctionnalités avancées (F6 à F12)
+
+| Code | Fonctionnalité | Données | Dans EffiSmart |
+|---|---|---|---|
+| F6 | Suivi mensuel tri-axe : consommations, émissions, coûts | N1 (+ N0) | page « Suivi mensuel » ; contrats saisis dans « Patrimoine & consentements » |
+| F7 | IPE ISO 50001 : kWh/m², kWh/unité produite, kWh/ETP, kWh/DJU | N1 + variables du client | page « Performance (IPE) » |
+| F8 | Visualisation spatiale : plan 2D (la maquette 3D est reportée en V3) | N1 + P2 | onglet « Plan 2D » de « Équipements », et carte de chaque anomalie |
+| F9 | Simulateur d'économies | N1 | page « Simulateur » ; bibliothèque de gestes types |
+| F10 | Générateur de rapport trimestriel assisté (D2, option A) | N1 | page « Rapports trimestriels » |
+| F11 | Prédiction des consommations : modèle mathématique renforcé par l'apprentissage | N1, 12 à 24 mois | détecteur « écart au modèle » (F2) ; page « Trajectoire 2030 » ; simulateur |
+| F12 | Optimisation tarifaire, mode conseil (D3) | N1 + contrat | recommandations « décalage de charge » |
+
+**F6 — suivi mensuel tri-axe** (`app/services/tariffs.py`). Chaque point de livraison peut avoir un contrat de
+fourniture, avec une grille tarifaire à prix complets (fourniture, acheminement, taxes) :
+- **Base** : un prix unique ;
+- **heures pleines / creuses** : plage creuse réglable ;
+- **Tempo** : prix par couleur de jour et par plage ;
+- **dynamique** : prix horaire du marché plus une marge.
+
+Chaque demi-heure mesurée est chiffrée au prix de sa plage, et l'abonnement est réparti au prorata des jours.
+Les factures (N0) sont chiffrées au prix moyen du contrat. Sans contrat, le prix indicatif est signalé comme tel.
+Émissions : facteurs ADEME de la Base Empreinte (D6). Démonstration : couleurs Tempo simulées (les jours les
+plus froids) et prix spot simulés ; en production, signal RTE et prix de marché à brancher.
+
+**F7 — IPE ISO 50001** (`app/services/ipe.py`). Chaque indicateur est calculé sur 12 mois et comparé à la
+situation énergétique de référence (SER) du site, une année choisie :
+- **kWh/m²** : consommation rapportée à la surface ;
+- **kWh par unité produite et kWh/ETP** : les variables d'ajustement mensuelles, saisies par le responsable
+  énergie du client ou par l'auditeur ;
+- **kWh/DJU** : la consommation liée au chauffage (mois de chauffe moins le niveau des mois d'été), rapportée
+  aux degrés-jours.
+
+Passerelle ISO 50001 : une entreprise certifiée est exemptée de l'audit énergétique obligatoire tous les 4 ans.
+Une fois la date de validité du certificat saisie, l'échéance d'audit apparaît « Exemptée » et ses rappels
+s'arrêtent. C'est un argument commercial que l'étude de marché n'exploitait pas encore.
+
+**F8 — plan 2D** (`app/services/site_plan.py`). Les zones du graphe P2 sont des rectangles, les équipements et
+les compteurs des points, placés en % du plan ; une image (PNG ou JPEG) peut servir de fond. Les anomalies des
+30 derniers jours y sont situées : l'équipement suspect clignote en rouge, les zones potentiellement impactées
+sont surlignées. Le plan apparaît aussi sur la carte de l'anomalie. La maquette 3D, coûteuse à développer et à
+alimenter, est reportée en V3 : un plan 2D branché sur le graphe est plus utile qu'une 3D vide.
+
+**F9 — simulateur** (`app/services/simulator.py`).
+1. **Consommation par usage** sur 12 mois :
+   - chauffage et refroidissement : la part liée au climat, d'après le modèle de consommation (F11) ;
+   - autres usages : puissance nominale × durée type de fonctionnement des équipements du graphe ;
+   - le reste en « autres usages » ;
+   - chaque part est ajustable.
+2. **Actions** : les gestes types de la bibliothèque (ordres de grandeur indicatifs, que chaque cabinet
+   complète) et les recommandations validées. Sur un même usage, les économies se cumulent sans double compte.
+3. **Résultats** : kWh, € au prix payé (contrat F6), tCO₂e, investissement, temps de retour.
+
+Le scénario retenu alimente la trajectoire « avec actions » (F11) et le rapport trimestriel. Démo, bureaux
+Part-Dieu : 34 MWh par an (5 %), 6 300 €, retour en 3,8 ans.
+
+**F10 — rapport trimestriel assisté** (`app/services/quarterly_reports.py`). Le rapport est un outil de
+productivité pour l'auditeur, pas une IA autonome.
+1. **Projet** : dès la fin du trimestre, la plateforme prépare un projet en six parties : synthèse des
+   consommations, écarts au prévisionnel, dérives détectées, IPE, trajectoire, pistes d'action.
+2. **Enrichissement** : l'auditeur le relit et ajoute son analyse (sa synthèse est obligatoire).
+3. **Validation, puis livraison** : il le valide, puis le délivre sous l'identité de son cabinet.
+
+Le client ne voit que les rapports délivrés. Le document (HTML, imprimable en PDF) ne mentionne pas
+EffiSmart : EffiSmart ne délivre jamais d'analyse en direct au client final. Le régénérer conserve le texte de
+l'auditeur.
+
+**F11 — prédiction** (`app/services/consumption_model.py`). Le moteur de prévision v2 est appris sur les 12 à
+24 derniers mois. Le meilleur modèle est choisi par validation hors échantillon ; la famille « jours
+pertinents » apprend des jours analogues. Le modèle sert trois fois :
+1. **Consommation attendue** : une anomalie devient un écart au modèle (seuil : 15 % au moins, et 2,5 fois
+   l'erreur du modèle). Ce détecteur remplace l'écart N-1 dès que l'historique suffit (`app/services/drift.py`).
+2. **Trajectoire Décret Tertiaire** (`app/services/trajectory.py`) :
+   - la consommation est corrigée du climat (année de météo normale) ;
+   - elle est comparée à la référence déclarée sur OPERAT ;
+   - le rythme annuel moyen depuis cette référence est prolongé jusqu'en 2050, face aux jalons −40 / −50 / −60 %.
+
+   Démo, bureaux Part-Dieu : « au rythme actuel, −30 % en 2030 au lieu des −40 % exigés ; avec le plan
+   d'actions retenu, −34 % ». La trajectoire est une projection : elle se valide comme une prévision
+   (principe P1).
+3. **Simulateur** (F9) : part du chauffage et trajectoire avec actions.
+
+Mode dégradé la première année, faute d'historique : pas de modèle, l'écart N-1 et les autres détecteurs
+restent en place.
+
+**F12 — optimisation tarifaire en mode conseil** (`app/services/load_shift.py`).
+- **Calcul** : pour un équipement décalable du graphe (chargeurs, ballon d'eau chaude, ou toute durée de
+  fonctionnement renseignée), la plateforme repère sa plage actuelle dans la courbe de charge. Elle cherche la
+  plage la moins chère selon le contrat (heures creuses, Tempo, prix de marché).
+- **Recommandation** : elle propose une « recommandation de décalage de charge », validée par un humain.
+  L'exploitant applique le réglage lui-même : aucune écriture vers les équipements (N4 exclu en V1 et V2).
+- **Gain** : il est financier, l'énergie consommée ne change pas ; il n'y a donc pas de mesure avant / après en
+  kWh.
+
+Démo, entrepôt de Genas : chargeurs déplacés de 11 h – 17 h vers 22 h – 4 h, environ 12 000 € par an.
 
 ## Principe 1 : la plateforme propose, un humain décide
 

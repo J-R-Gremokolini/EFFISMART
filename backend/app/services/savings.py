@@ -21,7 +21,7 @@ from datetime import date, timedelta
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Drift, Fluid, Recommendation, ReviewStatus
+from app.models import Drift, Fluid, Recommendation, RecommendationKind, ReviewStatus
 from app.providers.weather import WeatherUnavailableError
 from app.services import forecasting
 from app.services.consent import has_active_consent
@@ -84,6 +84,8 @@ def measure(db: Session, rec: Recommendation) -> SavingsMeasurement | None:
     dp = rec.delivery_point
     if rec.status != ReviewStatus.APPLIED or rec.applied_at is None or dp is None or not has_active_consent(db, dp.id):
         return None
+    if rec.kind == RecommendationKind.LOAD_SHIFT:
+        return None  # F12 : l'énergie ne change pas, le gain est financier ; pas de mesure avant / après en kWh
     applied_on = to_local(rec.applied_at).date()
     reporting_end = data_as_of(db, [dp.id])
     if reporting_end is None or (reporting_end - applied_on).days < MIN_REPORTING_DAYS:

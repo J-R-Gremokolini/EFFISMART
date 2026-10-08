@@ -14,7 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
 from app.db import SessionLocal
-from app.services import exports, predictions, regulatory
+from app.services import exports, load_shift, predictions, quarterly_reports, regulatory, trajectory
 from app.services.drift import run_detection
 from app.services.ingestion import ingest_all_for_day
 from app.timeutils import today_local
@@ -32,7 +32,10 @@ def run_daily_pipeline(today: date | None = None) -> None:
         regulatory.refresh_statuses(db, today)
         regulatory.send_reminders(db, today)
         predictions.refresh_predictions(db)
+        trajectory.refresh_trajectories(db)
+        load_shift.propose_load_shifts(db)
         exports.produce_automatic(db, today)
+        quarterly_reports.generate_due(db, today)
 
 
 def dispatch_webhooks() -> None:

@@ -1,10 +1,13 @@
 """Périmètre F1–F5 confirmé par l'étude de marché : données N0 (factures) et mode dégradé, avant / après
 recommandations, notification immédiate par e-mail, rappels d'échéances, données RSE produites automatiquement."""
+import json
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.models import (
     Consent,
     DeadlineStatus,
@@ -117,7 +120,7 @@ def test_rse_dataset_includes_invoices_and_states_its_sources(db, world, invoice
     assert gas.data_sources == {"N0 factures et relevés"}
     header = exports._common_header(data, "VSME")
     assert header["niveau_des_donnees"]["N0_factures_et_releves_kwh"] == pytest.approx(36500)
-    assert "volets social et gouvernance" in header["perimetre"]  # brique énergie, pas le rapport complet
+    assert "volets social et de gouvernance" in header["perimetre"]  # brique énergie, pas le rapport complet
 
 
 def test_rse_datasets_are_produced_automatically_once(db, world):
@@ -128,6 +131,22 @@ def test_rse_datasets_are_produced_automatically_once(db, world):
     assert exports.produce_automatic(db, today) == []  # déjà produits : rien de nouveau
     client_jobs = TenantRepository(db, world.client_a).list_export_jobs(world.org_a.id)
     assert {job.id for job in client_jobs} >= {job.id for job in created if job.organization_id == world.org_a.id}
+
+
+def test_automatic_datasets_are_renewed_when_the_template_changes(db, world):
+    """Nouvelle version des fichiers : les jeux automatiques sont produits de nouveau, sans ressaisie. L'ancienne
+    version reste conservée ; seule la plus récente est proposée au téléchargement."""
+    today = today_local()
+    first = exports.produce_automatic(db, today)
+    for job in first:  # jeux produits avec le gabarit précédent
+        for path in (Path(settings.export_dir) / job.file_ref).glob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["format_version"] = "effismart-v1-provisoire"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    renewed = exports.produce_automatic(db, today)
+    assert len(renewed) == len(first) and all(exports.is_current(job) for job in renewed)
+    shown = exports.latest_jobs(TenantRepository(db, world.auditor_a).list_export_jobs(world.org_a.id))
+    assert {job.id for job in shown} == {job.id for job in renewed if job.organization_id == world.org_a.id}
 
 
 def test_partner_api_consumption_flags_invoice_share(client, db, world, invoiced_point):

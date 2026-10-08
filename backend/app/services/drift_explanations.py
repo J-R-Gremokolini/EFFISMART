@@ -23,6 +23,7 @@ ALGORITHMS = {
     DriftKind.CLIMATE_DEVIATION: "F2a « écart climatique » v1 (régression N-1 × DJU)",
     DriftKind.BASELOAD: "F2a « talon de nuit » v2 (moyenne de la nuit, médiane des nuits précédentes)",
     DriftKind.OFF_HOURS: "F2a « consommation en inoccupation » v1 (talon du jour + écart habituel)",
+    DriftKind.MODEL_DEVIATION: "F11 « écart au modèle » v1 (moteur de prévision v2, 12 à 24 mois)",
 }
 RECURRENCE_WINDOW_DAYS = 90
 
@@ -134,6 +135,25 @@ def explain_drift(db: Session, dp: DeliveryPoint, drift: Drift, candidate=None) 
             a.factor(f"Talon de référence stable (variation {_pct(cv)})", 0.1)
         elif cv is not None and cv > 0.35:
             a.factor(f"Talon de référence variable (variation {_pct(cv)})", -0.1)
+    elif drift.kind == DriftKind.MODEL_DEVIATION:
+        start, end = facts["train_start"], facts["train_end"]
+        a.step(f"Mesure : {fr(drift.measured_value)} kWh consommés"
+               + (f", température moyenne {fr(facts['temperature'], 1)} °C." if facts.get("temperature") is not None
+                  else "."))
+        a.step(f"Référence : {fr(drift.reference_value)} kWh attendus par le modèle de consommation ({facts['model']}), "
+               f"appris sur {facts['train_days']} jours du {start[8:10]}/{start[5:7]}/{start[:4]} au "
+               f"{end[8:10]}/{end[5:7]}/{end[:4]} et alimenté par la météo réelle du jour.")
+        a.step(f"Écart : {drift.deviation_pct:+.0f} % pour un seuil de {_pct(facts['tolerance'])} : au moins 15 %, et "
+               f"2,5 fois l'erreur journalière du modèle ({_pct(facts['cv'])}, mesurée sur des périodes non apprises).")
+        _margin_factor(a, drift.deviation_pct, facts["tolerance"])
+        if facts["cv"] <= 0.10:
+            a.factor(f"Modèle précis ({_pct(facts['cv'])} d'erreur journalière)", 0.1)
+        elif facts["cv"] > 0.20:
+            a.factor(f"Modèle peu précis ({_pct(facts['cv'])} d'erreur journalière)", -0.1)
+        if facts["train_days"] >= 600:
+            a.factor(f"Modèle appris sur près de deux ans ({facts['train_days']} jours)", 0.05)
+        if str(facts.get("weather_source", "")).startswith("MOCK"):
+            a.factor("Météo simulée (démonstration)", -0.05)
     else:  # OFF_HOURS
         origin = "classe déduite des données" if facts.get("classes_learned") else "classe par défaut"
         a.step(f"Mesure : puissance moyenne de {fr(drift.measured_value)} kW sur les {facts['off_slots']} "

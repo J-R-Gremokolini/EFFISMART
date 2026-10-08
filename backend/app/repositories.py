@@ -23,11 +23,15 @@ from app.models import (
     ExportJob,
     Organization,
     Prediction,
+    QuarterlyReport,
     Recommendation,
     RegulatoryDeadline,
+    ReportStatus,
     ReviewStatus,
     Role,
+    SavingsScenario,
     Site,
+    Trajectory,
     User,
 )
 from app.timeutils import today_local
@@ -183,6 +187,43 @@ class TenantRepository:
 
     def get_prediction(self, prediction_id: int) -> Prediction:
         return self._one(self._predictions_stmt().where(Prediction.id == prediction_id))
+
+    # --- Version 2 : trajectoires (P1), scénarios, rapports trimestriels -----------------------------------
+
+    def _trajectories_stmt(self) -> Select:
+        stmt = select(Trajectory).where(self.org_clause(Trajectory.organization_id))
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(Trajectory.status == ReviewStatus.VALIDATED)
+        return stmt
+
+    def list_trajectories(self, organization_id: int, statuses: list[ReviewStatus] | None = None) -> list[Trajectory]:
+        stmt = self._trajectories_stmt().where(Trajectory.organization_id == organization_id)
+        if statuses:
+            stmt = stmt.where(Trajectory.status.in_(statuses))
+        return list(self.db.scalars(stmt.order_by(Trajectory.created_at.desc(), Trajectory.id.desc())))
+
+    def get_trajectory(self, trajectory_id: int) -> Trajectory:
+        return self._one(self._trajectories_stmt().where(Trajectory.id == trajectory_id))
+
+    def list_scenarios(self, site_id: int) -> list[SavingsScenario]:
+        site = self.get_site(site_id)
+        return list(self.db.scalars(select(SavingsScenario).where(
+            SavingsScenario.site_id == site.id, self.org_clause(SavingsScenario.organization_id))
+            .order_by(SavingsScenario.created_at.desc(), SavingsScenario.id.desc())))
+
+    def _reports_stmt(self) -> Select:
+        """F10 : le client ne voit que les rapports délivrés par son auditeur."""
+        stmt = select(QuarterlyReport).where(self.org_clause(QuarterlyReport.organization_id))
+        if self.user.role == Role.CLIENT_VIEWER:
+            stmt = stmt.where(QuarterlyReport.status == ReportStatus.DELIVERED)
+        return stmt
+
+    def list_reports(self, organization_id: int) -> list[QuarterlyReport]:
+        stmt = self._reports_stmt().where(QuarterlyReport.organization_id == organization_id)
+        return list(self.db.scalars(stmt.order_by(QuarterlyReport.year.desc(), QuarterlyReport.quarter.desc())))
+
+    def get_report(self, report_id: int) -> QuarterlyReport:
+        return self._one(self._reports_stmt().where(QuarterlyReport.id == report_id))
 
     # --- Graphe physique des équipements -----------------------------------------------------
 

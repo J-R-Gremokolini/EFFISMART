@@ -30,7 +30,7 @@ export const fr = {
     newClient: 'Nouveau client',
     dashboard: 'Tableau de bord',
     drifts: 'Dérives',
-    exports: 'Exports',
+    exports: 'Données RSE',
     manage: 'Patrimoine & consentements',
   },
   dataAsOf: (date: string) =>
@@ -119,20 +119,23 @@ export const fr = {
     statuses: { UPCOMING: 'À venir', DUE_SOON: 'Échéance proche', DONE: 'Réalisée' },
   },
   exports: {
-    title: 'Exports des données énergie',
-    hint: 'Un même calcul alimente les deux gabarits. Formats provisoires V1 : JSON + CSV.',
-    generate: 'Générer',
+    title: 'Données énergie pour vos rapports RSE',
+    hint: 'EffiSmart fournit la brique énergie de vos rapports RSE ; le rapport de durabilité complet, avec ses '
+      + 'volets social et de gouvernance, reste hors de son périmètre. Un même calcul alimente les deux gabarits ; '
+      + 'chaque archive contient un JSON, un CSV et un LISEZMOI (formats provisoires V1).',
+    generate: 'Produire les données énergie',
     periodStart: 'Début de période',
     periodEnd: 'Fin de période',
     formats: 'Formats',
-    history: 'Exports disponibles',
+    history: 'Jeux de données disponibles',
     format: 'Format',
     period: 'Période',
     createdAt: 'Créé le',
     factors: 'Facteurs d’émission',
     statuses: { PENDING: 'En cours', DONE: 'Prêt', FAILED: 'Échec' },
-    formatLabels: { OPERAT: 'OPERAT (Décret Tertiaire)', VSME: 'VSME (ESG)' },
-    clientHint: 'Les exports sont générés par votre auditeur ; vous pouvez les télécharger ici.',
+    formatLabels: { OPERAT: 'OPERAT (Décret Tertiaire)', VSME: 'VSME, module B3 : énergie et émissions de GES' },
+    clientHint: 'Les données énergie sont produites automatiquement ou par votre auditeur ; vous pouvez les '
+      + 'télécharger ici.',
   },
   manage: {
     title: 'Patrimoine & consentements',

@@ -169,4 +169,14 @@ def predictions(
             for p in scope.repo.list_predictions(org.id, [ReviewStatus.VALIDATED])]
 
 
+@router.get("/organizations/{org_id}/trajectories")
+def trajectories(
+    org_id: int, scope: PartnerScope = Depends(partner_scope), db: Session = Depends(get_db)
+) -> list[dict]:
+    """F11 : trajectoires Décret Tertiaire validées par un humain."""
+    org = scope.organization(org_id)
+    return [validation.trajectory_payload(db, t)
+            for t in scope.repo.list_trajectories(org.id, [ReviewStatus.VALIDATED])]
+
+
 

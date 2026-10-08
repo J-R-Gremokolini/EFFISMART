@@ -54,6 +54,7 @@ KIND_LABELS = {
     RecommendationKind.HEATING_CONTROL: "Régulation chauffage / climatisation",
     RecommendationKind.PEAK_SHAVING: "Écrêtement des pointes",
     RecommendationKind.INVESTIGATE: "Recherche de la cause",
+    RecommendationKind.LOAD_SHIFT: "Décalage de charge (conseil)",
 }
 
 

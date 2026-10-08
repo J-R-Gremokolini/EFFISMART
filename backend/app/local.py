@@ -76,7 +76,16 @@ def catch_up() -> int:
 
     from app.db import SessionLocal
     from app.models import DeliveryPoint
-    from app.services import exports, integrations, mailer, predictions, regulatory
+    from app.services import (
+        exports,
+        integrations,
+        load_shift,
+        mailer,
+        predictions,
+        quarterly_reports,
+        regulatory,
+        trajectory,
+    )
     from app.services.consent import active_consent_clause
     from app.services.dashboard import data_as_of
     from app.services.drift import run_detection
@@ -103,7 +112,10 @@ def catch_up() -> int:
         regulatory.refresh_statuses(db)
         regulatory.send_reminders(db)
         predictions.refresh_predictions(db)
+        trajectory.refresh_trajectories(db)
+        load_shift.propose_load_shifts(db)
         exports.produce_automatic(db)
+        quarterly_reports.generate_due(db)
         integrations.dispatch_pending(db)
         mailer.dispatch_pending(db)
     logger.info("Rattrapage terminé : %d jour(s) x point(s)", caught_up)

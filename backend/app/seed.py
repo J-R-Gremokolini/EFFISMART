@@ -19,6 +19,7 @@ Usage : ``python -m app.seed``
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import delete, func, select
@@ -28,6 +29,8 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import (
     ActionLog,
+    AdjustmentKind,
+    AdjustmentVariable,
     AssetNode,
     AssetNodeKind,
     AssetRelation,
@@ -48,8 +51,10 @@ from app.models import (
     ReviewStatus,
     Role,
     Site,
+    TariffOption,
     User,
 )
+from app.repositories import TenantRepository
 from app.security import hash_password
 from app.services import (
     alert_groups,
@@ -58,14 +63,20 @@ from app.services import (
     drift_explanations,
     exports,
     integrations,
+    load_shift,
     predictions,
+    quarterly_reports,
     recommendations,
     regulatory,
+    simulator,
+    tariffs,
+    trajectory,
 )
-from app.services.consent import grant_consent
+from app.services.consent import grant_consent, has_active_consent
+from app.services.dashboard import data_as_of
 from app.services.drift import detect_baseload, run_detection
 from app.services.ingestion import ingest_delivery_point
-from app.timeutils import LOCAL_TZ, today_local, utcnow, yesterday_local
+from app.timeutils import LOCAL_TZ, add_months, month_start, today_local, utcnow, yesterday_local
 
 logger = logging.getLogger("effismart.seed")
 
@@ -390,6 +401,136 @@ def _create_demo_history(db: Session) -> None:
     logger.info("Historique de démonstration créé : « %s ».", rec.title)
 
 
+# --- Version 2 : données de démonstration (F6 à F12) ----------------------------------------------------
+
+# F6 : contrats de fourniture de démonstration (prix complets indicatifs, en €/kWh ; fournisseurs fictifs).
+TEMPO_DEMO = {"BLEU": {"HP": 0.1612, "HC": 0.1325}, "BLANC": {"HP": 0.1871, "HC": 0.1499},
+              "ROUGE": {"HP": 0.7060, "HC": 0.1575}}
+DEMO_CONTRACTS = {
+    "30001000000001": dict(supplier="Volt Pro (démo)", option=TariffOption.HPHC, price_hp=0.2280, price_hc=0.1720,
+                           subscription_eur_month=85.0),
+    "30001000000002": dict(supplier="Volt Pro (démo)", option=TariffOption.BASE, price_base=0.2150,
+                           subscription_eur_month=38.0),
+    "30001000000003": dict(supplier="Watt Santé (démo)", option=TariffOption.TEMPO, tempo_prices=TEMPO_DEMO,
+                           subscription_eur_month=210.0),
+    "30001000000005": dict(supplier="Logi Énergie (démo)", option=TariffOption.HPHC, price_hp=0.2210,
+                           price_hc=0.1640, subscription_eur_month=160.0),
+    "30001000000006": dict(supplier="Spot Énergie (démo)", option=TariffOption.DYNAMIC,
+                           dynamic_margin_eur_kwh=0.095, subscription_eur_month=120.0),
+    "21000000000007": dict(supplier="Gaz Ouest (démo)", option=TariffOption.BASE, price_base=0.1050,
+                           subscription_eur_month=45.0),
+    "21000000000008": dict(supplier="Gaz Ouest (démo)", option=TariffOption.BASE, price_base=0.0980,
+                           subscription_eur_month=140.0),
+}
+# F7 : variables d'ajustement (site : unité de production, production mensuelle moyenne, effectif en ETP).
+DEMO_ACTIVITY = {
+    "Atelier central": ("tonnes de pain et viennoiseries", 44.0, 38.0),
+    "Boutique Bellecour": (None, None, 6.0),
+    "Bâtiment principal": ("journées d'hospitalisation", 2900.0, 310.0),
+    "Entrepôt Genas": ("palettes expédiées", 8500.0, 52.0),
+    "Bureaux Part-Dieu": (None, None, 88.0),
+}
+# F11 : consommation actuelle / référence 2019 (fictive) : trajectoires contrastées pour la démonstration.
+DEMO_DT_RATIOS = {"Atelier central": 0.86, "Bâtiment principal": 0.90, "Entrepôt Genas": 0.66,
+                  "Bureaux Part-Dieu": 0.80}
+DEMO_ISO50001 = {"Clinique du Parc": date(2028, 6, 30)}
+# F8 : positions sur le plan 2D (en % ; zone : x, y, largeur, hauteur ; équipement ou compteur : x, y).
+DEMO_PLANS = {
+    "Bâtiment principal": {
+        "Bloc opératoire": (4, 6, 40, 38), "Chambres": (50, 6, 46, 52), "Administration": (4, 50, 40, 40),
+        "Local serveurs": (50, 64, 16, 26), "CTA bloc opératoire": (24, 30), "CTA administration": (24, 76),
+        "Radiateurs des chambres": (73, 34), "Ballon d'eau chaude sanitaire": (88, 66), "Éclairage": (46, 47),
+        "Salle serveurs": (58, 76), "Chaudière gaz à condensation": (88, 80), "Groupe froid": (75, 80),
+        "Compteur élec. 30001000000003": (75, 92), "Compteur gaz 21000000000008": (88, 92),
+    },
+    "Entrepôt Genas": {
+        "Zone de stockage": (4, 6, 64, 86), "Local de charge": (72, 6, 24, 30), "Quais frigorifiques": (72, 42, 24, 44),
+        "Chargeurs des chariots élévateurs": (84, 22), "Éclairage de l'entrepôt": (30, 30),
+        "Aérothermes électriques": (30, 66), "Groupes frigorifiques des quais": (84, 66),
+        "Compteur élec. 30001000000005": (50, 90), "Compteur élec. 30001000000004": (84, 90),
+    },
+    "Bureaux Part-Dieu": {
+        "Plateaux de bureaux": (4, 6, 68, 86), "Éclairage des bureaux": (36, 26), "Ventilo-convecteurs": (36, 62),
+        "Pompe à chaleur réversible": (86, 22), "CTA double flux": (86, 50), "Compteur élec. 30001000000006": (86, 82),
+    },
+}
+DEMO_SCENARIO = ("Bureaux Part-Dieu", "Plan d'actions 2027 (démonstration)",
+                 ["ECL_LED", "ECL_DETECTION", "VENT_PROG", "CHAUF_CONSIGNE"])
+
+
+def _create_demo_v2(db: Session) -> None:
+    """Données de démonstration de la version 2, pour les clients de démonstration (idempotent)."""
+    auditor = db.scalar(select(User).where(User.email == "auditeur@effismart.demo"))
+    demo_orgs = {o.name: o for o in db.scalars(select(Organization).where(
+        Organization.name.in_([spec["name"] for spec in ORGANIZATIONS])))}
+    if auditor is None or not demo_orgs:
+        return
+    repo = TenantRepository(db, auditor)
+    for ref, spec in DEMO_CONTRACTS.items():
+        dp = db.scalar(select(DeliveryPoint).where(DeliveryPoint.external_ref == ref))
+        if dp is not None and not tariffs.contracts_of(db, dp.id):
+            tariffs.save_contract(db, repo, auditor, dp.id, valid_from=date(2024, 1, 1), **spec)
+    today = today_local()
+    sites = {s.name: s for s in db.scalars(select(Site).where(Site.organization_id.in_([o.id for o in demo_orgs.values()])))}
+    for name, (unit, production, headcount) in DEMO_ACTIVITY.items():
+        site = sites.get(name)
+        if site is None or db.scalar(select(AdjustmentVariable.id).where(AdjustmentVariable.site_id == site.id).limit(1)):
+            continue
+        site.production_unit = site.production_unit or unit
+        site.energy_baseline_year = site.energy_baseline_year or today.year - 1
+        month = add_months(month_start(today), -24)
+        while month < month_start(today):
+            wave = math.sin(2 * math.pi * (month.month - 3) / 12)
+            if production:
+                db.add(AdjustmentVariable(organization_id=site.organization_id, site_id=site.id,
+                                          kind=AdjustmentKind.PRODUCTION, month=month,
+                                          value=round(production * (1 + 0.08 * wave + 0.03 * (month.month == 12)), 1)))
+            db.add(AdjustmentVariable(organization_id=site.organization_id, site_id=site.id,
+                                      kind=AdjustmentKind.HEADCOUNT, month=month,
+                                      value=round(headcount * (1 - 0.06 * (month.month == 8)), 1)))
+            month = add_months(month, 1)
+        db.commit()
+    for org_name, until in DEMO_ISO50001.items():
+        if org_name in demo_orgs and demo_orgs[org_name].iso50001_certified_until is None:
+            demo_orgs[org_name].iso50001_certified_until = until
+    for site_name, positions in DEMO_PLANS.items():
+        site = sites.get(site_name)
+        if site is None:
+            continue
+        nodes = {n.name: n for n in db.scalars(select(AssetNode).where(AssetNode.site_id == site.id))}
+        if any(n.plan_x is not None for n in nodes.values()):
+            continue
+        for node_name, place in positions.items():
+            node = nodes.get(node_name)
+            if node is not None:
+                node.plan_x, node.plan_y = float(place[0]), float(place[1])
+                if len(place) == 4:
+                    node.plan_w, node.plan_h = float(place[2]), float(place[3])
+    db.commit()
+    weather = integrations.weather_provider(db)
+    for site_name, ratio in DEMO_DT_RATIOS.items():
+        site = sites.get(site_name)
+        if site is None or site.dt_reference_kwh:
+            continue
+        points = [dp for dp in site.delivery_points if has_active_consent(db, dp.id)]
+        as_of = data_as_of(db, [dp.id for dp in points])
+        parts = trajectory.normalized_consumption(db, site, as_of, weather) if as_of else None
+        if parts:
+            site.dt_reference_year = 2019
+            site.dt_reference_kwh = round(sum(p.kwh for p in parts) / ratio, -2)
+    db.commit()
+    site_name, scenario_name, codes = DEMO_SCENARIO
+    site = sites.get(site_name)
+    if site is not None and not repo.list_scenarios(site.id):
+        templates = [t for t in simulator.library(db, auditor) if t.code in codes]
+        breakdown = simulator.breakdown(db, site, weather)
+        if breakdown and templates:
+            results = simulator.simulate(site, breakdown, templates, [])
+            simulator.save_scenario(db, repo, auditor, site.id, name=scenario_name,
+                                    template_ids=[t.id for t in templates], recommendation_ids=[], results=results,
+                                    retained=True)
+
+
 def upgrade(db: Session) -> None:
     """Mise à niveau idempotente d'une base existante (principes P1 et graphe physique)."""
     created = assets.sync_meter_nodes(db)
@@ -407,12 +548,18 @@ def upgrade(db: Session) -> None:
     grouped = alert_groups.regroup_existing(db)
     if grouped:
         logger.info("%d anomalie(s) à valider regroupée(s) avec une alerte de même cause.", grouped)
+    simulator.ensure_library(db)
+    if db.scalar(select(Organization.id).where(Organization.name.in_([o["name"] for o in ORGANIZATIONS])).limit(1)):
+        _create_demo_v2(db)
     proposed = recommendations.propose_missing(db)
     if proposed:
         logger.info("%d recommandation(s) proposée(s) pour des anomalies déjà validées.", proposed)
     predictions.refresh_predictions(db)
+    trajectory.refresh_trajectories(db)
+    load_shift.propose_load_shifts(db)
     regulatory.send_reminders(db)
     exports.produce_automatic(db)
+    quarterly_reports.generate_due(db)
 
 
 def seed() -> None:

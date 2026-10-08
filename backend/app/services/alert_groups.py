@@ -42,9 +42,11 @@ EXPLAINED_SHARE = 0.5
 ALERT_PREFIX = "À valider : "
 
 RULE_REPEAT, RULE_EXPLAINED, RULE_SUSPECT, RULE_DETACHED = "REPEAT", "EXPLAINED", "SUSPECT", "DETACHED"
+RULE_SAME_DAY = "SAME_DAY"
 RULE_WHY = {
     RULE_REPEAT: "le problème se répète (même compteur, même type d'anomalie)",
     RULE_EXPLAINED: "l'excès de la journée s'explique par une anomalie déjà signalée",
+    RULE_SAME_DAY: "le même excès de la journée est vu par deux détecteurs",
     RULE_SUSPECT: "même équipement suspect",
 }
 INTRADAY = (DriftKind.BASELOAD, DriftKind.OFF_HOURS)
@@ -91,6 +93,11 @@ def _suspects(drift: Drift) -> dict[int, str]:
     return {s["id"]: s["name"] for s in ctx.get("suspects", []) if s.get("retained")}
 
 
+def _whole_day(*drifts: Drift) -> bool:
+    """Anomalies portant toutes sur la journée entière (aucune sur une plage horaire)."""
+    return all(d.kind not in INTRADAY for d in drifts)
+
+
 def same_cause(drift: Drift, member: Drift) -> tuple[str, str] | None:
     """Règle de même cause entre une nouvelle anomalie et une anomalie du groupe : (règle, raison) ou None."""
     dp = drift.delivery_point
@@ -101,6 +108,9 @@ def same_cause(drift: Drift, member: Drift) -> tuple[str, str] | None:
                              f"l'occurrence du {member.day:%d/%m/%Y} : le problème se répète")
     if abs(gap) > CAUSE_WINDOW_DAYS:
         return None
+    if same_meter and gap == 0 and drift.unit == member.unit == "kWh" and _whole_day(drift, member):
+        return RULE_SAME_DAY, (f"même excès de la journée, déjà signalé par l'anomalie « {_label(member)} » du même "
+                               "compteur, le même jour")
     if same_meter and gap == 0:
         pair = (drift, member) if drift.kind not in INTRADAY else (member, drift)
         daily, intraday = pair

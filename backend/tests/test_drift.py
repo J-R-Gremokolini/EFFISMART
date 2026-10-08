@@ -108,15 +108,27 @@ def test_power_spike_raises_threshold_drift(db, dp):
     assert DriftKind.THRESHOLD not in _kinds(run_detection(db, date(2025, 6, 12), delivery_point_ids=[dp.id]))
 
 
-def test_overconsumption_raises_climate_deviation_drift(db, dp):
+def test_overconsumption_raises_model_deviation_with_a_year_of_history(db, dp):
+    """F11 : avec 12 mois d'historique ou plus, l'attendu vient du modèle de consommation (météo réelle),
+    qui remplace la comparaison à N-1 : une seule anomalie, « écart au modèle »."""
     start, end = date(2025, 6, 10), date(2025, 6, 13)
     _use_mock([AnomalySpec(REF, AnomalyKind.OVERCONSUMPTION, between(start, end), 0.45)])
-    ingest_delivery_point(db, dp, date(2024, 5, 1), date(2025, 6, 20))  # N-1 nécessaire
+    ingest_delivery_point(db, dp, date(2024, 5, 1), date(2025, 6, 20))
 
-    assert DriftKind.CLIMATE_DEVIATION in _kinds(run_detection(db, date(2025, 6, 11), delivery_point_ids=[dp.id]))
-    assert DriftKind.CLIMATE_DEVIATION not in _kinds(
-        run_detection(db, date(2025, 6, 18), delivery_point_ids=[dp.id])
-    )
+    drifts = run_detection(db, date(2025, 6, 11), delivery_point_ids=[dp.id])
+    assert _kinds(drifts) == {DriftKind.MODEL_DEVIATION}
+    reasoning = " ".join(drifts[0].reasoning)
+    assert "attendus par le modèle de consommation" in reasoning and "périodes non apprises" in reasoning
+    assert DriftKind.MODEL_DEVIATION not in _kinds(run_detection(db, date(2025, 6, 18), delivery_point_ids=[dp.id]))
+
+
+def test_first_year_falls_back_to_the_previous_year_comparison(db, dp):
+    """Mode dégradé : moins de 12 mois d'historique, pas de modèle ; l'écart N-1 corrigé des DJU reste en place."""
+    start, end = date(2025, 6, 10), date(2025, 6, 13)
+    _use_mock([AnomalySpec(REF, AnomalyKind.OVERCONSUMPTION, between(start, end), 0.45)])
+    ingest_delivery_point(db, dp, date(2024, 5, 1), date(2024, 7, 31))  # même période N-1 seulement
+    ingest_delivery_point(db, dp, date(2025, 5, 1), date(2025, 6, 20))
+    assert _kinds(run_detection(db, date(2025, 6, 11), delivery_point_ids=[dp.id])) == {DriftKind.CLIMATE_DEVIATION}
 
 
 def test_saturday_production_is_not_compared_with_closed_sunday(db, world):

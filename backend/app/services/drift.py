@@ -7,6 +7,10 @@ Quatre détecteurs purement statistiques, sans IA, entièrement faisables avec l
 4. OFF_HOURS         : consommation en période d'inoccupation hors nuit (week-end, avant l'arrivée et après
                        le départ). L'attendu part du talon de nuit du jour : un même excès n'est signalé qu'une fois.
 
+F11 (version 2) améliore le détecteur 2 : avec 12 à 24 mois d'historique, la consommation attendue vient du
+modèle de consommation (météo, inertie, soleil, classes de fonctionnement) et l'anomalie devient un écart au
+modèle (MODEL_DEVIATION). L'écart N-1 reste le recours la première année (mode dégradé).
+
 F2b (`anomaly_context`) replace ensuite chaque anomalie dans le graphe physique du site (principe P2) :
 équipement suspect, zones et usages potentiellement impactés.
 
@@ -35,6 +39,7 @@ from app.models import (
 )
 from app.providers.registry import get_energy_provider
 from app.providers.weather import WeatherProvider, WeatherUnavailableError
+from app.services import consumption_model
 from app.services.consent import active_consent_clause
 from app.services.forecasting import learn_operation_classes
 from app.timeutils import local_day_bounds, to_local
@@ -46,6 +51,7 @@ DRIFT_LABELS = {
     DriftKind.CLIMATE_DEVIATION: "Écart à l'historique corrigé du climat",
     DriftKind.BASELOAD: "Talon de nuit anormal",
     DriftKind.OFF_HOURS: "Consommation en période d'inoccupation",
+    DriftKind.MODEL_DEVIATION: "Écart au modèle de consommation",
 }
 MIN_NIGHT_SLOTS = 8  # au moins la moitié des créneaux de nuit pour juger le talon
 MIN_OFF_HOURS_SLOTS = 4
@@ -204,6 +210,9 @@ def detect_climate_deviation(
     actual = daily_kwh(db, dp.id, day, day).get(day)
     if actual is None:
         return None
+    model = consumption_model.model_for_day(db, [dp], day, weather)
+    if model is not None and model.reliable:
+        return None  # F11 : l'écart au modèle prend le relais
     window = settings.climate_regression_window_days
     center = day - timedelta(days=364)
     history = daily_kwh(db, dp.id, center - timedelta(days=2 * window), center + timedelta(days=2 * window))
@@ -251,6 +260,43 @@ def detect_climate_deviation(
             "r2": 1 - sum(r * r for r in residuals) / ss_tot if ss_tot > 0 and slope > 0 else None,
             "residual_cv": (statistics.fmean(r * r for r in residuals) ** 0.5) / mean_y if mean_y > 0 else None,
             "tolerance": settings.climate_deviation_tolerance, "excess_kwh": actual - expected,
+            "weather_source": weather.source, "coverage": coverage(db, dp, day),
+        },
+    )
+
+
+def detect_model_deviation(
+    db: Session, dp: DeliveryPoint, day: date, weather: WeatherProvider
+) -> DriftCandidate | None:
+    """F11 : consommation du jour comparée à celle qu'attend le modèle de consommation, à la météo réelle.
+
+    Modèle appris sur les 12 à 24 mois qui précèdent le mois du jour analysé. Seuil : 15 % au moins, et
+    2,5 fois l'erreur journalière du modèle (mesurée hors échantillon) : un modèle moins précis signale moins.
+    """
+    actual = daily_kwh(db, dp.id, day, day).get(day)
+    if actual is None:
+        return None
+    model = consumption_model.model_for_day(db, [dp], day, weather)
+    if model is None or not model.reliable:
+        return None
+    try:
+        climate = consumption_model.observed(model, weather, day, day)
+    except WeatherUnavailableError:
+        logger.warning("Météo indisponible : écart au modèle ignoré pour le %s", day)
+        return None
+    expected = model.predict(day, climate)
+    if not expected or expected <= 0:
+        return None
+    tolerance = max(settings.model_deviation_min_tolerance, settings.model_deviation_sigma * model.cv)
+    if actual <= expected * (1 + tolerance):
+        return None
+    return DriftCandidate(
+        DriftKind.MODEL_DEVIATION, actual, expected, "kWh",
+        f"Consommation de {actual:.0f} kWh pour {expected:.0f} kWh attendus par le modèle de consommation",
+        facts={
+            "model": model.describe(), "cv": model.cv, "train_start": model.train_start.isoformat(),
+            "train_end": model.train_end.isoformat(), "train_days": model.days, "tolerance": tolerance,
+            "temperature": climate.temperature.get(day), "excess_kwh": actual - expected,
             "weather_source": weather.source, "coverage": coverage(db, dp, day),
         },
     )
@@ -342,12 +388,13 @@ def detect_off_hours(db: Session, dp: DeliveryPoint, day: date, weather: Weather
 
 # Ordre d'exécution : du plus précis (plages horaires) au plus global (journée). Le même jour, une anomalie sur la
 # journée expliquée par une anomalie de plage horaire déjà signalée s'y regroupe (`alert_groups`).
-DETECTORS = (detect_threshold, detect_baseload, detect_off_hours, detect_climate_deviation)
+DETECTORS = (detect_threshold, detect_baseload, detect_off_hours, detect_model_deviation, detect_climate_deviation)
 DETECTOR_BY_KIND = {
     DriftKind.THRESHOLD: detect_threshold,
     DriftKind.CLIMATE_DEVIATION: detect_climate_deviation,
     DriftKind.BASELOAD: detect_baseload,
     DriftKind.OFF_HOURS: detect_off_hours,
+    DriftKind.MODEL_DEVIATION: detect_model_deviation,
 }
 
 

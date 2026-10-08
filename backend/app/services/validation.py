@@ -33,6 +33,7 @@ from app.models import (
     ReviewStatus,
     Role,
     Site,
+    Trajectory,
     User,
 )
 from app.repositories import TenantRepository, active_links_clause
@@ -422,13 +423,57 @@ def review_prediction(
     return prediction
 
 
+def trajectory_payload(db: Session, trajectory: Trajectory) -> dict:
+    return {
+        "trajectory_id": trajectory.id, "site": trajectory.site.name, "data_as_of": trajectory.data_as_of.isoformat(),
+        "reference_year": trajectory.reference_year, "reference_kwh": trajectory.reference_kwh,
+        "current_kwh_climate_corrected": trajectory.current_kwh, "annual_rate": trajectory.annual_rate,
+        "projected_2030_kwh": trajectory.projected_2030_kwh, "reduction_2030": trajectory.reduction_2030,
+        "reduction_2030_with_actions": trajectory.reduction_2030_with_actions, "points": trajectory.points,
+        "status": trajectory.status.value,
+        "validated_by_role": validator_role(db.get(User, trajectory.reviewed_by) if trajectory.reviewed_by else None),
+        "validated_at": trajectory.reviewed_at.isoformat() if trajectory.reviewed_at else None,
+        **explanation_dict(trajectory),
+    }
+
+
+def review_trajectory(
+    db: Session, repo: TenantRepository, user: User, trajectory_id: int, status: ReviewStatus,
+    comment: str | None = None,
+) -> Trajectory:
+    """F11 : une trajectoire Décret Tertiaire est une projection ; elle se valide comme une prévision."""
+    from app.services import integrations
+
+    _require_validator(user)
+    trajectory = repo.get_trajectory(trajectory_id)
+    if status not in PREDICTION_TRANSITIONS.get(trajectory.status, set()):
+        raise ValidationError(
+            f"Passage de « {REVIEW_STATUS_LABELS[trajectory.status]} » à « {REVIEW_STATUS_LABELS[status]} » impossible."
+        )
+    comment = _clean_comment(comment, required=status == ReviewStatus.REJECTED, what="écartez cette trajectoire")
+    decided = status != ReviewStatus.PROPOSED
+    previous = trajectory.status
+    trajectory.status, trajectory.review_comment = status, comment
+    trajectory.reviewed_by = user.id if decided else None
+    trajectory.reviewed_at = utcnow() if decided else None
+    if status == ReviewStatus.VALIDATED and previous == ReviewStatus.PROPOSED:
+        notify(db, trajectory.organization_id,
+               f"Trajectoire Décret Tertiaire validée par {validator_label(user)} : {trajectory.site.name}, "
+               f"{trajectory.reduction_2030 * -100:+.0f} % en 2030 au rythme actuel".replace(".", ","),
+               validators_only=False, exclude_user_id=user.id)
+        integrations.enqueue_event(db, "trajectory.validated", trajectory.organization_id,
+                                   trajectory_payload(db, trajectory))
+    db.commit()
+    return trajectory
+
+
 # --- File de validation ---------------------------------------------------------------------------
 
 
 @dataclass
 class PendingItem:
-    kind: str  # "drift" | "recommendation" | "prediction"
-    output: Drift | Recommendation | Prediction
+    kind: str  # "drift" | "recommendation" | "prediction" | "trajectory"
+    output: Drift | Recommendation | Prediction | Trajectory
 
     @property
     def priority(self) -> float:
@@ -442,6 +487,7 @@ def pending_outputs(repo: TenantRepository, organization_id: int) -> list[Pendin
         + [PendingItem("drift", d) for d in repo.list_drifts(organization_id, DriftStatus.OPEN)
            if d.grouped_with_id is None]  # une alerte par groupe de même cause
         + [PendingItem("prediction", p) for p in repo.list_predictions(organization_id, [ReviewStatus.PROPOSED])]
+        + [PendingItem("trajectory", t) for t in repo.list_trajectories(organization_id, [ReviewStatus.PROPOSED])]
     )
     return sorted(items, key=lambda item: item.priority, reverse=True)
 
@@ -459,4 +505,6 @@ def count_pending(db: Session, organization_id: int) -> int:
         Recommendation.organization_id == organization_id, Recommendation.status == ReviewStatus.PROPOSED)) or 0
     preds = db.scalar(select(func.count(Prediction.id)).where(
         Prediction.organization_id == organization_id, Prediction.status == ReviewStatus.PROPOSED)) or 0
-    return int(drifts + recs + preds)
+    trajectories = db.scalar(select(func.count(Trajectory.id)).where(
+        Trajectory.organization_id == organization_id, Trajectory.status == ReviewStatus.PROPOSED)) or 0
+    return int(drifts + recs + preds + trajectories)

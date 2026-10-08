@@ -49,8 +49,11 @@ def test_exports_timestamp_emission_factors(client, world):
     archive = client.get(f"/api/exports/{job['id']}/download", headers=headers)
     assert archive.status_code == 200
     with zipfile.ZipFile(io.BytesIO(archive.content)) as z:
-        assert set(z.namelist()) == {"operat_export.json", "operat_consommations.csv"}
-        payload = json.loads(z.read("operat_export.json"))
+        assert set(z.namelist()) == {"donnees_energie_operat.json", "donnees_energie_operat.csv", "LISEZMOI.txt"}
+        payload = json.loads(z.read("donnees_energie_operat.json"))
+        notice = z.read("LISEZMOI.txt").decode("utf-8-sig")
+    assert "brique énergie" in notice and "volets social et de gouvernance" in notice
+    assert "indicateurs d'intensité d'usage" in payload["a_completer_par_l_entreprise"]
     assert payload["facteurs_emission_utilises"][0]["version"] == "test-v1"
     assert payload["entites_fonctionnelles_assujetties"][0]["conso_totale_kwh"] > 0
 
@@ -64,7 +67,15 @@ def test_vsme_contains_b3_indicators(client, world):
     ).json()[0]
     archive = client.get(f"/api/exports/{job['id']}/download", headers=headers)
     with zipfile.ZipFile(io.BytesIO(archive.content)) as z:
-        b3 = json.loads(z.read("vsme_export.json"))["B3_energie_et_ges"]
+        payload = json.loads(z.read("donnees_energie_vsme_b3.json"))
+        notice = z.read("LISEZMOI.txt").decode("utf-8-sig")
+    b3 = payload["B3_energie_et_ges"]
+    # Brique énergie seulement : le module B3 ; les volets social (B8 à B10) et gouvernance (B11) restent à
+    # l'entreprise, comme les autres modules environnementaux.
+    coverage = payload["couverture_vsme"]
+    assert list(coverage["modules_fournis_par_effismart"]) == ["B3"]
+    assert {"B8", "B9", "B10", "B11"} <= coverage["modules_a_completer_par_l_entreprise"].keys()
+    assert "B11 : Condamnations et amendes pour corruption" in notice
     assert b3["electricite_mwh"] > 0
     assert b3["emissions_scope2_location_based_tco2e"] > 0
 
