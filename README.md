@@ -212,8 +212,27 @@ physique du site (principe 2).
 3. **Anomalies à examiner ensemble** : deux anomalies du même site, à un jour près, qui touchent les mêmes
    zones ou le même équipement sont rapprochées (une cause commune est possible, pas certaine).
 
+*Une cause, une alerte* (`app/services/alert_groups.py`). Une nouvelle anomalie se rattache à une alerte encore
+à valider quand elles ont vraisemblablement la même cause :
+
+| Règle | Exemple |
+|---|---|
+| répétition : même compteur, même type, à moins de 30 jours | talon de nuit sept nuits de suite : une alerte, sept occurrences |
+| excès expliqué : même compteur, même jour, l'excès de la journée couvert à 50 % au moins par une anomalie de plage horaire | groupe froid en marche le samedi : l'écart climatique du samedi rejoint l'alerte « inoccupation » |
+| même équipement suspect (F2b), à un jour près | deux compteurs dont l'anomalie désigne la même chaudière |
+
+Seule la **plus ancienne** est signalée (alerte, e-mail, file de validation) ; le même jour, les détecteurs de
+plage horaire passent avant celui de la journée, plus global. Les suivantes mettent à jour l'alerte, sans nouvel
+e-mail, et l'alerte dit pourquoi elle regroupe : « 7 alertes regroupées en une seule, du 24/08 au 30/08/2026.
+Pourquoi ce regroupement : le problème se répète (même compteur, même type d'anomalie) ; une seule décision vaut
+pour tout le groupe. » Comme toute proposition de la plateforme (principe 1), le regroupement se contrôle : la
+décision humaine porte sur tout le groupe, et un valideur peut détacher une anomalie sans rapport
+(`POST /api/drifts/{id}/detach`). Une alerte déjà décidée ne reçoit plus d'occurrences : la suivante ouvre une
+nouvelle alerte. Deux causes distinctes sur un même compteur restent séparées (bureaux : éclairage la nuit,
+160 kWh, et pompe à chaleur déréglée le jour, 800 kWh).
+
 Le contexte figure sur la carte de l'anomalie (avec le graphe surligné), dans son raisonnement, dans l'alerte
-et l'e-mail, dans les webhooks et l'API (`context`). C'est une hypothèse (principe 1) : elle suit le graphe tant
+et l'e-mail, dans les webhooks et l'API (`context`, et `grouped_with_id`, `group_drift_ids` pour les groupes). C'est une hypothèse (principe 1) : elle suit le graphe tant
 que l'anomalie est à valider, puis elle est figée telle que validée. Sans graphe derrière le compteur,
 l'anomalie reste signalée par F2a mais « non localisée ».
 

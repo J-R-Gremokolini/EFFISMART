@@ -183,6 +183,10 @@ class DriftOut(ExplanationOut):
     detected_at: datetime
     # F2b : qualification et propagation d'impact par le graphe des équipements (équipement suspect, zones…).
     context: dict | None = None
+    # F2 : alertes regroupées. Une anomalie rattachée se décide avec son alerte principale.
+    grouped_with_id: int | None = None
+    grouping_reason: str | None = None
+    group_drift_ids: list[int] = []
 
 
 class DriftUpdate(BaseModel):

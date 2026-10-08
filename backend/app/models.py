@@ -393,6 +393,11 @@ class Drift(ExplainedOutput, Base):
     qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # F2b : qualification et propagation d'impact par le graphe physique (P2), figées à la validation.
     context: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    # F2 : alertes regroupées. Une anomalie de même cause qu'une alerte encore à valider s'y rattache ; seule la
+    # plus ancienne (l'anomalie principale) est signalée et se décide pour tout le groupe.
+    grouped_with_id: Mapped[int | None] = mapped_column(ForeignKey("drifts.id"), index=True)
+    grouping_rule: Mapped[str | None] = mapped_column(String(16))  # REPEAT, EXPLAINED, SUSPECT ou DETACHED
+    grouping_reason: Mapped[str | None] = mapped_column(Text)
 
     delivery_point: Mapped[DeliveryPoint] = relationship()
 

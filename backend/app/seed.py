@@ -52,6 +52,7 @@ from app.models import (
 )
 from app.security import hash_password
 from app.services import (
+    alert_groups,
     anomaly_context,
     assets,
     drift_explanations,
@@ -403,6 +404,9 @@ def upgrade(db: Session) -> None:
     contextualized = anomaly_context.backfill(db)
     if contextualized:
         logger.info("%d anomalie(s) existante(s) replacée(s) dans le graphe des équipements (F2b).", contextualized)
+    grouped = alert_groups.regroup_existing(db)
+    if grouped:
+        logger.info("%d anomalie(s) à valider regroupée(s) avec une alerte de même cause.", grouped)
     proposed = recommendations.propose_missing(db)
     if proposed:
         logger.info("%d recommandation(s) proposée(s) pour des anomalies déjà validées.", proposed)

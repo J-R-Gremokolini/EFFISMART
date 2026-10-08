@@ -340,7 +340,9 @@ def detect_off_hours(db: Session, dp: DeliveryPoint, day: date, weather: Weather
     )
 
 
-DETECTORS = (detect_threshold, detect_climate_deviation, detect_baseload, detect_off_hours)
+# Ordre d'exécution : du plus précis (plages horaires) au plus global (journée). Le même jour, une anomalie sur la
+# journée expliquée par une anomalie de plage horaire déjà signalée s'y regroupe (`alert_groups`).
+DETECTORS = (detect_threshold, detect_baseload, detect_off_hours, detect_climate_deviation)
 DETECTOR_BY_KIND = {
     DriftKind.THRESHOLD: detect_threshold,
     DriftKind.CLIMATE_DEVIATION: detect_climate_deviation,
@@ -356,13 +358,15 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
     """Analyse un jour pour les points consentis. Idempotent : une dérive (point, type, jour) n'est créée qu'une fois.
 
     Chaque dérive est créée « à valider », avec son explication ; seuls ses valideurs (auditeur, responsable
-    énergie) sont prévenus. Rien ne part vers l'extérieur (webhooks, API partenaires) avant validation humaine.
+    énergie) sont prévenus. Une dérive de même cause qu'une alerte encore à valider s'y regroupe : l'alerte est
+    mise à jour au lieu d'en envoyer une nouvelle. Rien ne part vers l'extérieur (webhooks, API partenaires)
+    avant validation humaine.
     """
     stmt = select(DeliveryPoint).where(active_consent_clause())
     if delivery_point_ids is not None:
         stmt = stmt.where(DeliveryPoint.id.in_(delivery_point_ids))
     # Imports locaux : évitent un cycle drift ↔ intégrations / explications.
-    from app.services import anomaly_context, drift_explanations, integrations, validation
+    from app.services import alert_groups, drift_explanations, integrations, validation
 
     weather = integrations.weather_provider(db)
     created: list[Drift] = []
@@ -391,15 +395,12 @@ def run_detection(db: Session, day: date, delivery_point_ids: list[int] | None =
             db.add(drift)
             db.flush()
             drift_explanations.explain_drift(db, dp, drift, candidate)  # F2b compris : contexte physique
-            level = validation.confidence_level(drift.confidence)[0].lower()
-            context = anomaly_context.short_text(drift.context)
-            validation.notify(
-                db, dp.site.organization_id,
-                f"À valider : {DRIFT_LABELS[drift.kind].lower()} le {drift.day:%d/%m/%Y}, {dp.site.name} "
-                f"({dp.external_ref}), écart de {drift.deviation_pct:+.0f} %, confiance {level}"
-                + (f". {context[0].upper()}{context[1:]}" if context else ""),
-                validators_only=True, drift_id=drift.id,
-            )
+            lead = alert_groups.attach(db, drift)
+            if lead is not None:  # même cause qu'une alerte à valider : celle-ci est mise à jour, sans e-mail
+                alert_groups.refresh_alert(db, lead)
+            else:
+                validation.notify(db, dp.site.organization_id, alert_groups.alert_text(db, drift),
+                                  validators_only=True, drift_id=drift.id)
             created.append(drift)
     db.commit()
     logger.info("Détection du %s : %d dérive(s) créée(s)", day, len(created))

@@ -115,6 +115,10 @@ export interface Drift {
   detected_at: string;
   // F2b : équipement suspect, zones et usages potentiellement impactés (graphe des équipements).
   context?: { localisation: string; summary: string; nature_label: string } | null;
+  // F2 : une cause, une alerte. Une anomalie regroupée se décide avec son alerte principale.
+  grouped_with_id?: number | null;
+  grouping_reason?: string | null;
+  group_drift_ids?: number[];
 }
 
 export interface Notification {

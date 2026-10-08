@@ -8,7 +8,7 @@ from app.deps import get_current_user, get_repo, require_validator
 from app.models import Drift, DriftStatus, Notification, User
 from app.repositories import TenantRepository
 from app.schemas import DriftOut, DriftUpdate, NotificationOut
-from app.services import validation
+from app.services import alert_groups, validation
 
 router = APIRouter(tags=["dérives"])
 
@@ -48,6 +48,9 @@ def drift_out(db: Session, drift: Drift) -> DriftOut:
         comment=drift.comment,
         detected_at=drift.detected_at,
         context=drift.context,
+        grouped_with_id=drift.grouped_with_id,
+        grouping_reason=drift.grouping_reason,
+        group_drift_ids=[d.id for d in alert_groups.members(db, drift)],
         **explanation_fields(db, drift, drift.qualified_by, drift.qualified_at),
     )
 
@@ -75,6 +78,21 @@ def review_drift(
     """
     try:
         drift, _ = validation.review_drift(db, repo, user, drift_id, body.status, body.comment)
+    except validation.ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return drift_out(db, drift)
+
+
+@router.post("/drifts/{drift_id}/detach", response_model=DriftOut)
+def detach_drift(
+    drift_id: int,
+    user: User = Depends(require_validator),
+    repo: TenantRepository = Depends(get_repo),
+    db: Session = Depends(get_db),
+) -> DriftOut:
+    """Détache une anomalie de son groupe d'alertes : elle devient une alerte à part, à décider seule."""
+    try:
+        drift = alert_groups.detach(db, repo, user, drift_id)
     except validation.ValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
     return drift_out(db, drift)

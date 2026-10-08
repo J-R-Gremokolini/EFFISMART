@@ -56,6 +56,7 @@ from app.models import (  # noqa: E402
 )
 from app.repositories import ResourceNotFound, TenantRepository, sees_unvalidated  # noqa: E402
 from app.security import verify_password  # noqa: E402
+from app.services import alert_groups  # noqa: E402
 from app.services import anomaly_context, assets, dashboard, integrations, onboarding, regulatory, validation  # noqa: E402
 from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
@@ -574,7 +575,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
             if st.button("Ouvrir la file de validation", icon=":material/fact_check:"):
                 goto(PAGE_VALIDATION, org.id)
     else:
-        drifts = repo.list_drifts(org.id, DriftStatus.QUALIFIED)[:5]
+        drifts = [d for d in repo.list_drifts(org.id, DriftStatus.QUALIFIED) if d.grouped_with_id is None][:5]
         st.header("Anomalies confirmées")
         if not drifts:
             ui.empty_state("Aucune anomalie confirmée", "La consommation suit son rythme habituel.")
@@ -876,10 +877,16 @@ def review_actions(db: Session, repo: TenantRepository, user: User, kind: str, o
     """Boutons de décision, réservés à l'auditeur et au responsable énergie."""
     if not validation.can_validate(user):
         return
+    if kind == "drift" and output.grouped_with_id is not None:
+        st.caption("Se décide avec son alerte principale.")
+        return
+    group = len(alert_groups.members(db, output)) if kind == "drift" else 0
     for label, target in ACTIONS.get((kind, output.status), []):
         explanation, comment_label = ACTION_HELP[label]
         if kind == "drift" and label == "Valider":
             explanation += " Une recommandation ciblée sera proposée, elle aussi à valider."
+        if group:
+            explanation += f" La décision vaut pour les {group + 1} anomalies regroupées dans cette alerte."
         with st.popover(label, width="stretch", key=f"{key}-pop-{target.value}",
                         type="primary" if label == "Valider" else "secondary"):
             st.markdown(f"**{label} ?**")
@@ -959,7 +966,9 @@ def context_html(db: Session, repo: TenantRepository, drift) -> str:
     if details:
         parts.append(f"<div class='es-output-meta'>{ui.e(' ; '.join(details))}.</div>")
     statuses = None if sees_unvalidated(repo.user) else (DriftStatus.QUALIFIED,)
-    linked = anomaly_context.related(db, drift, statuses)
+    lead_id = drift.grouped_with_id or drift.id  # les anomalies du même groupe sont déjà regroupées
+    linked = [d for d in anomaly_context.related(db, drift, statuses)
+              if d.id != lead_id and d.grouped_with_id != lead_id]
     if linked:
         items = " ; ".join(f"{drift_kind_lower(d.kind)} du {fmt_date(d.day)} "
                            f"({FLUID_LABELS[d.delivery_point.fluid].lower()} {d.delivery_point.external_ref})"
@@ -970,6 +979,55 @@ def context_html(db: Session, repo: TenantRepository, drift) -> str:
         parts.append("<div class='es-output-meta'>Contexte établi après la validation de l'anomalie, détectée avant "
                      "la mise en contexte par le graphe.</div>")
     return f"<div class='es-output-context'>{''.join(parts)}</div>"
+
+
+def group_html(db: Session, drift) -> str:
+    """F2 : une cause, une alerte. Pourquoi des anomalies sont regroupées, et sous quelle alerte."""
+    if drift.grouped_with_id is not None:
+        lead = db.get(Drift, drift.grouped_with_id)
+        return (f"<div class='es-output-context'><div class='es-output-head'>{ui.badge('Regroupée', 'warning')}</div>"
+                f"<div class='es-output-action'>Rattachée à l'alerte du {fmt_date(lead.day)} "
+                f"({ui.e(drift_kind_lower(lead.kind))}) : {ui.e(drift.grouping_reason or '')}. La décision se prend "
+                "sur cette alerte.</div></div>")
+    group = alert_groups.members(db, drift)
+    if not group:
+        detached = drift.grouping_rule == alert_groups.RULE_DETACHED
+        return f"<div class='es-output-meta'>{ui.e(drift.grouping_reason)}</div>" if detached else ""
+    why = list(dict.fromkeys(alert_groups.RULE_WHY[d.grouping_rule] for d in group
+                             if d.grouping_rule in alert_groups.RULE_WHY))
+    last = max(d.day for d in group)
+    return (f"<div class='es-output-context'><div class='es-output-head'>"
+            f"{ui.badge(f'{len(group) + 1} alertes regroupées en une seule', 'warning')}</div>"
+            f"<div class='es-output-action'>Du {fmt_date(drift.day)} au {fmt_date(last)}. Pourquoi ce regroupement : "
+            f"{ui.e(' ; '.join(why))}. Seule la plus ancienne est signalée ; la décision vaut pour tout le "
+            "groupe.</div></div>")
+
+
+def group_members(db: Session, repo: TenantRepository, user: User, drift, key: str) -> None:
+    """Occurrences regroupées sous l'alerte, avec la raison de chacune ; un valideur peut en détacher une."""
+    group = alert_groups.members(db, drift)
+    if not group:
+        return
+    with st.expander(f"Occurrences regroupées ({len(group)})"):
+        ui.table(["Date", "Type", "Compteur", "Écart", "Pourquoi regroupée"],
+                 [[fmt_date(d.day), ui.e(DRIFT_KIND_LABELS[d.kind.value]), ui.e(d.delivery_point.external_ref),
+                   f"<b>{ui.e(fmt_pct(d.deviation_pct))}</b>", ui.e(d.grouping_reason or "")] for d in group],
+                 numeric={3})
+        if not validation.can_validate(user) or drift.status != DriftStatus.OPEN:
+            return
+        st.caption("Une anomalie sans rapport avec les autres ? Détachez-la : elle devient une alerte à part, "
+                   "à décider seule.")
+        options = {d.id: f"{fmt_date(d.day)}, {drift_kind_lower(d.kind)} ({d.delivery_point.external_ref})"
+                   for d in group}
+        picked = st.selectbox("Anomalie à détacher", list(options), format_func=options.get, key=f"{key}-detach-pick")
+        if st.button("Détacher du groupe", key=f"{key}-detach", icon=":material/call_split:"):
+            try:
+                alert_groups.detach(db, repo, user, picked)
+            except validation.ValidationError as exc:
+                st.error(str(exc))
+                return
+            flash("Anomalie détachée : elle devient une alerte à part, à décider seule.")
+            st.rerun()
 
 
 def context_graph(db: Session, drift) -> None:
@@ -1005,7 +1063,7 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                 head = [ui.badge("Anomalie"), ui.badge(DRIFT_KIND_LABELS[output.kind.value])]
                 title = f"{dp.site.name}, {FLUID_LABELS[dp.fluid].lower()} {dp.external_ref}, le {fmt_date(output.day)}"
                 body = (f"<div>{ui.e(output.details)} <b>({ui.e(fmt_pct(output.deviation_pct))})</b></div>"
-                        + context_html(db, repo, output))
+                        + context_html(db, repo, output) + group_html(db, output))
                 meta = decision_html(db, output.detected_at, output.qualified_by, output.qualified_at, output.comment,
                                      DRIFT_STATUS_LABELS[output.status], output.status == DriftStatus.OPEN)
             else:
@@ -1060,6 +1118,7 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                 prediction_chart(output)
                 model_table(output)
             if kind == "drift":
+                group_members(db, repo, user, output, key)
                 context_graph(db, output)
             explanation_block(output)
         with actions:
@@ -1129,11 +1188,15 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
     else:
         st.caption("Seules les anomalies validées par votre auditeur ou votre responsable énergie apparaissent ici.")
         drifts = repo.list_drifts(org.id)
+    # Une cause, une alerte : les anomalies regroupées apparaissent sous leur alerte principale.
+    drifts = [d for d in drifts if d.grouped_with_id is None]
+    sizes = alert_groups.group_sizes(db, [d.id for d in drifts])
     if not drifts:
         ui.empty_state("Aucune dérive", "Rien pour ce filtre : la consommation suit son rythme habituel.")
         return
     ui.table(
-        ["Date", "Type", "Point de livraison", "Équipement suspect", "Écart", "Confiance", "Gain estimé", "Statut"],
+        ["Date", "Type", "Point de livraison", "Équipement suspect", "Occurrences", "Écart", "Confiance",
+         "Gain estimé", "Statut"],
         [
             [
                 fmt_date(d.day),
@@ -1141,6 +1204,7 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
                 f"{ui.e(d.delivery_point.site.name)}<span class='sub'>"
                 f"{ui.e(FLUID_LABELS[d.delivery_point.fluid])} {ui.e(d.delivery_point.external_ref)}</span>",
                 suspect_cell(d),
+                str(sizes[d.id]),
                 f"<b>{ui.e(fmt_pct(d.deviation_pct))}</b>",
                 confidence_badge(d.confidence),
                 ui.e(f"{fmt_eur(d.gain_eur)}/an") if d.gain_eur else "—",
@@ -1148,12 +1212,17 @@ def page_drifts(db: Session, repo: TenantRepository, user: User, org: Organizati
             ]
             for d in drifts
         ],
-        numeric={4, 6},
+        numeric={4, 5, 7},
     )
+    if any(size > 1 for size in sizes.values()):
+        st.caption("Occurrences : anomalies de même cause regroupées en une seule alerte (même problème qui se "
+                   "répète, excès de la journée déjà expliqué, ou même équipement suspect). Seule la plus ancienne "
+                   "est signalée ; le détail figure sur sa carte.")
     st.header("Détail d'une anomalie")
     labels = {
         d.id: f"{fmt_date(d.day)}, {drift_kind_lower(d.kind)}, {d.delivery_point.site.name} "
               f"({fmt_pct(d.deviation_pct)}), {DRIFT_STATUS_LABELS[d.status].lower()}"
+              + (f", {sizes[d.id]} occurrences" if sizes[d.id] > 1 else "")
         for d in drifts
     }
     drift_id = st.selectbox("Anomalie", list(labels), format_func=labels.get, key="drift_detail")

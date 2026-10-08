@@ -244,6 +244,10 @@ def drift_payload(db: Session, drift: Drift) -> dict:
         "validated_by_role": validator_role(db.get(User, drift.qualified_by) if drift.qualified_by else None),
         "validated_at": drift.qualified_at.isoformat() if drift.qualified_at else None,
         "context": drift.context,  # F2b : équipement suspect, zones et usages potentiellement impactés
+        # F2 : alertes regroupées (une cause, une alerte).
+        "grouped_with_id": drift.grouped_with_id, "grouping_reason": drift.grouping_reason,
+        "group_drift_ids": list(db.scalars(select(Drift.id).where(Drift.grouped_with_id == drift.id)
+                                           .order_by(Drift.day, Drift.id))),
         **explanation_dict(drift),
     }
 
@@ -279,17 +283,25 @@ def review_drift(
 ) -> tuple[Drift, Recommendation | None]:
     """Valide, écarte ou rouvre une anomalie. Une anomalie validée déclenche une recommandation *proposée*
     (elle-même à valider) ; renvoie cette recommandation, nouvelle ou existante."""
-    from app.services import anomaly_context, integrations, recommendations  # imports locaux : évitent un cycle
+    # Imports locaux : évitent un cycle.
+    from app.services import alert_groups, anomaly_context, integrations, recommendations
     from app.services.drift import DRIFT_LABELS
 
     _require_validator(user)
     drift = repo.get_drift(drift_id)
+    if drift.grouped_with_id is not None:
+        lead = db.get(Drift, drift.grouped_with_id)
+        raise ValidationError(f"Cette anomalie est regroupée avec l'alerte du {lead.day:%d/%m/%Y} : la décision se "
+                              "prend sur cette alerte, ou détachez d'abord l'anomalie du groupe.")
     comment = _clean_comment(comment, required=status == DriftStatus.IGNORED, what="écartez cette anomalie")
     previous = drift.status
-    drift.status, drift.comment = status, comment
+    # La décision vaut pour tout le groupe d'alertes de même cause.
+    group = alert_groups.members(db, drift)
     decided = status != DriftStatus.OPEN
-    drift.qualified_by = user.id if decided else None
-    drift.qualified_at = utcnow() if decided else None
+    for output in (drift, *group):
+        output.status, output.comment = status, comment
+        output.qualified_by = user.id if decided else None
+        output.qualified_at = utcnow() if decided else None
     dp = drift.delivery_point
     organization_id = dp.site.organization_id
 
@@ -299,10 +311,15 @@ def review_drift(
         notify(db, organization_id,
                f"Anomalie validée par {validator_label(user)} : {DRIFT_LABELS[drift.kind].lower()} le "
                f"{drift.day:%d/%m/%Y}, {dp.site.name} ({dp.external_ref})"
+               + (f", avec {len(group)} occurrence(s) regroupée(s) de même cause" if group else "")
                + (f". {context[0].upper()}{context[1:]}" if context else ""),
                validators_only=False, exclude_user_id=user.id, drift_id=drift.id)
         integrations.enqueue_event(db, "drift.validated", organization_id, drift_payload(db, drift))
         recommendation = recommendations.propose_for_drift(db, drift)
+        if recommendation is not None and group:
+            support = list(recommendation.supporting_drift_ids or [])
+            recommendation.supporting_drift_ids = support + [
+                d.id for d in group if d.id not in support and d.id != recommendation.drift_id]
     elif previous == DriftStatus.QUALIFIED and status != DriftStatus.QUALIFIED:
         recommendations.withdraw_for_drift(db, drift)
     db.commit()
@@ -422,7 +439,8 @@ class PendingItem:
 def pending_outputs(repo: TenantRepository, organization_id: int) -> list[PendingItem]:
     items = (
         [PendingItem("recommendation", r) for r in repo.list_recommendations(organization_id, [ReviewStatus.PROPOSED])]
-        + [PendingItem("drift", d) for d in repo.list_drifts(organization_id, DriftStatus.OPEN)]
+        + [PendingItem("drift", d) for d in repo.list_drifts(organization_id, DriftStatus.OPEN)
+           if d.grouped_with_id is None]  # une alerte par groupe de même cause
         + [PendingItem("prediction", p) for p in repo.list_predictions(organization_id, [ReviewStatus.PROPOSED])]
     )
     return sorted(items, key=lambda item: item.priority, reverse=True)
@@ -434,7 +452,8 @@ def count_pending(db: Session, organization_id: int) -> int:
         select(func.count(Drift.id))
         .join(DeliveryPoint, Drift.delivery_point_id == DeliveryPoint.id)
         .join(Site, DeliveryPoint.site_id == Site.id)
-        .where(Site.organization_id == organization_id, Drift.status == DriftStatus.OPEN)
+        .where(Site.organization_id == organization_id, Drift.status == DriftStatus.OPEN,
+               Drift.grouped_with_id.is_(None))
     ) or 0
     recs = db.scalar(select(func.count(Recommendation.id)).where(
         Recommendation.organization_id == organization_id, Recommendation.status == ReviewStatus.PROPOSED)) or 0
