@@ -26,6 +26,7 @@ from app.models import (
     Drift,
     DriftStatus,
     Fluid,
+    IpeDefinition,
     Notification,
     Organization,
     Prediction,
@@ -467,13 +468,38 @@ def review_trajectory(
     return trajectory
 
 
+def review_ipe(
+    db: Session, repo: TenantRepository, user: User, definition_id: int, status: ReviewStatus,
+    comment: str | None = None,
+) -> IpeDefinition:
+    """F7 : un IPE proposé par l'IA devient un IPE suivi une fois validé par un humain."""
+    _require_validator(user)
+    definition = repo.get_ipe_definition(definition_id)
+    if status not in PREDICTION_TRANSITIONS.get(definition.status, set()):
+        raise ValidationError(
+            f"Passage de « {REVIEW_STATUS_LABELS[definition.status]} » à « {REVIEW_STATUS_LABELS[status]} » impossible."
+        )
+    comment = _clean_comment(comment, required=status == ReviewStatus.REJECTED, what="écartez cet IPE")
+    decided = status != ReviewStatus.PROPOSED
+    previous = definition.status
+    definition.status, definition.review_comment = status, comment
+    definition.reviewed_by = user.id if decided else None
+    definition.reviewed_at = utcnow() if decided else None
+    if status == ReviewStatus.VALIDATED and previous == ReviewStatus.PROPOSED:
+        notify(db, definition.organization_id,
+               f"IPE validé par {validator_label(user)} : {definition.name} ({definition.site.name})",
+               validators_only=False, exclude_user_id=user.id)
+    db.commit()
+    return definition
+
+
 # --- File de validation ---------------------------------------------------------------------------
 
 
 @dataclass
 class PendingItem:
-    kind: str  # "drift" | "recommendation" | "prediction" | "trajectory"
-    output: Drift | Recommendation | Prediction | Trajectory
+    kind: str  # "drift" | "recommendation" | "prediction" | "trajectory" | "ipe"
+    output: Drift | Recommendation | Prediction | Trajectory | IpeDefinition
 
     @property
     def priority(self) -> float:
@@ -488,6 +514,7 @@ def pending_outputs(repo: TenantRepository, organization_id: int) -> list[Pendin
            if d.grouped_with_id is None]  # une alerte par groupe de même cause
         + [PendingItem("prediction", p) for p in repo.list_predictions(organization_id, [ReviewStatus.PROPOSED])]
         + [PendingItem("trajectory", t) for t in repo.list_trajectories(organization_id, [ReviewStatus.PROPOSED])]
+        + [PendingItem("ipe", d) for d in repo.list_ipe_definitions(organization_id, [ReviewStatus.PROPOSED])]
     )
     return sorted(items, key=lambda item: item.priority, reverse=True)
 
@@ -507,4 +534,6 @@ def count_pending(db: Session, organization_id: int) -> int:
         Prediction.organization_id == organization_id, Prediction.status == ReviewStatus.PROPOSED)) or 0
     trajectories = db.scalar(select(func.count(Trajectory.id)).where(
         Trajectory.organization_id == organization_id, Trajectory.status == ReviewStatus.PROPOSED)) or 0
-    return int(drifts + recs + preds + trajectories)
+    ipes = db.scalar(select(func.count(IpeDefinition.id)).where(
+        IpeDefinition.organization_id == organization_id, IpeDefinition.status == ReviewStatus.PROPOSED)) or 0
+    return int(drifts + recs + preds + trajectories + ipes)

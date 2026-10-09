@@ -79,6 +79,7 @@ def catch_up() -> int:
     from app.services import (
         exports,
         integrations,
+        ipe_definitions,
         load_shift,
         mailer,
         predictions,
@@ -114,6 +115,7 @@ def catch_up() -> int:
         predictions.refresh_predictions(db)
         trajectory.refresh_trajectories(db)
         load_shift.propose_load_shifts(db)
+        ipe_definitions.propose_all(db)
         exports.produce_automatic(db)
         quarterly_reports.generate_due(db)
         integrations.dispatch_pending(db)

@@ -33,6 +33,7 @@ from app.local import catch_up, prepare_database  # noqa: E402
 from app.models import (  # noqa: E402
     AdjustmentKind,
     AssetNodeKind,
+    IpeKind,
     DeadlineStatus,
     DeclaredSource,
     ConnectorAuth,
@@ -68,6 +69,7 @@ from app.services import anomaly_context, assets, dashboard, integrations, onboa
 from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
 from app.services import energy_data, ipe, quarterly_reports, simulator, site_plan, tariffs  # noqa: E402
+from app.services import ipe_definitions as ipe_defs  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
 from app.services import savings as savings_service  # noqa: E402
@@ -119,7 +121,7 @@ REVIEW_STATUS_TONES = {ReviewStatus.PROPOSED: "warning", ReviewStatus.VALIDATED:
                        ReviewStatus.REJECTED: "neutral", ReviewStatus.APPLIED: "success",
                        ReviewStatus.SUPERSEDED: "neutral"}
 OUTPUT_KIND_LABELS = {"drift": "Anomalie", "recommendation": "Recommandation", "prediction": "Prévision",
-                      "trajectory": "Trajectoire"}
+                      "trajectory": "Trajectoire", "ipe": "IPE"}
 OBLIGATION_LABELS = {
     Obligation.DECRET_TERTIAIRE_OPERAT: "Décret Tertiaire (OPERAT)",
     Obligation.AUDIT_EED: "Audit énergétique (EED)",
@@ -794,6 +796,9 @@ ACTIONS = {
     ("trajectory", ReviewStatus.PROPOSED): [("Valider", ReviewStatus.VALIDATED), ("Écarter", ReviewStatus.REJECTED)],
     ("trajectory", ReviewStatus.VALIDATED): [("Retirer la validation", ReviewStatus.PROPOSED)],
     ("trajectory", ReviewStatus.REJECTED): [("Rouvrir", ReviewStatus.PROPOSED)],
+    ("ipe", ReviewStatus.PROPOSED): [("Valider", ReviewStatus.VALIDATED), ("Écarter", ReviewStatus.REJECTED)],
+    ("ipe", ReviewStatus.VALIDATED): [("Retirer la validation", ReviewStatus.PROPOSED)],
+    ("ipe", ReviewStatus.REJECTED): [("Rouvrir", ReviewStatus.PROPOSED)],
 }
 # (explication, libellé du commentaire ou None)
 ACTION_HELP = {
@@ -828,6 +833,8 @@ def output_title(kind: str, output) -> str:
         return output.title
     if kind == "trajectory":
         return f"Trajectoire Décret Tertiaire : {output.site.name}, {fmt_number(-output.reduction_2030 * 100)} % en 2030"
+    if kind == "ipe":
+        return f"IPE proposé par l'IA : {output.name} ({output.site.name})"
     return f"Projection {output.year} : {output.site.name}, {FLUID_LABELS[output.fluid].lower()}"
 
 
@@ -839,6 +846,8 @@ def confidence_badge(score: float | None) -> str:
 
 def gain_html(output, kind: str) -> str:
     """Gain estimé écrit en clair : énergie, euros, CO₂."""
+    if kind == "ipe":
+        return ""  # indicateur de suivi : pas de gain
     if kind == "trajectory" and output.gain_kwh is None:
         return "<div class='es-output-gain'>Objectif 2030 atteint au rythme actuel.</div>"
     if output.gain_kwh is None:
@@ -913,6 +922,9 @@ def _decide(db: Session, repo: TenantRepository, user: User, kind: str, output_i
             message = DECISION_MESSAGES[status]
         elif kind == "trajectory":
             validation.review_trajectory(db, repo, user, output_id, status, comment)
+            message = DECISION_MESSAGES[status]
+        elif kind == "ipe":
+            validation.review_ipe(db, repo, user, output_id, status, comment)
             message = DECISION_MESSAGES[status]
         else:
             validation.review_prediction(db, repo, user, output_id, status, comment)
@@ -1160,6 +1172,10 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                     head = [ui.badge("Trajectoire"), ui.badge("Décret Tertiaire")]
                     title = f"Trajectoire Décret Tertiaire, {output.site.name}"
                     body = trajectory_headline(output)
+                elif kind == "ipe":
+                    head = [ui.badge("IPE"), ui.badge("Proposé par l'IA")]
+                    title = f"{output.name}, {output.site.name}"
+                    body = ipe_proposal_html(db, output)
                 else:
                     head = [ui.badge("Prévision")]
                     fluid = FLUID_LABELS[output.fluid].lower()
@@ -1180,6 +1196,8 @@ def output_card(db: Session, repo: TenantRepository, user: User, kind: str, outp
                 model_table(output)
             if kind == "trajectory":
                 trajectory_chart(output)
+            if kind == "ipe":
+                ipe_chart(db, output)
             if kind == "drift":
                 group_members(db, repo, user, output, key)
                 context_graph(db, output)
@@ -2412,7 +2430,8 @@ def contract_form(db: Session, repo: TenantRepository, user: User, dp: DeliveryP
 def page_ipe(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     ui.page_header(org.name, "Indicateurs de performance énergétique",
                    "IPE au sens de l'ISO 50001 : la consommation rapportée à ce qui l'explique (surface, production, "
-                   "effectif, climat), comparée à la situation énergétique de référence (SER) de chaque site.")
+                   "effectif, climat, variables propres au site), comparée à la situation énergétique de référence "
+                   "(SER) de chaque site. Créez vos propres IPE ; l'IA en propose aussi, à valider.")
     certified, text = ipe.iso50001_status(org)
     ui.banner(f"<span><b>Passerelle ISO 50001.</b> {ui.e(text)}</span>")
     if user.role == Role.AUDITOR:
@@ -2429,6 +2448,8 @@ def page_ipe(db: Session, repo: TenantRepository, user: User, org: Organization)
                     st.rerun()
     weather = integrations.weather_provider(db)
     last_month = add_months(month_start(today_local()), -1)
+    tracked = repo.list_ipe_definitions(org.id, [ReviewStatus.VALIDATED])
+    ipe_defs_editable = ipe.can_enter_variables(user)
     for site in org.sites:
         report = ipe.site_report(db, site, last_month, weather)
         values = report.current.values
@@ -2452,11 +2473,155 @@ def page_ipe(db: Session, repo: TenantRepository, user: User, org: Organization)
             ui.kpi_grid(cards)
             st.caption(f"12 mois du {fmt_date(report.current.start)} à fin {fmt_month(report.current.end.strftime('%Y-%m'))} ; "
                        f"situation de référence : {report.baseline_year}. " + " ".join(report.current.notes))
+            custom_ipe_cards(db, repo, user, [d for d in tracked if d.site_id == site.id], weather)
+    ipe_proposals_section(db, repo, user, org)
+    if ipe_defs_editable:
+        ipe_create_section(db, repo, user, org, weather)
+    ipe_variables_section(db, repo, user, org, last_month)
+
+
+def ipe_value_text(value: ipe_defs.IpeValue, kind: IpeKind) -> tuple[str, str]:
+    """(valeur, note) d'un IPE personnalisé pour une carte."""
+    if value.current is None:
+        return "—", "données insuffisantes"
+    digits = 1 if kind == IpeKind.MODEL or value.current >= 10 else 3
+    note = value.unit
+    if value.baseline is not None:
+        note += f" ; SER {value.baseline_year} : {fmt_number(value.baseline, digits)}"
+    return fmt_number(value.current, digits), note
+
+
+def custom_ipe_cards(db: Session, repo: TenantRepository, user: User, definitions: list, weather) -> None:
+    """IPE suivis du site : créés par un humain, ou proposés par l'IA puis validés."""
+    if not definitions:
+        return
+    st.markdown("**IPE suivis**")
+    cards = []
+    for definition in definitions:
+        value = ipe_defs.evaluate(db, definition, weather)
+        text, note = ipe_value_text(value, definition.kind)
+        card = {"label": definition.name, "value": text, "icon": "total",
+                "note": ("IA, validé · " if definition.origin == "PLATFORM" else "") + note}
+        if value.variation is not None:
+            card["pct"] = value.variation * 100
+        cards.append(card)
+    ui.kpi_grid(cards)
+    removable = [d for d in definitions if d.origin == "USER"]
+    if removable and ipe.can_enter_variables(user):
+        with st.popover("Retirer un IPE créé"):
+            labels = {d.id: d.name for d in removable}
+            chosen = st.selectbox("IPE", list(labels), format_func=labels.get, key=f"ipe-del-{definitions[0].site_id}")
+            if st.button("Retirer", key=f"ipe-del-btn-{definitions[0].site_id}"):
+                ipe_defs.delete_definition(db, repo, user, chosen)
+                flash("IPE retiré.")
+                st.rerun()
+
+
+def ipe_proposal_html(db: Session, definition) -> str:
+    site = definition.site
+    model = definition.model or {}
+    if definition.kind == IpeKind.RATIO:
+        name, unit = ipe_defs.driver_label(db, site, definition.drivers[0])
+        head = (f"<b>Ratio</b> : consommation ÷ {ui.e(name.lower())} ({ui.e(unit)}). Régression qui le justifie : "
+                f"{ui.e(ipe_defs.formula(db, site, definition))}, talon de "
+                f"{ui.e(fmt_number(model.get('intercept_share', 0) * 100))} % seulement")
+    else:
+        head = (f"<b>IPE modélisé, base 100</b> : consommation mesurée ÷ consommation attendue, avec "
+                f"{ui.e(ipe_defs.formula(db, site, definition))}")
+    return (f"<div class='es-output-action'>{head}</div>"
+            f"<div class='es-output-meta'>Énergie : {ui.e(ipe_defs.ENERGY_LABELS[definition.energy])} ; R² = "
+            f"{ui.e(fmt_number(model.get('r2', 0), 2))}, erreur sur les mois retirés de l'apprentissage "
+            f"{ui.e(fmt_number(model.get('cv', 0) * 100, 1))} % ; {model.get('months', 0)} mois.</div>")
+
+
+def ipe_chart(db: Session, definition) -> None:
+    """Mesuré et attendu par le modèle, mois par mois, sur la période d'apprentissage."""
+    site = definition.site
+    model = definition.model or {}
+    if not model.get("coefs"):
+        return
+    start, end = date.fromisoformat(model["fit_start"]), date.fromisoformat(model["fit_end"])
+    months = ipe_defs._months(start, end)
+    weather = integrations.weather_provider(db)
+    energy = ipe_defs.monthly_energy(db, site, definition.energy, months)
+    series = {d: ipe_defs.driver_series(db, site, d, months, weather) for d in model["coefs"]}
+    rows = []
+    for month in months:
+        if month not in energy or any(month not in s for s in series.values()):
+            continue
+        expected = model["intercept"] + sum(b * series[d][month] for d, b in model["coefs"].items())
+        label = fmt_month(month.strftime("%Y-%m"))
+        rows += [{"Mois": label, "Série": "Mesuré", "kWh": energy[month]},
+                 {"Mois": label, "Série": "Attendu par le modèle", "kWh": expected}]
+    if not rows:
+        return
+    order = list(dict.fromkeys(r["Mois"] for r in rows))
+    chart = alt.Chart(pd.DataFrame(rows)).mark_line(point=True).encode(
+        x=alt.X("Mois:N", sort=order, title=None, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("kWh:Q", title="kWh par mois", scale=alt.Scale(zero=False)),
+        color=alt.Color("Série:N", title=None, scale=alt.Scale(domain=["Mesuré", "Attendu par le modèle"],
+                                                               range=[ui.PRIMARY, ui.MUTED])),
+        strokeDash=alt.StrokeDash("Série:N", legend=None, scale=alt.Scale(domain=["Mesuré", "Attendu par le modèle"],
+                                                                           range=[[1, 0], [5, 4]])),
+        tooltip=["Mois", "Série", alt.Tooltip("kWh:Q", format=",.0f")],
+    )
+    st.altair_chart(style_chart(chart.properties(height=200)), width="stretch")
+
+
+def ipe_proposals_section(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    """IPE proposés par l'IA : à valider un par un, comme toute sortie de la plateforme (principe P1)."""
+    if not sees_unvalidated(user):
+        return
+    st.header("IPE proposés par l'IA")
+    st.caption("L'IA de la plateforme teste chaque facteur (degrés-jours, jours ouvrés, production, effectif, variables "
+               "personnalisées) sur les 12 à 24 derniers mois et propose les IPE qui expliquent le mieux la "
+               "consommation : ratio si la consommation est proportionnelle au facteur, IPE modélisé (ISO 50006) "
+               "sinon. Chaque proposition devient un IPE suivi une fois validée.")
+    if validation.can_validate(user) and st.button("Analyser les données", icon=":material/insights:"):
+        with st.spinner("Analyse des facteurs…"):
+            created = ipe_defs.propose_all(db, org.id)
+        flash(f"{len(created)} IPE proposé(s), à valider." if created
+              else "Aucun nouvel IPE à proposer : les facteurs connus n'expliquent pas mieux la consommation.")
+        st.rerun()
+    proposals = repo.list_ipe_definitions(org.id, [ReviewStatus.PROPOSED])
+    if not proposals:
+        st.caption("Aucune proposition en attente.")
+    for definition in proposals:
+        output_card(db, repo, user, "ipe", definition, key=f"ipe-{definition.id}")
+
+
+def ipe_create_section(db: Session, repo: TenantRepository, user: User, org: Organization, weather) -> None:
+    st.header("Créer un IPE")
+    sites = {s.id: s for s in org.sites}
+    site = sites[st.selectbox("Site", list(sites), format_func=lambda i: sites[i].name, key="ipe_new_site")]
+    drivers = ipe_defs.available_drivers(db, site)
+    labels = {d: "{} ({})".format(*ipe_defs.driver_label(db, site, d)) for d in drivers}
+    with st.form(f"ipe-new-{site.id}"):
+        left, right = st.columns(2)
+        energy = left.selectbox("Énergie", list(ipe_defs.ENERGY_LABELS), format_func=ipe_defs.ENERGY_LABELS.get)
+        kind = right.selectbox("Forme", list(IpeKind), format_func=ipe_defs.KIND_LABELS.get)
+        chosen = st.multiselect("Facteurs", drivers, format_func=labels.get,
+                                help="Ratio : un facteur. IPE modélisé : un ou deux facteurs variables, appris sur "
+                                     "l'année de référence du site.")
+        name = st.text_input("Nom (facultatif)", placeholder="proposé automatiquement")
+        if st.form_submit_button("Créer l'IPE", type="primary"):
+            try:
+                ipe_defs.create_definition(db, repo, user, site.id, energy=energy, kind=kind, drivers=chosen,
+                                           weather=weather, name=name)
+            except ipe_defs.IpeDefinitionError as exc:
+                st.error(str(exc))
+            else:
+                flash("IPE créé : il est suivi dès maintenant.")
+                st.rerun()
+
+
+def ipe_variables_section(db: Session, repo: TenantRepository, user: User, org: Organization,
+                          last_month: date) -> None:
     st.header("Variables d'ajustement")
     editable = ipe.can_enter_variables(user)
-    st.caption("Fournies par le client : production mensuelle (dans l'unité du site) et effectif en équivalents temps "
-               "plein. " + ("Saisissez ou corrigez les valeurs, puis enregistrez." if editable else
-                            "Saisies par votre responsable énergie ou votre auditeur."))
+    st.caption("Fournies par le client : production, effectif et variables propres au site (repas servis, nuitées, "
+               "heures d'ouverture…). " + ("Saisissez ou corrigez les valeurs, puis enregistrez." if editable else
+                                           "Saisies par votre responsable énergie ou votre auditeur."))
     sites = {s.id: s for s in org.sites}
     site_id = st.selectbox("Site", list(sites), format_func=lambda i: sites[i].name, key="ipe_site")
     site = sites[site_id]
@@ -2476,25 +2641,45 @@ def page_ipe(db: Session, repo: TenantRepository, user: User, org: Organization)
                 else:
                     flash("Réglages du site enregistrés.")
                     st.rerun()
+        with st.popover("Nouvelle variable personnalisée"):
+            with st.form(f"ipe-var-{site.id}"):
+                var_name = st.text_input("Nom", placeholder="ex. Repas servis")
+                var_unit = st.text_input("Unité", placeholder="ex. repas")
+                if st.form_submit_button("Créer la variable", type="primary"):
+                    try:
+                        ipe_defs.create_variable(db, repo, user, site.id, var_name, var_unit)
+                    except ipe_defs.IpeDefinitionError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("Variable créée : saisissez ses valeurs mensuelles.")
+                        st.rerun()
     months = [add_months(last_month, -k) for k in range(11, -1, -1)]
-    known = ipe.variables(db, site.id, months[0], add_months(last_month, 1) - timedelta(days=1))
-    frame = pd.DataFrame({
-        "Mois": [fmt_month(m.strftime("%Y-%m")) for m in months],
-        f"Production ({site.production_unit or 'unités'})": [known[AdjustmentKind.PRODUCTION].get(m) for m in months],
-        "Effectif (ETP)": [known[AdjustmentKind.HEADCOUNT].get(m) for m in months],
-    })
+    end = add_months(last_month, 1) - timedelta(days=1)
+    known = ipe.variables(db, site.id, months[0], end)
+    custom = ipe_defs.variables_of(db, site.id)
+    columns = {f"Production ({site.production_unit or 'unités'})": ("builtin", AdjustmentKind.PRODUCTION),
+               "Effectif (ETP)": ("builtin", AdjustmentKind.HEADCOUNT)}
+    columns.update({f"{v.name} ({v.unit})": ("custom", v.id) for v in custom})
+    values = {column: (known[ref].get if source == "builtin"
+                       else ipe_defs.driver_series(db, site, f"VAR:{ref}", months, None).get)
+              for column, (source, ref) in columns.items()}
+    frame = pd.DataFrame({"Mois": [fmt_month(m.strftime("%Y-%m")) for m in months],
+                          **{column: [getter(m) for m in months] for column, getter in values.items()}})
     edited = st.data_editor(frame, disabled=not editable or ["Mois"], hide_index=True, width="stretch",
-                            key=f"ipe-editor-{site.id}")
+                            key=f"ipe-editor-{site.id}-{len(custom)}")
     if editable and st.button("Enregistrer les variables", type="primary"):
-        columns = {AdjustmentKind.PRODUCTION: frame.columns[1], AdjustmentKind.HEADCOUNT: frame.columns[2]}
         try:
-            for i, month in enumerate(months):
-                for kind, column in columns.items():
+            for column, (source, ref) in columns.items():
+                for i, month in enumerate(months):
                     value = edited[column].iloc[i]
                     value = None if pd.isna(value) else float(value)
-                    if value != known[kind].get(month):
-                        ipe.set_variable(db, repo, user, site.id, kind, month, value)
-        except ipe.IpeError as exc:
+                    if value == values[column](month):
+                        continue
+                    if source == "builtin":
+                        ipe.set_variable(db, repo, user, site.id, ref, month, value)
+                    else:
+                        ipe_defs.set_variable_value(db, repo, user, ref, month, value)
+        except (ipe.IpeError, ipe_defs.IpeDefinitionError) as exc:
             st.error(str(exc))
         else:
             flash("Variables d'ajustement enregistrées.")

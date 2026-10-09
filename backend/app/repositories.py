@@ -21,6 +21,7 @@ from app.models import (
     Drift,
     DriftStatus,
     ExportJob,
+    IpeDefinition,
     Organization,
     Prediction,
     QuarterlyReport,
@@ -204,6 +205,23 @@ class TenantRepository:
 
     def get_trajectory(self, trajectory_id: int) -> Trajectory:
         return self._one(self._trajectories_stmt().where(Trajectory.id == trajectory_id))
+
+    def _ipe_stmt(self) -> Select:
+        """F7 : un IPE proposé par l'IA n'est vu que de ses valideurs tant qu'il n'est pas validé (P1)."""
+        stmt = select(IpeDefinition).where(self.org_clause(IpeDefinition.organization_id))
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(IpeDefinition.status == ReviewStatus.VALIDATED)
+        return stmt
+
+    def list_ipe_definitions(self, organization_id: int,
+                             statuses: list[ReviewStatus] | None = None) -> list[IpeDefinition]:
+        stmt = self._ipe_stmt().where(IpeDefinition.organization_id == organization_id)
+        if statuses:
+            stmt = stmt.where(IpeDefinition.status.in_(statuses))
+        return list(self.db.scalars(stmt.order_by(IpeDefinition.site_id, IpeDefinition.created_at, IpeDefinition.id)))
+
+    def get_ipe_definition(self, definition_id: int) -> IpeDefinition:
+        return self._one(self._ipe_stmt().where(IpeDefinition.id == definition_id))
 
     def list_scenarios(self, site_id: int) -> list[SavingsScenario]:
         site = self.get_site(site_id)

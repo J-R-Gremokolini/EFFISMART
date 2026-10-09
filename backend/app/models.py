@@ -929,3 +929,65 @@ class QuarterlyReport(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     organization: Mapped[Organization] = relationship()
+
+
+# --- F7 : IPE personnalisés et proposés par l'IA -----------------------------------------------------------
+
+
+class IpeKind(str, enum.Enum):
+    RATIO = "RATIO"  # consommation / facteur (kWh par unité)
+    MODEL = "MODEL"  # consommation mesurée / consommation modélisée (ISO 50006), base 100
+
+
+class IpeVariable(Base):
+    """Variable d'ajustement personnalisée d'un site (repas servis, nuitées, heures d'ouverture…)."""
+
+    __tablename__ = "ipe_variables"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    unit: Mapped[str] = mapped_column(String(40))
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class IpeVariableValue(Base):
+    __tablename__ = "ipe_variable_values"
+    __table_args__ = (UniqueConstraint("variable_id", "month", name="uq_ipe_variable_month"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    variable_id: Mapped[int] = mapped_column(ForeignKey("ipe_variables.id"), index=True)
+    month: Mapped[date] = mapped_column(Date)  # premier jour du mois
+    value: Mapped[float] = mapped_column(Float)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class IpeDefinition(ExplainedOutput, Base):
+    """IPE d'un site : créé par un humain (actif d'emblée) ou proposé par l'IA de la plateforme (à valider, P1).
+
+    `drivers` : facteurs explicatifs, parmi SURFACE, DJU, DJF, WORKDAYS, PRODUCTION, HEADCOUNT et « VAR:<id> »
+    (variable personnalisée). `model` : coefficients de la régression (IPE modélisé) et ses statistiques.
+    """
+
+    __tablename__ = "ipe_definitions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    energy: Mapped[str] = mapped_column(String(8))  # ALL, ELEC ou GAS
+    kind: Mapped[IpeKind] = mapped_column(_enum(IpeKind))
+    drivers: Mapped[list] = mapped_column(JSON)
+    model: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    origin: Mapped[str] = mapped_column(String(16))  # USER (créé par un humain) ou PLATFORM (proposé par l'IA)
+    status: Mapped[ReviewStatus] = mapped_column(_enum(ReviewStatus), default=ReviewStatus.PROPOSED)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[str | None] = mapped_column(Text)
+
+    site: Mapped[Site] = relationship()

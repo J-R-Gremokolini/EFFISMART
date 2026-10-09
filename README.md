@@ -313,6 +313,37 @@ situation énergétique de référence (SER) du site, une année choisie :
 - **kWh/DJU** : la consommation liée au chauffage (mois de chauffe moins le niveau des mois d'été), rapportée
   aux degrés-jours.
 
+**IPE personnalisés** (`app/services/ipe_definitions.py`). L'auditeur ou le responsable énergie crée ses
+propres IPE :
+- **énergie** : toutes énergies, électricité ou gaz ;
+- **facteur** : surface, degrés-jours de chauffage ou de froid, jours ouvrés, production, effectif, ou une
+  **variable personnalisée** du site (repas servis, nuitées, heures d'ouverture…) dont il saisit les valeurs
+  mensuelles ;
+- **forme** :
+  - un **ratio** (kWh par unité) ;
+  - un **IPE modélisé, base 100** (ISO 50006) : consommation mesurée ÷ consommation attendue par une régression
+    sur un ou deux facteurs, apprise sur l'année de référence ; sous 100, la performance s'améliore.
+
+Un IPE créé par un humain est suivi d'emblée. Un simple compte client consulte seulement.
+
+**IPE proposés par l'IA**. Sur les 12 à 24 derniers mois, la plateforme fait trois choses :
+- **Elle teste chaque facteur** par régression. Elle garde ceux qui expliquent la consommation : R² ≥ 0,5, effet
+  positif, au moins 20 % de la consommation (sinon l'IPE resterait plat).
+- **Elle choisit le meilleur modèle**, en essayant aussi les couples de facteurs. Le critère est l'erreur sur les
+  mois retirés de l'apprentissage (validation croisée « un mois retiré »).
+- **Elle choisit la forme** : un ratio si le talon est faible (≤ 15 %), un IPE modélisé sinon. Elle propose par
+  énergie d'abord, et « toutes énergies » seulement à défaut.
+
+Chaque proposition (principe 1) présente son raisonnement : facteurs retenus et écartés avec leur R², formule,
+erreur, choix de la forme. Elle porte un niveau de confiance et attend une validation humaine, dans « À valider »
+ou sur la page « Performance (IPE) ». Une proposition écartée n'est pas reproposée avant 180 jours. Analyse
+lancée chaque jour, à la mise à niveau, ou par le bouton « Analyser les données ».
+
+Démo : la variable « fournées » de l'Atelier central est déduite de sa consommation d'électricité (le simulateur
+ne modélise pas la production), pour montrer une proposition fondée sur l'activité : « kWh électricité par fournée »,
+R² = 0,89. Les autres propositions portent sur le gaz (degrés-jours). L'électricité des sites de démonstration
+dépend trop peu du climat (talon de 90 % et plus) pour qu'un IPE climatique soit utile.
+
 Passerelle ISO 50001 : une entreprise certifiée est exemptée de l'audit énergétique obligatoire tous les 4 ans.
 Une fois la date de validité du certificat saisie, l'échéance d'audit apparaît « Exemptée » et ses rappels
 s'arrêtent. C'est un argument commercial que l'étude de marché n'exploitait pas encore.

@@ -38,6 +38,8 @@ from app.models import (
     Auditor,
     AuditorClientLink,
     Consent,
+    IpeVariable,
+    IpeVariableValue,
     DeliveryPoint,
     Drift,
     DriftStatus,
@@ -63,6 +65,7 @@ from app.services import (
     drift_explanations,
     exports,
     integrations,
+    ipe_definitions,
     load_shift,
     predictions,
     quarterly_reports,
@@ -531,6 +534,28 @@ def _create_demo_v2(db: Session) -> None:
                                     retained=True)
 
 
+# F7 : variable personnalisée de démonstration. Le simulateur ne modélise pas la production : les fournées de
+# l'atelier sont déduites de sa consommation d'électricité, pour montrer une proposition de l'IA fondée sur l'activité.
+DEMO_IPE_VARIABLE = ("Atelier central", "Fournées", "fournée", 420.0)  # site, nom, unité, kWh par fournée
+
+
+def _create_demo_ipe(db: Session) -> None:
+    site_name, name, unit, kwh_per_batch = DEMO_IPE_VARIABLE
+    site = db.scalar(select(Site).join(Organization, Site.organization_id == Organization.id).where(
+        Site.name == site_name, Organization.name.in_([o["name"] for o in ORGANIZATIONS])))
+    if site is None or any(v.name == name for v in ipe_definitions.variables_of(db, site.id)):
+        return
+    variable = IpeVariable(organization_id=site.organization_id, site_id=site.id, name=name, unit=unit)
+    db.add(variable)
+    db.flush()
+    last = ipe_definitions.last_complete_month()
+    months = [add_months(last, -k) for k in range(23, -1, -1)]
+    for k, (month, kwh) in enumerate(sorted(ipe_definitions.monthly_energy(db, site, "ELEC", months).items())):
+        db.add(IpeVariableValue(variable_id=variable.id, month=month,
+                                value=round(kwh / kwh_per_batch * (1 + 0.03 * math.sin(1.7 * k)))))
+    db.commit()
+
+
 def upgrade(db: Session) -> None:
     """Mise à niveau idempotente d'une base existante (principes P1 et graphe physique)."""
     created = assets.sync_meter_nodes(db)
@@ -551,12 +576,14 @@ def upgrade(db: Session) -> None:
     simulator.ensure_library(db)
     if db.scalar(select(Organization.id).where(Organization.name.in_([o["name"] for o in ORGANIZATIONS])).limit(1)):
         _create_demo_v2(db)
+        _create_demo_ipe(db)
     proposed = recommendations.propose_missing(db)
     if proposed:
         logger.info("%d recommandation(s) proposée(s) pour des anomalies déjà validées.", proposed)
     predictions.refresh_predictions(db)
     trajectory.refresh_trajectories(db)
     load_shift.propose_load_shifts(db)
+    ipe_definitions.propose_all(db)
     regulatory.send_reminders(db)
     exports.produce_automatic(db)
     quarterly_reports.generate_due(db)

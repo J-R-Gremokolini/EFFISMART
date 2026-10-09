@@ -16,7 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
 from app.db import SessionLocal
-from app.services import exports, load_shift, predictions, quarterly_reports, regulatory, trajectory
+from app.services import exports, ipe_definitions, load_shift, predictions, quarterly_reports, regulatory, trajectory
 from app.services.drift import run_detection
 from app.services.ingestion import ingest_recent
 from app.timeutils import today_local
@@ -37,6 +37,7 @@ def run_daily_pipeline(today: date | None = None) -> None:
         predictions.refresh_predictions(db)
         trajectory.refresh_trajectories(db)
         load_shift.propose_load_shifts(db)
+        ipe_definitions.propose_all(db)
         exports.produce_automatic(db, today)
         quarterly_reports.generate_due(db, today)
 
