@@ -37,6 +37,7 @@ from app.models import (  # noqa: E402
 )
 from app.providers.registry import set_provider_factory  # noqa: E402
 from app.security import hash_password  # noqa: E402
+from app.services import memo  # noqa: E402
 from app.services.ingestion import ingest_delivery_point  # noqa: E402
 from app.timeutils import utcnow, yesterday_local  # noqa: E402
 
@@ -53,6 +54,7 @@ def db():
         session.close()
         set_provider_factory(None)
         Base.metadata.drop_all(engine)
+        memo.clear()  # une base neuve par test : pas de calcul mémorisé d'un test à l'autre
 
 
 @pytest.fixture()

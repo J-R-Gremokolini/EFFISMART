@@ -39,7 +39,7 @@ from app.models import (
 )
 from app.providers.registry import get_energy_provider
 from app.providers.weather import WeatherProvider, WeatherUnavailableError
-from app.services import consumption_model
+from app.services import consumption_model, memo
 from app.services.consent import active_consent_clause
 from app.services.forecasting import learn_operation_classes
 from app.timeutils import local_day_bounds, to_local
@@ -76,8 +76,19 @@ class DriftCandidate:
 # --- Lecture des séries ------------------------------------------------------
 
 
+MEMO_MIN_DAYS = 7  # en deçà (détecteurs, jour par jour), le calcul est trop léger pour être mémorisé
+
+
 def half_hour_powers(db: Session, delivery_point_id: int, start: date, end: date) -> list[tuple[datetime, float]]:
-    """Puissances moyennes 30 min (kW), horodatées en heure locale."""
+    """Puissances moyennes 30 min (kW), horodatées en heure locale (mémorisées sur les longues périodes)."""
+    if (end - start).days < MEMO_MIN_DAYS:
+        return _half_hour_powers(db, delivery_point_id, start, end)
+    key = (delivery_point_id, start, end, memo.measurement_stamp(db, delivery_point_id, start, end))
+    return list(memo.cached("powers", key, lambda: _half_hour_powers(db, delivery_point_id, start, end),
+                            copy_result=False))
+
+
+def _half_hour_powers(db: Session, delivery_point_id: int, start: date, end: date) -> list[tuple[datetime, float]]:
     t0, t1 = local_day_bounds(start, end)
     rows = db.execute(
         select(Measurement.time, Measurement.value_kwh, Measurement.avg_power_kw).where(
@@ -91,6 +102,14 @@ def half_hour_powers(db: Session, delivery_point_id: int, start: date, end: date
 
 
 def daily_kwh(db: Session, delivery_point_id: int, start: date, end: date) -> dict[date, float]:
+    """Consommation par jour local (mémorisée sur les longues périodes)."""
+    if (end - start).days < MEMO_MIN_DAYS:
+        return _daily_kwh(db, delivery_point_id, start, end)
+    key = (delivery_point_id, start, end, memo.measurement_stamp(db, delivery_point_id, start, end))
+    return dict(memo.cached("daily", key, lambda: _daily_kwh(db, delivery_point_id, start, end), copy_result=False))
+
+
+def _daily_kwh(db: Session, delivery_point_id: int, start: date, end: date) -> dict[date, float]:
     t0, t1 = local_day_bounds(start, end)
     rows = db.execute(
         select(Measurement.time, Measurement.value_kwh).where(

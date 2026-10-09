@@ -20,9 +20,9 @@ from datetime import date, timedelta  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 import altair as alt  # noqa: E402
+from altair.utils.schemapi import disable_debug_mode  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
-import streamlit.components.v1 as components  # noqa: E402
 from sqlalchemy import func, select  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -73,6 +73,7 @@ from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
 from app.services import energy_data, ipe, quarterly_reports, simulator, site_plan, tariffs  # noqa: E402
 from app.services import action_plan, economics, energy_balance, energy_management, metering_plan  # noqa: E402
+from app.services import warmup  # noqa: E402
 from app.services import ipe_definitions as ipe_defs  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
@@ -92,6 +93,10 @@ from app.timeutils import (  # noqa: E402
     today_local,
     yesterday_local,
 )
+
+# Altair valide chaque objet de graphique dès sa construction (mode « debug ») puis encore au rendu : la première
+# validation coûte jusqu'à 0,2 s par graphique et n'apporte rien, Streamlit validant la spécification finale.
+disable_debug_mode()
 
 # --- Libellés (UI en français ; données J+1, voir app/vocabulary.py) ------------------
 
@@ -316,6 +321,7 @@ def guard_write(user: User) -> None:
 def initialize() -> bool:
     prepare_database()
     catch_up()
+    warmup.start()  # calculs lourds préparés en arrière-plan : la première visite d'une page est rapide
     return True
 
 
@@ -3054,7 +3060,7 @@ def page_reports(db: Session, repo: TenantRepository, user: User, org: Organizat
         except quarterly_reports.ReportError as exc:
             st.error(str(exc))
     with st.expander("Aperçu du document" if is_auditor else "Lire le rapport", expanded=not is_auditor):
-        components.html(document, height=900, scrolling=True)
+        st.iframe(document, height=900)  # document produit par la plateforme, textes échappés
 
 
 # --- F8 : plan 2D ---------------------------------------------------------------------------------------------

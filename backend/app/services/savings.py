@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Drift, Fluid, Recommendation, RecommendationKind, ReviewStatus
 from app.providers.weather import WeatherUnavailableError
-from app.services import forecasting
+from app.services import forecasting, memo
 from app.services.consent import has_active_consent
 from app.services.dashboard import data_as_of, emission_factors_at, estimated_price
 from app.services.drift import daily_kwh
@@ -108,8 +108,12 @@ def measure(db: Session, rec: Recommendation) -> SavingsMeasurement | None:
                                       weather.daily_solar(weather_start, reporting_end))
     except WeatherUnavailableError:
         return None
-    forecast = forecasting.build_forecast(baseline, climate, base=settings.dju_base_temperature,
-                                          cooling=dp.fluid == Fluid.ELEC)
+    # Le modèle de référence ne dépend que de la période de référence et de sa météo : mémorisé, il n'est réappris que
+    # si une mesure de cette période change (sinon chaque affichage du tableau de bord le réapprendrait).
+    key = (dp.id, dp.fluid, baseline_start, baseline_end, str(getattr(weather, "source", "")),
+           memo.measurement_stamp(db, dp.id, baseline_start, baseline_end))
+    forecast = memo.cached("forecast", key, lambda: forecasting.build_forecast(
+        baseline, climate, base=settings.dju_base_temperature, cooling=dp.fluid == Fluid.ELEC), copy_result=False)
     if forecast is None:
         return None
     expected = actual = 0.0

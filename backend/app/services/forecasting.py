@@ -32,6 +32,7 @@ import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from functools import cached_property
 
 import numpy as np
 
@@ -81,6 +82,10 @@ class Climate:
 
     temperature: dict[date, float]
     solar: dict[date, float] = field(default_factory=dict)
+    # Profils déjà calculés : la validation croisée les redemande des centaines de milliers de fois. Un climat n'est
+    # jamais modifié en place (`shifted` et les appelants en font une copie), la mémoire reste donc juste.
+    _profiles: dict = field(default_factory=dict, repr=False, compare=False)
+    _effective: dict = field(default_factory=dict, repr=False, compare=False)
 
     def air(self, day: date, solar: bool) -> float | None:
         t = self.temperature.get(day)
@@ -92,13 +97,19 @@ class Climate:
 
     def profile(self, day: date, inertia: int, solar: bool) -> list[float] | None:
         """Le jour et ses `inertia` jours précédents (Paudel, 2016)."""
-        values = [self.air(day - timedelta(days=k), solar) for k in range(inertia + 1)]
-        return None if None in values else values
+        key = (day, inertia, solar)
+        if key not in self._profiles:
+            values = [self.air(day - timedelta(days=k), solar) for k in range(inertia + 1)]
+            self._profiles[key] = None if None in values else values
+        return self._profiles[key]
 
     def effective(self, day: date, inertia: int, solar: bool) -> float | None:
         """Moyenne glissante de la température sur le jour et ses jours précédents (inertie)."""
-        values = self.profile(day, inertia, solar)
-        return None if values is None else sum(values) / len(values)
+        key = (day, inertia, solar)
+        if key not in self._effective:
+            values = self.profile(day, inertia, solar)
+            self._effective[key] = None if values is None else sum(values) / len(values)
+        return self._effective[key]
 
     def shifted(self, days: list[date], delta: float) -> Climate:
         """Même climat, températures décalées de `delta` °C sur les jours donnés (sensibilité)."""
@@ -118,8 +129,12 @@ class OperationClasses:
     levels: dict[int, float] = field(default_factory=dict)  # niveau relatif à la moyenne de la semaine
     learned: bool = False
 
+    @cached_property
+    def _by_weekday(self) -> tuple[int, ...]:
+        return tuple(next(i for i, group in enumerate(self.groups) if weekday in group) for weekday in range(7))
+
     def of(self, day: date) -> int:
-        return next(i for i, group in enumerate(self.groups) if day.weekday() in group)
+        return self._by_weekday[day.weekday()]
 
     @staticmethod
     def _names(group: tuple[int, ...]) -> str:
@@ -286,6 +301,34 @@ class _RelevantDaysModel:
             estimate = min(max(local, 0.5 * float(y.min())), 1.5 * float(y.max()))
         return max(0.0, estimate)
 
+    def predict_many(self, days: list[date], climate: Climate) -> list[float | None]:
+        """Même calcul que `predict`, jour par jour, mais les distances, le tri des jours analogues et la moyenne
+        pondérée sont faits pour tous les jours d'une classe à la fois (validation croisée bien plus rapide)."""
+        out: list[float | None] = [None] * len(days)
+        by_class: dict[int, list[tuple[int, list[float]]]] = {}
+        for index, day in enumerate(days):
+            profile = climate.profile(day, self.config.inertia, self.config.solar)
+            if profile is not None:
+                by_class.setdefault(self.classes.of(day), []).append((index, profile))
+        k = self.config.neighbours
+        for cls, items in by_class.items():
+            scaled, effective, values, mean, std = self.tables[cls]
+            targets = (np.array([p for _, p in items]) - mean) / std
+            distances = np.sqrt(((scaled[None, :, :] - targets[:, None, :]) ** 2).sum(axis=2))
+            nearest = np.argsort(distances, axis=1)[:, :k]
+            for row, (index, profile) in enumerate(items):
+                chosen = nearest[row]
+                weights = 1.0 / (distances[row, chosen] + 0.1)
+                x, y = effective[chosen], values[chosen]
+                estimate = float(np.average(y, weights=weights))
+                if np.ptp(x) >= 1.0:
+                    design = np.column_stack([np.ones_like(x), x]) * np.sqrt(weights)[:, None]
+                    intercept, slope = np.linalg.lstsq(design, y * np.sqrt(weights), rcond=None)[0]
+                    local = float(intercept + slope * (sum(profile) / len(profile)))
+                    estimate = min(max(local, 0.5 * float(y.min())), 1.5 * float(y.max()))
+                out[index] = max(0.0, estimate)
+        return out
+
 
 def fit(config: Config, classes: OperationClasses, days: list[date], consumption: dict[date, float],
         climate: Climate, *, base: float, cooling: bool):
@@ -336,8 +379,9 @@ def evaluate(config: Config, classes: OperationClasses, days: list[date], consum
         if model is None:
             return None
         predicted, actual = 0.0, 0.0
-        for day in block:
-            estimate = model.predict(day, climate)
+        estimates = (model.predict_many(block, climate) if hasattr(model, "predict_many")
+                     else [model.predict(day, climate) for day in block])
+        for day, estimate in zip(block, estimates):
             if estimate is None:
                 continue
             squared += (estimate - consumption[day]) ** 2

@@ -85,6 +85,41 @@ publication par Enedis de la courbe de charge de la veille (entre 12 h et 16 h) 
 Lancement manuel : `docker compose exec backend python -m app.scheduler`. Horaire réglable
 (`EFFISMART_DAILY_JOB_HOUR`).
 
+### Fluidité de l'interface
+
+Streamlit réexécute toute la page à chaque clic. Quatre mesures évitent de refaire ce qui n'a pas changé :
+- **Mémoire des calculs** (`app/services/memo.py`) :
+  - calculs mémorisés : chiffrage mensuel au pas 30 min, consommations journalières, courbes de puissance, modèle
+    de référence des mesures avant / après ;
+  - clé : leurs arguments et une empreinte des données lues (nombre de mesures, dernière mesure et somme des
+    valeurs, factures, contrats, consentement) ;
+  - une nouvelle mesure, une correction, une facture ou un contrat change l'empreinte et relance le calcul : une
+    valeur mémorisée n'est jamais périmée.
+- **Préchauffage** (`app/services/warmup.py`) : au démarrage de l'interface, un fil en arrière-plan prépare les
+  calculs de tous les clients :
+  - chiffrages, bilans et puissance souscrite (quelques secondes) ;
+  - puis les modèles de consommation (une dizaine de secondes) ;
+  - la première visite d'une page est alors aussi rapide que les suivantes.
+- **Moteur de prévision plus rapide**, à résultats identiques :
+  - profils climatiques et classes de jours calculés une seule fois ;
+  - prédiction « jours analogues » faite pour un bloc de jours à la fois pendant la validation croisée.
+- **Graphiques** : la validation Altair à la construction de chaque objet est désactivée ; Streamlit valide
+  toujours la spécification finale.
+
+Mesure sur les trois clients de démonstration, 8 pages principales :
+
+| | Avant | Après |
+|---|---|---|
+| Chaque clic | 8 à 11 s | ~1 s |
+| Premier affichage du bilan énergétique | 9 à 15 s | 0,2 s (préchauffage terminé), 3 s sinon |
+
+Gains par page, à chaque clic :
+- plan d'actions : de 1,2–2,6 s à 0,1 s ;
+- simulateur : de 1 s à 0,03 s ;
+- suivi mensuel : de 0,7–1,1 s à 0,06 s.
+
+Tests : `tests/test_performance.py`.
+
 ### Vocabulaire : la donnée la plus fraîche est celle de la veille
 
 La courbe de charge de la veille est disponible chaque jour entre 12 h et 16 h ; le gaz à J+1 ou J+2. Un suivi à

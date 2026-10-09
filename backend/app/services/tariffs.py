@@ -37,6 +37,7 @@ from app.models import (
 )
 from app.providers.weather import MockWeatherProvider
 from app.repositories import TenantRepository
+from app.services import memo
 from app.services.consent import has_active_consent
 from app.services.dashboard import data_as_of, emission_factors_at, estimated_price
 from app.services.energy_data import declared_daily
@@ -202,23 +203,46 @@ def month_key(day: date) -> str:
 
 def monthly_costing(db: Session, dp: DeliveryPoint, start: date, end: date) -> dict[str, Costing]:
     """Consommation et coût d'un point, mois par mois : mesures N1 au prix de chaque pas, factures N0 au prix
-    moyen, abonnement au prorata des jours sous contrat."""
+    moyen, abonnement au prorata des jours sous contrat.
+
+    Mémorisé (`memo`) : refait seulement si les mesures, les factures, les contrats ou le consentement changent."""
     contracts = contracts_of(db, dp.id)
+    consented = has_active_consent(db, dp.id)
+    key = (dp.id, dp.fluid, start, end, consented,
+           memo.measurement_stamp(db, dp.id, start, end) if consented else None,
+           memo.declared_stamp(db, dp.id), memo.contracts_stamp(contracts))
+    return memo.cached("costing", key, lambda: _monthly_costing(db, dp, start, end, contracts, consented))
+
+
+def _monthly_costing(db: Session, dp: DeliveryPoint, start: date, end: date, contracts: list[SupplyContract],
+                     consented: bool) -> dict[str, Costing]:
     months: dict[str, Costing] = defaultdict(Costing)
     covered: set[date] = set()
-    if has_active_consent(db, dp.id):
+    if consented:
         t0, t1 = local_day_bounds(start, end)
         rows = db.execute(select(Measurement.time, Measurement.value_kwh).where(
             Measurement.delivery_point_id == dp.id, Measurement.time >= t0, Measurement.time < t1))
+        # Le contrat et le mois ne dépendent que du jour, le prix que du jour et de l'heure : calculés une fois par
+        # jour ou par heure, pas à chaque pas de 30 min (douze mois de courbe = 17 500 pas par point).
+        by_day: dict[date, tuple[Costing, SupplyContract | None]] = {}
+        by_hour: dict[tuple[date, int], tuple[float, str]] = {}
+        indicative = (estimated_price(dp.fluid), INDICATIVE)
         for time, kwh in rows:
             local = to_local(time)
-            covered.add(local.date())
-            contract = contract_at(contracts, local.date())
+            day = local.date()
+            entry = by_day.get(day)
+            if entry is None:
+                covered.add(day)
+                entry = by_day[day] = (months[month_key(day)], contract_at(contracts, day))
+            costing, contract = entry
             if contract is None:
-                price, period = estimated_price(dp.fluid), INDICATIVE
+                price, period = indicative
             else:
-                price, period = slot_price(contract, local)
-            months[month_key(local.date())].add(period, kwh, kwh * price)
+                slot = by_hour.get((day, local.hour))
+                if slot is None:
+                    slot = by_hour[(day, local.hour)] = slot_price(contract, local)
+                price, period = slot
+            costing.add(period, kwh, kwh * price)
     for day, kwh in declared_daily(db, dp, start, end, covered).items():
         contract = contract_at(contracts, day)
         costing = months[month_key(day)]

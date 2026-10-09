@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from sqlalchemy import func, select
@@ -46,6 +46,7 @@ class ConsumptionModel:
     train_end: date
     days: int
     fluid: Fluid
+    _parts: dict = field(default_factory=dict, repr=False, compare=False)  # parts climatiques déjà calculées
 
     @property
     def cv(self) -> float:
@@ -70,7 +71,13 @@ class ConsumptionModel:
 
     def climate_parts(self, start: date) -> tuple[float, float, float]:
         """(chauffage, refroidissement, reste) sur une année normale : écart entre la météo normale et une
-        météo neutre (20 °C, sans soleil), où ni chauffage ni refroidissement ne sont nécessaires."""
+        météo neutre (20 °C, sans soleil), où ni chauffage ni refroidissement ne sont nécessaires.
+        Gardé avec le modèle : le modèle est lui-même mémorisé tant que ses données ne changent pas."""
+        if start not in self._parts:
+            self._parts[start] = self._climate_parts(start)
+        return self._parts[start]
+
+    def _climate_parts(self, start: date) -> tuple[float, float, float]:
         days = self.normal_year(start)
         neutral = forecasting.Climate(
             {**self.climate.temperature, **{d - timedelta(days=k): NEUTRAL_TEMPERATURE
