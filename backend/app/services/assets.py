@@ -60,6 +60,9 @@ CATEGORIES: dict[AssetNodeKind, dict[str, Category]] = {
         "REFRIGERATION": Category("Froid alimentaire, chambre froide", off_hours_ok=False),
         "PROCESS": Category("Process, machines de production"),
         "CHARGING": Category("Recharge (véhicules, chariots)"),
+        # Utilités industrielles (formation PRO-REFEI, SP3 et SP4).
+        "COMPRESSOR": Category("Compresseur d'air"),
+        "PUMP_FAN": Category("Pompes, ventilateurs, moteurs"),
         "OTHER": Category("Autre équipement"),
     },
     K.FLOW: {
@@ -68,6 +71,7 @@ CATEGORIES: dict[AssetNodeKind, dict[str, Category]] = {
         "CHILLED_WATER": Category("Eau glacée"),
         "AIR": Category("Air traité"),
         "STEAM": Category("Vapeur"),
+        "COMPRESSED_AIR": Category("Air comprimé"),
         "OTHER": Category("Autre fluide"),
     },
     K.ZONE: {
@@ -88,6 +92,7 @@ CATEGORIES: dict[AssetNodeKind, dict[str, Category]] = {
         "IT": Category("Informatique"),
         "PROCESS": Category("Process"),
         "REFRIGERATION": Category("Froid alimentaire"),
+        "COMPRESSED_AIR": Category("Air comprimé"),
         "OTHER": Category("Autre usage"),
     },
 }
@@ -108,6 +113,8 @@ RELEVANT_USAGES = {
     "REFRIGERATION": {"REFRIGERATION"},
     "PROCESS": {"PROCESS"},
     "CHARGING": {"PROCESS"},
+    "COMPRESSOR": {"COMPRESSED_AIR", "PROCESS"},
+    "PUMP_FAN": {"HEATING", "COOLING", "VENTILATION", "PROCESS", "REFRIGERATION"},
 }
 # Grammaire physique : (type de la source, relation, type de la cible).
 ALLOWED_RELATIONS = {

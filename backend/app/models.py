@@ -8,6 +8,9 @@ Compteur → alimente → Chaudière → produit → Eau chaude → alimente →
 
 Version 2 : contrats de fourniture (F6, F12), variables d'ajustement (F7), plan 2D (F8), bibliothèque de
 gestes types et scénarios (F9), rapports trimestriels (F10), trajectoires Décret Tertiaire (F11).
+
+Module référent énergie (formation PRO-REFEI de l'ATEE) : plan d'actions chiffré et suivi (R2, R4),
+auto-évaluation et socle du management de l'énergie (R3), messages de sensibilisation (R7).
 """
 from __future__ import annotations
 
@@ -166,6 +169,14 @@ class Organization(Base):
     currency: Mapped[str] = mapped_column(String(3), default="EUR")
     # F7, passerelle ISO 50001 : une entreprise certifiée est exemptée de l'audit énergétique obligatoire.
     iso50001_certified_until: Mapped[date | None] = mapped_column(Date)
+    # R1 : poids économique de l'énergie (formation PRO-REFEI, SP5) : chiffre d'affaires et excédent brut
+    # d'exploitation (EBE) du dernier exercice, saisis par l'auditeur ou le responsable énergie.
+    revenue_eur: Mapped[float | None] = mapped_column(Float)
+    ebitda_eur: Mapped[float | None] = mapped_column(Float)
+    finance_year: Mapped[int | None] = mapped_column()
+    # R2 : paramètres de rentabilité du plan d'actions (taux d'actualisation, durée d'analyse, évolution du prix
+    # de l'énergie, valorisation des CEE). Vide = valeurs par défaut de `economics.DEFAULTS`.
+    economics: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     sites: Mapped[list[Site]] = relationship(back_populates="organization", order_by="Site.id")
@@ -844,6 +855,10 @@ class ActionTemplate(Base):
     investment_eur_m2: Mapped[float] = mapped_column(Float, default=0.0)
     investment_eur: Mapped[float] = mapped_column(Float, default=0.0)
     notes: Mapped[str | None] = mapped_column(Text)
+    # R6 : famille d'actions du plan de préconisations, fiche CEE de référence et durée de vie (calcul de la VAN).
+    category: Mapped[str | None] = mapped_column(String(32))
+    cee_sheet: Mapped[str | None] = mapped_column(String(20))
+    lifetime_years: Mapped[int | None] = mapped_column()
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -989,5 +1004,153 @@ class IpeDefinition(ExplainedOutput, Base):
     reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     review_comment: Mapped[str | None] = mapped_column(Text)
+    # R6 : valeur cible fixée par un humain et seuil d'alerte autour de la cible (formation PRO-REFEI, SP5 :
+    # « seuil d'alerte à +10 % ; si dépassement, le référent énergie intervient pour en analyser la cause »).
+    target_value: Mapped[float | None] = mapped_column(Float)
+    alert_threshold_pct: Mapped[float | None] = mapped_column(Float)
+
+    site: Mapped[Site] = relationship()
+
+
+# --- Module référent énergie (formation PRO-REFEI de l'ATEE) ---------------------------------------------------
+
+
+class ActionStatus(str, enum.Enum):
+    """Avancement d'une action du plan (SP5 : suivre l'avancement, clôturer, ouvrir les actions nouvelles)."""
+
+    IDENTIFIED = "IDENTIFIED"  # gisement identifié, pas encore décidé
+    PLANNED = "PLANNED"  # décidée : un responsable, une échéance
+    IN_PROGRESS = "IN_PROGRESS"
+    DONE = "DONE"  # réalisée, déclarée par un humain
+    VERIFIED = "VERIFIED"  # économies vérifiées (plan de mesure et vérification)
+    ABANDONED = "ABANDONED"
+
+
+class EnergyAction(Base):
+    """R2 — Action du plan d'actions du référent énergie : chiffrée, hiérarchisée, planifiée et suivie.
+
+    Créée par un humain (auditeur ou responsable énergie), éventuellement à partir d'un geste type (F9) ou
+    d'une recommandation validée. Économies annuelles par énergie dans `savings` ({"ELEC": kWh, "GAS": kWh},
+    valeur négative = surconsommation). Fiche QQOQPCC (SP8) et plan de mesure et vérification IPMVP (SP5).
+    """
+
+    __tablename__ = "energy_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200))  # Quoi ?
+    description: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(32))  # famille : éclairage, air comprimé, froid…
+    nature: Mapped[str] = mapped_column(String(32))  # conception, technique, pilotage-maintenance, organisationnelle
+    priority: Mapped[str] = mapped_column(String(16), default="UNRANKED")  # prioritaire, ambitieuse, très ambitieuse
+    horizon: Mapped[str] = mapped_column(String(16), default="SHORT")  # court terme, moyen terme, pour mémoire
+    savings: Mapped[dict] = mapped_column(JSON)
+    recurring_eur: Mapped[float] = mapped_column(Float, default=0.0)  # gain (+) ou coût (−) récurrent non énergétique
+    investment_eur: Mapped[float] = mapped_column(Float, default=0.0)
+    # Situation de référence (SP3) : coût de la solution qu'on aurait de toute façon payée (ex. rebobiner un moteur
+    # en fin de vie). La rentabilité porte alors sur le surinvestissement : investissement − référence.
+    reference_investment_eur: Mapped[float] = mapped_column(Float, default=0.0)
+    lifetime_years: Mapped[int] = mapped_column(default=10)
+    cee_kwh_cumac: Mapped[float | None] = mapped_column(Float)
+    cee_sheet: Mapped[str | None] = mapped_column(String(20))
+    # Cotation (SP5, exemple WinErgia) : notes de 1 (nul) à 4 (fort) ; co-bénéfices (SP4, autres critères).
+    score_economic: Mapped[int | None] = mapped_column()
+    score_technical: Mapped[int | None] = mapped_column()
+    score_risk: Mapped[int | None] = mapped_column()
+    cobenefits: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
+    # QQOQPCC (SP8) : un seul responsable, une échéance datée (jamais « asap »).
+    owner: Mapped[str | None] = mapped_column(String(120))  # Qui ?
+    location: Mapped[str | None] = mapped_column(String(200))  # Où ?
+    equipment_id: Mapped[int | None] = mapped_column(ForeignKey("asset_nodes.id"))
+    due_date: Mapped[date | None] = mapped_column(Date)  # Quand ?
+    why: Mapped[str | None] = mapped_column(Text)  # Pourquoi ?
+    how_much: Mapped[str | None] = mapped_column(Text)  # Combien ? (quantités)
+    how: Mapped[str | None] = mapped_column(Text)  # Comment ? (méthode, rétroplanning)
+    contacts: Mapped[list | None] = mapped_column(JSON(none_as_null=True))  # [{"who", "channel", "when", "purpose"}]
+    needs: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))  # {"training", "documentation", "monitoring"}
+    status: Mapped[ActionStatus] = mapped_column(_enum(ActionStatus), default=ActionStatus.IDENTIFIED)
+    progress_note: Mapped[str | None] = mapped_column(Text)
+    done_on: Mapped[date | None] = mapped_column(Date)
+    ipe_definition_id: Mapped[int | None] = mapped_column(ForeignKey("ipe_definitions.id"))  # IPE de vérification
+    recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"))
+    template_id: Mapped[int | None] = mapped_column(ForeignKey("action_templates.id"))
+    origin: Mapped[str] = mapped_column(String(16), default="USER")  # USER, GESTURE ou RECOMMENDATION
+    mv_plan: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))  # plan de M&V IPMVP en 13 points
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    site: Mapped[Site] = relationship()
+
+
+class MaturityAssessment(Base):
+    """R3 — Auto-évaluation de la démarche de management de l'énergie (5 axes PDCA de l'ISO 50001).
+
+    Réponses d'un humain : 2 (tout à fait), 1 (partiellement), 0 (pas du tout), −1 (non applicable).
+    Les évaluations successives sont conservées : elles montrent la progression (amélioration continue).
+    """
+
+    __tablename__ = "maturity_assessments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    answers: Mapped[dict] = mapped_column(JSON)  # {code de la question: note}
+    comments: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    scores: Mapped[dict] = mapped_column(JSON)  # {"axes": {…}, "themes": {…}, "global": …}
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EnergyManagement(Base):
+    """R3 — Socle du management de l'énergie d'une organisation : politique, équipe énergie, objectifs.
+
+    `team` : [{"name", "role", "missions"}] ; `objectives` : [{"label", "indicator", "baseline", "target",
+    "deadline", "owner", "ipe_definition_id"}] (objectifs SMART, SP5).
+    """
+
+    __tablename__ = "energy_management"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
+    policy: Mapped[str | None] = mapped_column(Text)
+    policy_approved_on: Mapped[date | None] = mapped_column(Date)  # validation par la direction
+    scope: Mapped[str | None] = mapped_column(Text)  # domaine d'application et périmètre
+    team: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
+    objectives: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
+    review_months: Mapped[int | None] = mapped_column()  # périodicité de la revue énergétique
+    last_review_on: Mapped[date | None] = mapped_column(Date)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CommunicationStatus(str, enum.Enum):
+    DRAFT = "DRAFT"  # préparé par la plateforme d'après les données, à relire
+    APPROVED = "APPROVED"  # relu et approuvé par un humain : diffusable
+    ARCHIVED = "ARCHIVED"
+
+
+class CommunicationMessage(Base):
+    """R7 — Message de sensibilisation (SP6) : un message à la fois, chiffré, qui appelle à agir.
+
+    Préparé par la plateforme d'après les données du site ; un humain le relit, l'ajuste et l'approuve avant
+    toute diffusion (affichage, écran d'information). Principe P1 : jamais diffusé sans relecture.
+    """
+
+    __tablename__ = "communication_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    theme: Mapped[str] = mapped_column(String(32))  # BASELOAD, SAVINGS, ACTION, IPE, COMPRESSED_AIR…
+    title: Mapped[str] = mapped_column(String(160))
+    body: Mapped[str] = mapped_column(Text)
+    call_to_action: Mapped[str] = mapped_column(String(200))
+    figures: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))  # chiffres sources, pour la traçabilité
+    status: Mapped[CommunicationStatus] = mapped_column(_enum(CommunicationStatus), default=CommunicationStatus.DRAFT)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    approved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     site: Mapped[Site] = relationship()

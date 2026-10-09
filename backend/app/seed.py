@@ -35,9 +35,11 @@ from app.models import (
     AssetNodeKind,
     AssetRelation,
     AssetRelationKind,
+    ActionStatus,
     Auditor,
     AuditorClientLink,
     Consent,
+    EnergyAction,
     IpeVariable,
     IpeVariableValue,
     DeliveryPoint,
@@ -59,10 +61,13 @@ from app.models import (
 from app.repositories import TenantRepository
 from app.security import hash_password
 from app.services import (
+    action_plan,
     alert_groups,
     anomaly_context,
     assets,
     drift_explanations,
+    energy_balance,
+    energy_management,
     exports,
     integrations,
     ipe_definitions,
@@ -556,6 +561,162 @@ def _create_demo_ipe(db: Session) -> None:
     db.commit()
 
 
+# Module référent énergie (formation PRO-REFEI) : finances, plan d'actions, socle du management de l'énergie
+# et auto-évaluations. Chiffres cohérents avec les consommations simulées des sites ; actions saisies « comme » par
+# l'auditeur du cabinet de démonstration.
+DEMO_FINANCES = {"Boulangeries Martin": (6_500_000, 600_000), "Clinique du Parc": (42_000_000, 2_100_000),
+                 "Logistique Rhône": (18_000_000, 900_000)}
+# (site, intitulé, famille, nature, horizon, priorité, économies, investissement, durée de vie, statut, extras)
+DEMO_ACTIONS = [
+    ("Atelier central", "Arrêt des pétrins, des fours et des éclairages hors production", "PROCESS", "ORGANISATIONAL",
+     "SHORT", "PRIORITY", {"ELEC": 24_000}, 0, 5, "PLANNED",
+     {"owner": "Chef d'atelier", "due_days": 45, "cobenefits": ["MANAGEMENT"], "score_technical": 4, "score_risk": 4,
+      "why": "Talon électrique du week-end ; sensibiliser l'équipe de production.",
+      "how": "Check-list de fin de poste, affichage près des tableaux électriques."}),
+    ("Atelier central", "Relamping LED de l'atelier (tubes T8 remplacés)", "LIGHTING", "TECHNICAL", "SHORT", "PRIORITY",
+     {"ELEC": 21_000}, 9_500, 15, "DONE",
+     {"owner": "Responsable maintenance", "due_days": -150, "done_days": 120, "cobenefits": ["MAINTENANCE"],
+      "score_technical": 4, "score_risk": 4}),
+    ("Atelier central", "Récupération de chaleur sur les fumées des fours", "RENEWABLES", "DESIGN", "MEDIUM",
+     "AMBITIOUS", {"GAS": 26_000}, 28_000, 15, "IDENTIFIED",
+     {"cobenefits": ["ENVIRONMENT"], "score_technical": 3, "score_risk": 3}),
+    ("Atelier central", "Régulation haute pression flottante de la chambre froide", "COLD", "TECHNICAL", "MEDIUM",
+     "AMBITIOUS", {"ELEC": 12_000}, 9_000, 15, "IDENTIFIED", {"score_technical": 4, "score_risk": 3}),
+    ("Atelier central", "Panneaux photovoltaïques en autoconsommation (500 m²)", "RENEWABLES", "DESIGN", "MEMO",
+     "VERY_AMBITIOUS", {"ELEC": 32_000}, 45_000, 25, "IDENTIFIED", {"cobenefits": ["ENERGY_MIX", "ENVIRONMENT"]}),
+    ("Bâtiment principal", "Variateurs de vitesse sur les ventilateurs des CTA", "MOTORS", "TECHNICAL", "SHORT",
+     "PRIORITY", {"ELEC": 22_000}, 7_500, 15, "PLANNED",
+     {"owner": "Responsable maintenance", "due_days": 60, "cee_sheet": "IND-UT-102", "cee_kwh_cumac": 160_000,
+      "equipment": "CTA bloc opératoire", "cobenefits": ["MANAGEMENT"], "score_technical": 4, "score_risk": 3,
+      "how_much": "2 ventilateurs (CTA bloc et administration)",
+      "contacts": [{"who": "Fournisseur de variateurs", "channel": "téléphone, e-mail", "when": "sous 15 jours",
+                    "purpose": "validation technique, devis"},
+                   {"who": "Obligé CEE", "channel": "e-mail", "when": "avant la commande",
+                    "purpose": "accord de valorisation (rôle actif et incitatif)"}]}),
+    ("Bâtiment principal", "Calorifugeage des points singuliers en chaufferie", "STEAM", "TECHNICAL", "SHORT",
+     "PRIORITY", {"GAS": 16_000}, 5_300, 15, "IN_PROGRESS",
+     {"owner": "Responsable maintenance", "due_days": 20, "cee_sheet": "IND-UT-121", "cee_kwh_cumac": 120_000,
+      "cobenefits": ["SAFETY"], "score_technical": 4, "score_risk": 4,
+      "why": "Pertes thermiques et risque de brûlure sur les vannes et brides non isolées."}),
+    ("Bâtiment principal", "Consigne de climatisation des bureaux relevée à 26 °C", "HVAC", "ORGANISATIONAL", "SHORT",
+     "PRIORITY", {"ELEC": 9_000}, 0, 5, "DONE",
+     {"owner": "Cadre de santé", "due_days": -100, "done_days": 90, "score_technical": 4, "score_risk": 4}),
+    ("Bâtiment principal", "Gestion technique centralisée (programmation, réduits)", "METERING", "TECHNICAL", "MEDIUM",
+     "AMBITIOUS", {"ELEC": 30_000, "GAS": 15_000}, 48_000, 15, "IDENTIFIED",
+     {"cobenefits": ["MAINTENANCE", "SAFETY"], "score_technical": 3, "score_risk": 3}),
+    ("Bâtiment principal", "Récupération de chaleur du groupe froid pour l'eau chaude sanitaire", "RENEWABLES", "DESIGN",
+     "MEDIUM", "VERY_AMBITIOUS", {"GAS": 40_000, "ELEC": -2_000}, 38_000, 20, "IDENTIFIED",
+     {"cobenefits": ["ENVIRONMENT"], "score_technical": 3, "score_risk": 2}),
+    ("Entrepôt Genas", "Éclairage LED de l'entrepôt avec détection de présence", "LIGHTING", "TECHNICAL", "SHORT",
+     "PRIORITY", {"ELEC": 60_000}, 45_000, 15, "IDENTIFIED", {"score_technical": 4, "score_risk": 4}),
+]
+DEMO_MANAGEMENT = {
+    "Boulangeries Martin": {
+        "policy": "Réduire de 10 % l'énergie consommée par fournée d'ici fin 2028, en associant l'équipe de production "
+                  "et en privilégiant les équipements performants à chaque renouvellement.",
+        "approved": date(2026, 2, 3), "scope": "Atelier central et boutique Bellecour ; électricité et gaz.",
+        "team": [{"name": "Responsable maintenance", "role": "Référent énergie", "missions": "Plan d'actions, suivi"},
+                 {"name": "Chef d'atelier", "role": "Production", "missions": "Consignes de fin de poste"},
+                 {"name": "Direction", "role": "Sponsor", "missions": "Arbitrages, budget"}],
+        "objectives": [{"label": "−10 % de kWh par fournée", "indicator": "kWh électricité par fournée",
+                        "target": "−10 %", "deadline": "2028-12-31", "owner": "Référent énergie"}],
+        "review": (12, date(2025, 11, 15)),
+        "assessments": [(30, {"P1": 2, "P2": 1, "P3": 1, "P4": 0, "P5": 0, "O1": 2, "O2": 1, "O3": 0, "O4": 0,
+                              "G1": 1, "G2": 0, "G3": 1, "K1": 2, "K2": 1, "K3": 1, "K4": 1, "K5": 1, "A1": 1,
+                              "A2": 1, "S1": 0, "S2": 0, "S3": 1, "C1": 0, "C2": 1, "C3": 0, "M1": 1, "M2": 0,
+                              "B1": 0, "B2": 0, "B3": 1, "B4": 0, "N1": 1, "N2": 1, "N3": 2, "V1": 0, "V2": 1,
+                              "I1": 0, "I2": 0})],
+    },
+    "Clinique du Parc": {
+        "policy": "Améliorer en continu la performance énergétique de la clinique (ISO 50001), sans compromis sur la "
+                  "qualité des soins : −15 % d'énergie par m² d'ici 2030 par rapport à 2019.",
+        "approved": date(2025, 9, 1), "scope": "Bâtiment principal ; électricité et gaz ; usages de soins exclus.",
+        "team": [{"name": "Responsable énergie", "role": "Référent énergie", "missions": "SMÉ, plan d'actions"},
+                 {"name": "Responsable maintenance", "role": "Maintenance", "missions": "Utilités, CTA, chaufferie"},
+                 {"name": "Directeur administratif et financier", "role": "Direction",
+                  "missions": "Budget, revue de direction"}],
+        "objectives": [{"label": "−15 % kWh/m² (Décret Tertiaire, palier 2030)", "indicator": "kWh/m²",
+                        "target": "−15 %", "deadline": "2030-12-31", "owner": "Responsable énergie"},
+                       {"label": "Toutes les actions réalisées vérifiées (IPMVP)", "indicator": "",
+                        "target": "100 %", "deadline": "", "owner": ""}],
+        "review": (12, date(2026, 3, 20)),
+        "assessments": [(300, {**{q: 1 for q in ("P1", "P2", "P3", "P4", "P5", "O1", "O2", "O3", "O4", "G1", "G2",
+                                                "G3", "K1", "K2", "K3", "K4", "K5", "A1", "A2", "S1", "S2", "S3",
+                                                "C1", "C2", "C3", "M1", "M2", "B1", "B2", "B3", "B4", "N1", "N2",
+                                                "N3", "V1", "V2", "I1", "I2")}, "P1": 2, "G1": 2, "N3": 2}),
+                        (20, {**{q: 2 for q in ("P1", "P2", "P3", "P4", "O1", "O2", "O3", "O4", "G1", "G2", "G3",
+                                               "K1", "K2", "K3", "K4", "K5", "A1", "A2", "N1", "N2", "N3", "I1",
+                                               "I2")},
+                              **{q: 1 for q in ("P5", "S1", "S2", "S3", "C1", "C2", "M1", "M2", "B1", "B2", "B3",
+                                               "B4", "V1", "V2")}, "C3": 0})],
+    },
+}
+
+
+def _create_demo_referent(db: Session) -> None:
+    """Données de démonstration du module référent énergie, pour les clients de démonstration (idempotent)."""
+    auditor = db.scalar(select(User).where(User.email == "auditeur@effismart.demo"))
+    demo_orgs = {o.name: o for o in db.scalars(select(Organization).where(
+        Organization.name.in_([spec["name"] for spec in ORGANIZATIONS])))}
+    if auditor is None or not demo_orgs:
+        return
+    repo = TenantRepository(db, auditor)
+    for name, (revenue, ebitda) in DEMO_FINANCES.items():
+        org = demo_orgs.get(name)
+        if org is not None and org.revenue_eur is None:
+            energy_balance.set_finances(db, repo, auditor, org.id, revenue_eur=revenue, ebitda_eur=ebitda,
+                                        year=today_local().year - 1)
+    sites = {s.name: s for s in db.scalars(select(Site).where(Site.organization_id.in_([o.id for o in demo_orgs.values()])))}
+    seeded_orgs = set(db.scalars(select(EnergyAction.organization_id).distinct()))
+    today = today_local()
+    for site_name, title, category, nature, horizon, priority, savings, investment, lifetime, status, extra in DEMO_ACTIONS:
+        site = sites.get(site_name)
+        if site is None or site.organization_id in seeded_orgs:
+            continue
+        extra = dict(extra)
+        values = {k: extra.pop(k) for k in ("owner", "cobenefits", "score_technical", "score_risk", "why", "how",
+                                            "how_much", "contacts", "cee_sheet", "cee_kwh_cumac") if k in extra}
+        if "due_days" in extra:
+            values["due_date"] = today + timedelta(days=extra.pop("due_days"))
+        equipment = extra.pop("equipment", None)
+        if equipment:
+            node = db.scalar(select(AssetNode).where(AssetNode.site_id == site.id, AssetNode.name == equipment))
+            values["equipment_id"] = node.id if node else None
+        action = action_plan.create_action(db, repo, auditor, site.id, title=title, category=category, nature=nature,
+                                           horizon=horizon, priority=priority, savings=savings,
+                                           investment_eur=investment, lifetime_years=lifetime, **values)
+        if status in ("PLANNED", "IN_PROGRESS", "DONE"):
+            action_plan.set_status(db, repo, auditor, action.id, ActionStatus.PLANNED)
+        if status == "IN_PROGRESS":
+            action_plan.set_status(db, repo, auditor, action.id, ActionStatus.IN_PROGRESS)
+        if status == "DONE":
+            action_plan.set_status(db, repo, auditor, action.id, ActionStatus.DONE,
+                                   done_on=today - timedelta(days=extra.pop("done_days", 90)))
+            prices = action_plan.site_prices(db, site)
+            econ = action_plan.evaluate(action, prices, action_plan.economics.params_of(site.organization))
+            consumption = {line.fluid.value: line.kwh for line in (energy_balance.site_balance(db, site) or
+                                                                   energy_balance.Balance(today, today, [])).lines}
+            suggestion = action_plan.suggest_mv(db, action, econ, consumption, prices)
+            action_plan.save_mv_plan(db, repo, auditor, action.id, suggestion["values"])
+    for org_name, spec in DEMO_MANAGEMENT.items():
+        org = demo_orgs.get(org_name)
+        if org is None or repo.get_management(org.id) is not None:
+            continue
+        months, last_review = spec["review"]
+        energy_management.save_management(db, repo, auditor, org.id, policy=spec["policy"],
+                                          policy_approved_on=spec["approved"], scope=spec["scope"], team=spec["team"],
+                                          objectives=spec["objectives"], review_months=months,
+                                          last_review_on=last_review)
+        for days_ago, answers in spec["assessments"]:
+            assessment = energy_management.save_assessment(db, repo, auditor, org.id, answers)
+            assessment.created_at = utcnow() - timedelta(days=days_ago)
+        db.commit()
+    for site_name in ("Bâtiment principal", "Atelier central"):
+        site = sites.get(site_name)
+        if site is not None and not repo.list_messages(site.organization_id, site.id):
+            energy_management.generate_drafts(db, repo, auditor, site.id, integrations.weather_provider(db))
+
+
 def upgrade(db: Session) -> None:
     """Mise à niveau idempotente d'une base existante (principes P1 et graphe physique)."""
     created = assets.sync_meter_nodes(db)
@@ -577,6 +738,7 @@ def upgrade(db: Session) -> None:
     if db.scalar(select(Organization.id).where(Organization.name.in_([o["name"] for o in ORGANIZATIONS])).limit(1)):
         _create_demo_v2(db)
         _create_demo_ipe(db)
+        _create_demo_referent(db)
     proposed = recommendations.propose_missing(db)
     if proposed:
         logger.info("%d recommandation(s) proposée(s) pour des anomalies déjà validées.", proposed)

@@ -407,6 +407,155 @@ restent en place.
 
 Démo, entrepôt de Genas : chargeurs déplacés de 11 h – 17 h vers 22 h – 4 h, environ 12 000 € par an.
 
+## Module référent énergie (formation PRO-REFEI de l'ATEE)
+
+Ce module reprend la démarche enseignée aux référents énergie par le programme PRO-REFEI (ATEE) :
+- état des lieux ;
+- plan de préconisations chiffré ;
+- mesure et suivi ;
+- argumentation ;
+- management de l'énergie.
+
+Elle s'appuie aussi sur les outils diffusés pendant la formation : énergieSIM, check-list énergie CHECK, guide
+ComptIAA, protocole IPMVP, guides ADEME. Migration `0011_referent_energie` ; tests dans
+`backend/tests/test_referent.py`.
+
+| Code | Fonctionnalité | Module de la formation | Dans EffiSmart |
+|---|---|---|---|
+| R1 | Bilan énergétique : énergies, usages, Pareto et UES, poids sur le CA et l'EBE, puissance souscrite | SP2, SP3, SP5 | page « Bilan énergétique » |
+| R2 | Plan d'actions chiffré, hiérarchisé, planifié (QQOQPCC) ; note pour la direction | SP3, SP4, SP5, SP8, énergieSIM | page « Plan d'actions » |
+| R3 | Management de l'énergie : auto-évaluation sur 5 axes ; politique, équipe, objectifs SMART | SP1, SP5, énergie CHECK | page « Management de l'énergie » |
+| R4 | Plan de mesure et vérification IPMVP en 13 points par action | SP5, IPMVP | onglet « Mesure et vérification » d'une action |
+| R5 | Plan de comptage : niveau, recoupement des sous-compteurs, sous-compteurs à poser | SP5, ComptIAA | onglet « Plan de comptage » du bilan |
+| R6 | Utilités industrielles : air comprimé, moteurs, vapeur ; cibles et seuils d'alerte des IPE | SP3, SP4, SP5, ADEME | graphe, simulateur, page « Performance (IPE) » |
+| R7 | Kit de sensibilisation : messages préparés d'après les données, approuvés par un humain | SP6 | onglet « Sensibilisation » |
+
+**R1 — bilan énergétique** (`app/services/energy_balance.py`).
+- **Bilan par énergie** sur 12 mois :
+  - consommation, coût en € HT (abonnements compris, au prix du contrat F6) et émissions ;
+  - parts de chaque énergie dans la consommation et dans la facture ;
+  - ratios kWh/m² et kWh (ou €) par unité produite.
+- **Poids économique de l'énergie** :
+  - facture / chiffre d'affaires, un indicateur à suivre à chaque exercice au-delà de 2 % ;
+  - facture / EBE, qui traduit l'impact direct sur la marge : 10 % d'économie sur la facture se lit en points d'EBE.
+- **Répartition par usage** :
+  - chaque part dit sa provenance (norme NF EN 16247) : « calculé » (modèle de consommation et DJU), « estimé »
+    (puissance × durée type) ou « par différence » ;
+  - le Pareto propose comme **usages énergétiques significatifs** (UES, ISO 50001) les usages qui cumulent 80 %
+    de la consommation. Le référent énergie confirme.
+- **Puissance souscrite** : comparée au maximum atteint sur 12 mois, en moyenne 30 min, convertie en kVA avec
+  cos φ = 0,93 (seuil de l'énergie réactive) et une marge de 15 % pour les pointes au pas 10 min.
+  - Diagnostic : dépassements probables, marge faible, puissance surdimensionnée ou adaptée.
+  - Le gain d'un ajustement se chiffre avec la part fixe de l'acheminement (€/kVA/an) lue sur le contrat.
+
+**R2 — plan d'actions** (`app/services/action_plan.py`, `app/services/economics.py`).
+
+Une action est saisie par l'auditeur ou par le responsable énergie : directement, depuis un geste du simulateur
+(bouton « Inscrire ces actions au plan d'actions ») ou depuis une recommandation validée. Elle porte :
+- **chiffrage** : économies par énergie (une surconsommation est négative), gain ou coût récurrent, investissement,
+  situation de référence (rentabilité du seul surinvestissement, ex. moteur neuf contre rebobinage), durée de vie,
+  CEE en kWh cumac et fiche de référence ;
+- **classement** : famille (éclairage, air comprimé, froid…), nature (conception, technique,
+  pilotage-maintenance, organisationnelle), horizon (court terme, moyen terme, pour mémoire), priorité
+  (prioritaire, ambitieuse, très ambitieuse) ;
+- **cotation sur 100** : faisabilité économique (suggérée d'après le retour), technique et risques notées de 1 à 4,
+  plus les co-bénéfices (sécurité, maintenance, réglementation, productivité, environnement…). Le ROI n'est pas le
+  seul critère ;
+- **fiche QQOQPCC** : Qui (un seul responsable), Quoi, Où (lieu, équipement du graphe), Quand (une date, jamais
+  « asap »), Pourquoi, Combien, Comment, contacts à prendre, besoins en formation, documentation, surveillance ;
+- **avancement** : identifiée, planifiée, en cours, réalisée, vérifiée, abandonnée. Une action planifiée exige un
+  responsable et une échéance ; une action vérifiée, un plan de mesure et vérification.
+
+Rentabilité, comme énergieSIM :
+- TRB = investissement / gain annuel net ;
+- VAN sur la durée d'analyse (au plus la durée de vie), au taux d'actualisation choisi ;
+- TRI et temps de retour actualisé ;
+- chaque indicateur sans et avec CEE (déduits de l'investissement).
+
+Paramètres par organisation : taux d'actualisation (10 % par défaut), durée d'analyse (10 ans), évolution du prix
+de l'énergie (constant, +2 %/an, +5 %/an ou personnalisé), valorisation des CEE.
+
+Synthèse du plan, comme le canevas de la formation :
+- **court terme** et **moyen terme** : le moyen terme reprend le court terme, les actions « pour mémoire » restent
+  hors plan ;
+- MWh/an, € HT/an et part de la facture, investissement, CEE, retour, VAN et TRI ;
+- un graphique des flux cumulés bruts et actualisés ;
+- des alertes de revue : échéance dépassée, action à planifier, action réalisée sans plan de vérification ;
+- une **note de synthèse pour la direction** (HTML imprimable) : chiffres du plan et arguments par enjeu.
+  L'accord CEE avec l'obligé se signe avant toute commande (rôle actif et incitatif).
+
+**R3 — management de l'énergie** (`app/services/energy_management.py`).
+- **Auto-évaluation** : 38 questions, 12 thèmes, 5 axes PDCA de l'ISO 50001, démarche inspirée de la check-list
+  énergie CHECK de l'ATEE (questions reformulées).
+  - Réponses : tout à fait, partiellement, pas du tout, non applicable (exclue).
+  - Pour chaque question, la plateforme montre ce que ses données en disent (« indices ») ; elle ne répond jamais
+    à la place du référent.
+  - Les évaluations s'additionnent pour suivre la progression ; les thèmes sous 50 % renvoient vers la page
+    EffiSmart qui y répond.
+- **Socle** :
+  - politique énergétique et date de validation par la direction, périmètre ;
+  - équipe énergie (rôles, missions) ;
+  - objectifs SMART, chacun signalé s'il manque un indicateur, une cible, une échéance ou un responsable ;
+  - périodicité de la revue énergétique, avec alerte de retard.
+
+**R4 — mesure et vérification** (`action_plan.suggest_mv`). Plan IPMVP en 13 points ; la plateforme suggère, un
+humain enregistre :
+- **option C** (compteur général) si les économies attendues dépassent 10 % de la consommation du compteur ;
+- sinon **option B** si l'équipement a son sous-compteur, **option A** autrement ;
+- **budget de M&V** : moins de 10 % des économies annuelles ;
+- **précision** : critère « 90/10 ».
+
+Vérification d'une action réalisée : par la mesure avant / après validée de la recommandation d'origine (F1), ou
+par l'IPE de vérification relié à l'action (12 mois avant, mois écoulés depuis).
+
+**R5 — plan de comptage** (`app/services/metering_plan.py`).
+- **Niveau** : 1, compteurs et factures ; 2, sous-comptage des postes clés ; 3, chaque usage significatif mesuré.
+- **Données de chaque compteur** : courbe 30 min, index journaliers, factures ou rien.
+- **Recoupement** : un sous-compteur est relié à son compteur général dans le graphe (« alimente »). La part non
+  mesurée est un compteur virtuel « général − sous-compteurs » ; si les sous-compteurs dépassent le général,
+  l'incohérence est signalée.
+- **Sous-compteurs à poser** : usages significatifs sans comptage propre, avec un coût indicatif (cas de la
+  formation : 10 sous-compteurs électriques, 9 000 € HT).
+- **Les 4 étapes ComptIAA**, cochées d'après les données.
+
+**R6 — utilités industrielles et IPE.**
+- **Graphe des équipements** : compresseur d'air, pompes, ventilateurs et moteurs ; fluide et usage « air comprimé ».
+- **Bibliothèque de gestes** : 14 gestes industriels, chacun avec sa famille, sa fiche CEE de référence et sa durée
+  de vie ; ordres de grandeur ADEME diffusés par la formation. Exemples :
+  - fuites d'air comprimé, souvent 40 à 50 % de la consommation, acceptable sous 15 % ;
+  - baisse de pression ;
+  - variateurs de vitesse sur pompes et ventilateurs (IND-UT-102) ;
+  - calorifugeage des points singuliers (IND-UT-121) ;
+  - économiseur ;
+  - HP flottante ;
+  - free-cooling ;
+  - sous-comptage.
+- **IPE validé** : un humain fixe sa **valeur cible** et un **seuil d'alerte** (+10 % par défaut). EffiSmart affiche
+  « cible atteinte », « au-dessus de la cible » ou « seuil d'alerte dépassé », et compte les mois hors seuil.
+- **Repères des utilités** affichés quand la variable s'y prête :
+  - air comprimé : 110 à 125 Wh/Nm³ à 7 bars ;
+  - vapeur : 950 kWh PCS/t ;
+  - eau chaude : 95 kWh PCS/m³.
+
+**R7 — sensibilisation** (`energy_management.generate_drafts`). Messages préparés d'après les données du site,
+selon la communication engageante : un message, un chiffre, un geste.
+- **Sources** :
+  - consommation hors activité de l'électricité ;
+  - économies mesurées et validées ;
+  - action réalisée ;
+  - IPE en amélioration ;
+  - coût d'une fuite d'air de 1 mm à 7 bars.
+- **Relecture** : un brouillon n'est visible que de l'auditeur et du responsable énergie, qui l'ajustent puis
+  l'approuvent (principe P1). Un message approuvé s'imprime en affiche A4.
+
+Démo :
+- **Finances** : chiffre d'affaires et EBE des trois clients.
+- **Plans d'actions** : Boulangeries Martin, Clinique du Parc (avec CEE), Logistique Rhône.
+- **Management de l'énergie** : socle des Boulangeries et de la Clinique, et leurs auto-évaluations (deux pour la
+  Clinique, pour montrer la progression).
+- **Sensibilisation** : messages à relire pour l'Atelier central et le Bâtiment principal.
+- **Mise à niveau** : idempotente, faite au démarrage de l'interface.
+
 ## Principe 1 : la plateforme propose, un humain décide
 
 Toute sortie algorithmique (anomalie, recommandation d'optimisation, prévision) est présentée avec son

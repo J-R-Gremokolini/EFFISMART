@@ -9,6 +9,10 @@ Un IPE rapporte une consommation (toutes énergies, électricité ou gaz) à ce 
     facteurs, apprise sur l'année de référence (SER). Préférable dès qu'une part de la consommation ne dépend pas
     du facteur (talon) : un ratio simple varierait alors avec l'activité, même sans gain réel.
 
+Module référent énergie (formation PRO-REFEI, SP5) : un humain fixe à un IPE validé sa valeur cible et un seuil d'alerte autour
+de la cible (+10 % par défaut) ; au-delà, le référent énergie analyse la cause. Repères des utilités industrielles
+(air comprimé, vapeur, eau chaude) affichés quand la variable de l'IPE s'y prête.
+
 L'IA de la plateforme propose des IPE : sur les 12 à 24 derniers mois, elle teste chaque facteur disponible par
 régression, garde ceux qui expliquent la consommation (R² ≥ 0,5, effet positif), essaie les couples de facteurs,
 choisit le modèle qui prédit le mieux les mois retirés de l'apprentissage (validation croisée « un mois retiré »),
@@ -61,6 +65,14 @@ RATIO_MAX_INTERCEPT_SHARE = 0.15  # talon au-delà duquel un ratio simple trompe
 MIN_VARIABLE_SHARE = 0.20  # le facteur doit expliquer au moins 20 % de la consommation, sinon l'IPE reste plat
 PAIR_GAIN = 0.10  # un second facteur doit réduire l'erreur hors échantillon d'au moins 10 %
 REJECTION_MEMORY_DAYS = 180
+DEFAULT_ALERT_THRESHOLD = 0.10  # SP5 : « seuil d'alerte à +10 % » (retour d'expérience d'une industrie agroalimentaire)
+# Repères des utilités (formation PRO-REFEI, SP5 ; ADEME) : mots-clés de la variable, énergie, repère, plage en kWh.
+UTILITY_BENCHMARKS = [
+    (("nm3", "nm³"), "ELEC", "Air comprimé à 7 bars : 110 à 125 Wh par Nm³ ; de nombreuses installations dépassent "
+     "200 Wh/Nm³ (ADEME).", (0.110, 0.125)),
+    (("vapeur",), "GAS", "Vapeur à 5 bars : environ 950 kWh PCS par tonne de vapeur.", (0.0, 950.0)),
+    (("eau chaude",), "GAS", "Eau chaude à 80 °C : environ 95 kWh PCS par m³.", (0.0, 95.0)),
+]
 
 
 class IpeDefinitionError(ValueError):
@@ -287,6 +299,89 @@ def evaluate(db: Session, definition: IpeDefinition, weather: WeatherProvider | 
     if base_used < 12:
         value.notes.append(f"Référence {year} : {base_used} mois complets.")
     return value
+
+
+def period_value(db: Session, definition: IpeDefinition, months: list[date],
+                 weather: WeatherProvider | None) -> tuple[float | None, int]:
+    """Valeur de l'IPE sur des mois donnés (vérification avant / après d'une action) et nombre de mois utilisés."""
+    if not months:
+        return None, 0
+    site = definition.site
+    energy = monthly_energy(db, site, definition.energy, months)
+    series = [driver_series(db, site, d, months, weather) for d in definition.drivers]
+    value, _, used = _period_value(definition, energy, series, months)
+    return value, used
+
+
+# --- Valeur cible et seuil d'alerte (SP5) --------------------------------------------------------------------
+
+
+@dataclass
+class TargetStatus:
+    target: float
+    threshold: float
+    current: float
+    gap: float  # écart relatif à la cible (négatif = mieux que la cible)
+    status: str  # ON_TARGET, WATCH, ALERT
+    months_over: int  # mois des 12 derniers au-delà du seuil d'alerte
+    message: str
+
+
+TARGET_LABELS = {"ON_TARGET": ("Cible atteinte", "success"), "WATCH": ("Au-dessus de la cible", "warning"),
+                 "ALERT": ("Seuil d'alerte dépassé", "danger")}
+
+
+def target_status(definition: IpeDefinition, value: IpeValue) -> TargetStatus | None:
+    """Position de l'IPE par rapport à sa cible : un IPE plus bas est meilleur (moins d'énergie par unité)."""
+    if definition.target_value is None or value.current is None or definition.target_value <= 0:
+        return None
+    target = definition.target_value
+    threshold = definition.alert_threshold_pct if definition.alert_threshold_pct is not None else DEFAULT_ALERT_THRESHOLD
+    limit = target * (1 + threshold)
+    gap = (value.current - target) / target
+    months_over = sum(1 for m in value.monthly if m.get("value") is not None and m["value"] > limit)
+    if value.current <= target:
+        status, message = "ON_TARGET", "L'IPE des 12 derniers mois atteint la valeur cible."
+    elif value.current <= limit:
+        status, message = "WATCH", (f"L'IPE dépasse la cible de {fr(gap * 100, 1)} %, sous le seuil d'alerte "
+                                    f"(+{fr(threshold * 100)} %).")
+    else:
+        status, message = "ALERT", (f"L'IPE dépasse la cible de {fr(gap * 100, 1)} %, au-delà du seuil d'alerte "
+                                    f"(+{fr(threshold * 100)} %) : le référent énergie en analyse la cause.")
+    if months_over:
+        message += f" {months_over} mois sur 12 au-delà du seuil."
+    return TargetStatus(target, threshold, value.current, gap, status, months_over, message)
+
+
+def set_target(db: Session, repo: TenantRepository, user: User, definition_id: int, target: float | None,
+               threshold: float | None = None) -> IpeDefinition:
+    """Valeur cible (« IPÉ visé », révisée régulièrement) et seuil d'alerte d'un IPE validé ; vide = sans cible."""
+    _require_editor(user)
+    definition = repo.get_ipe_definition(definition_id)
+    if definition.status != ReviewStatus.VALIDATED:
+        raise IpeDefinitionError("Fixez une cible à un IPE validé.")
+    if target is not None and target <= 0:
+        raise IpeDefinitionError("La valeur cible doit être positive.")
+    if threshold is not None and not 0 < threshold <= 0.5:
+        raise IpeDefinitionError("Le seuil d'alerte est compris entre 1 et 50 % au-dessus de la cible.")
+    definition.target_value = target
+    definition.alert_threshold_pct = threshold if target is not None else None
+    db.commit()
+    return definition
+
+
+def benchmark_for(db: Session, definition: IpeDefinition) -> tuple[str, tuple[float, float]] | None:
+    """Repère d'utilité industrielle pour un ratio dont la variable s'y prête (ex. kWh élec par Nm³ d'air)."""
+    if definition.kind != IpeKind.RATIO or not definition.drivers[0].startswith("VAR:"):
+        return None
+    variable = db.get(IpeVariable, int(definition.drivers[0].split(":", 1)[1]))
+    if variable is None:
+        return None
+    text = f"{variable.name} {variable.unit}".lower()
+    for keywords, energy, label, bounds in UTILITY_BENCHMARKS:
+        if any(k in text for k in keywords) and definition.energy in (energy, "ALL"):
+            return label, bounds
+    return None
 
 
 # --- Variables personnalisées et IPE créés par un humain ------------------------------------------------------

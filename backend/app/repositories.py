@@ -14,14 +14,19 @@ from app.models import (
     ActionLog,
     AssetNode,
     AuditorClientLink,
+    CommunicationMessage,
+    CommunicationStatus,
     Consent,
     DeliveryPoint,
     Document,
     DocumentStatus,
     Drift,
     DriftStatus,
+    EnergyAction,
+    EnergyManagement,
     ExportJob,
     IpeDefinition,
+    MaturityAssessment,
     Organization,
     Prediction,
     QuarterlyReport,
@@ -242,6 +247,44 @@ class TenantRepository:
 
     def get_report(self, report_id: int) -> QuarterlyReport:
         return self._one(self._reports_stmt().where(QuarterlyReport.id == report_id))
+
+    # --- Module référent énergie (plan d'actions, management de l'énergie, sensibilisation) --------------------
+
+    def list_actions(self, organization_id: int, site_id: int | None = None) -> list[EnergyAction]:
+        stmt = select(EnergyAction).where(EnergyAction.organization_id == organization_id,
+                                          self.org_clause(EnergyAction.organization_id))
+        if site_id is not None:
+            stmt = stmt.where(EnergyAction.site_id == site_id)
+        return list(self.db.scalars(stmt.order_by(EnergyAction.site_id, EnergyAction.id)))
+
+    def get_action(self, action_id: int) -> EnergyAction:
+        return self._one(select(EnergyAction).where(EnergyAction.id == action_id,
+                                                    self.org_clause(EnergyAction.organization_id)))
+
+    def list_assessments(self, organization_id: int) -> list[MaturityAssessment]:
+        return list(self.db.scalars(select(MaturityAssessment).where(
+            MaturityAssessment.organization_id == organization_id, self.org_clause(MaturityAssessment.organization_id))
+            .order_by(MaturityAssessment.created_at.desc(), MaturityAssessment.id.desc())))
+
+    def get_management(self, organization_id: int) -> EnergyManagement | None:
+        org = self.get_organization(organization_id)
+        return self.db.scalar(select(EnergyManagement).where(EnergyManagement.organization_id == org.id))
+
+    def _messages_stmt(self) -> Select:
+        """R7 : un message préparé par la plateforme n'est vu que de ses relecteurs tant qu'il n'est pas approuvé."""
+        stmt = select(CommunicationMessage).where(self.org_clause(CommunicationMessage.organization_id))
+        if not sees_unvalidated(self.user):
+            stmt = stmt.where(CommunicationMessage.status == CommunicationStatus.APPROVED)
+        return stmt
+
+    def list_messages(self, organization_id: int, site_id: int | None = None) -> list[CommunicationMessage]:
+        stmt = self._messages_stmt().where(CommunicationMessage.organization_id == organization_id)
+        if site_id is not None:
+            stmt = stmt.where(CommunicationMessage.site_id == site_id)
+        return list(self.db.scalars(stmt.order_by(CommunicationMessage.created_at.desc(), CommunicationMessage.id.desc())))
+
+    def get_message(self, message_id: int) -> CommunicationMessage:
+        return self._one(self._messages_stmt().where(CommunicationMessage.id == message_id))
 
     # --- Graphe physique des équipements -----------------------------------------------------
 

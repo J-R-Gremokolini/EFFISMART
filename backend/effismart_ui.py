@@ -31,8 +31,11 @@ from app.config import settings  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
 from app.local import catch_up, prepare_database  # noqa: E402
 from app.models import (  # noqa: E402
+    ActionStatus,
     AdjustmentKind,
     AssetNodeKind,
+    Auditor,
+    CommunicationStatus,
     IpeKind,
     DeadlineStatus,
     DeclaredSource,
@@ -69,6 +72,7 @@ from app.services import anomaly_context, assets, dashboard, integrations, onboa
 from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
 from app.services import energy_data, ipe, quarterly_reports, simulator, site_plan, tariffs  # noqa: E402
+from app.services import action_plan, economics, energy_balance, energy_management, metering_plan  # noqa: E402
 from app.services import ipe_definitions as ipe_defs  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
@@ -187,13 +191,19 @@ PAGE_IPE = "Performance (IPE)"
 PAGE_TRAJECTORY = "Trajectoire 2030"
 PAGE_SIMULATOR = "Simulateur"
 PAGE_REPORTS = "Rapports trimestriels"
-AUDITOR_PAGES = [PAGE_PORTFOLIO, PAGE_DASHBOARD, PAGE_MONTHLY, PAGE_VALIDATION, PAGE_DRIFTS, PAGE_RECOMMENDATIONS,
-                 PAGE_PREDICTIONS, PAGE_TRAJECTORY, PAGE_IPE, PAGE_SIMULATOR, PAGE_ASSETS, PAGE_DOCUMENTS,
-                 PAGE_REPORTS, PAGE_REGULATORY, PAGE_EXPORTS, PAGE_MANAGE, PAGE_NEW_CLIENT, PAGE_INTEGRATIONS]
-CLIENT_PAGES = [PAGE_DASHBOARD, PAGE_MONTHLY, PAGE_DRIFTS, PAGE_RECOMMENDATIONS, PAGE_PREDICTIONS, PAGE_TRAJECTORY,
-                PAGE_IPE, PAGE_ASSETS, PAGE_DOCUMENTS, PAGE_REPORTS, PAGE_EXPORTS]
+# Module référent énergie (formation PRO-REFEI de l'ATEE)
+PAGE_BALANCE = "Bilan énergétique"
+PAGE_ACTIONS = "Plan d'actions"
+PAGE_MANAGEMENT = "Management de l'énergie"
+AUDITOR_PAGES = [PAGE_PORTFOLIO, PAGE_DASHBOARD, PAGE_MONTHLY, PAGE_BALANCE, PAGE_VALIDATION, PAGE_DRIFTS,
+                 PAGE_RECOMMENDATIONS, PAGE_PREDICTIONS, PAGE_TRAJECTORY, PAGE_IPE, PAGE_SIMULATOR, PAGE_ACTIONS,
+                 PAGE_MANAGEMENT, PAGE_ASSETS, PAGE_DOCUMENTS, PAGE_REPORTS, PAGE_REGULATORY, PAGE_EXPORTS, PAGE_MANAGE,
+                 PAGE_NEW_CLIENT, PAGE_INTEGRATIONS]
+CLIENT_PAGES = [PAGE_DASHBOARD, PAGE_MONTHLY, PAGE_BALANCE, PAGE_DRIFTS, PAGE_RECOMMENDATIONS, PAGE_PREDICTIONS,
+                PAGE_TRAJECTORY, PAGE_IPE, PAGE_ACTIONS, PAGE_MANAGEMENT, PAGE_ASSETS, PAGE_DOCUMENTS, PAGE_REPORTS,
+                PAGE_EXPORTS]
 # Le responsable énergie du client a en plus la file de validation (principe P1) et le simulateur.
-ENERGY_MANAGER_PAGES = [PAGE_DASHBOARD, PAGE_VALIDATION, *CLIENT_PAGES[1:7], PAGE_SIMULATOR, *CLIENT_PAGES[7:]]
+ENERGY_MANAGER_PAGES = [PAGE_DASHBOARD, PAGE_VALIDATION, *CLIENT_PAGES[1:8], PAGE_SIMULATOR, *CLIENT_PAGES[8:]]
 
 
 def pages_for(user: User) -> list[str]:
@@ -2506,6 +2516,7 @@ def custom_ipe_cards(db: Session, repo: TenantRepository, user: User, definition
             card["pct"] = value.variation * 100
         cards.append(card)
     ui.kpi_grid(cards)
+    ipe_targets(db, repo, user, definitions, weather)
     removable = [d for d in definitions if d.origin == "USER"]
     if removable and ipe.can_enter_variables(user):
         with st.popover("Retirer un IPE créé"):
@@ -2515,6 +2526,46 @@ def custom_ipe_cards(db: Session, repo: TenantRepository, user: User, definition
                 ipe_defs.delete_definition(db, repo, user, chosen)
                 flash("IPE retiré.")
                 st.rerun()
+
+
+def ipe_targets(db: Session, repo: TenantRepository, user: User, definitions: list, weather) -> None:
+    """Valeur cible, seuil d'alerte (formation PRO-REFEI, SP5) et repères des utilités industrielles."""
+    rows = []
+    for definition in definitions:
+        value = ipe_defs.evaluate(db, definition, weather)
+        status = ipe_defs.target_status(definition, value)
+        benchmark = ipe_defs.benchmark_for(db, definition)
+        if status is None and benchmark is None:
+            continue
+        cell = "—"
+        if status is not None:
+            label, tone = ipe_defs.TARGET_LABELS[status.status]
+            cell = ui.status(label, tone) + f"<span class='sub'>{ui.e(status.message)}</span>"
+        rows.append([ui.e(definition.name),
+                     ui.e(fmt_number(definition.target_value, 3 if definition.target_value < 10 else 1))
+                     if definition.target_value else "—", cell, ui.e(benchmark[0]) if benchmark else "—"])
+    if rows:
+        ui.table(["IPE", "Valeur cible", "Position", "Repère"], rows)
+    if not ipe.can_enter_variables(user):
+        return
+    with st.popover("Cible et seuil d'alerte"):
+        labels = {d.id: d.name for d in definitions}
+        chosen = st.selectbox("IPE", list(labels), format_func=labels.get, key=f"ipe-target-{definitions[0].site_id}")
+        definition = next(d for d in definitions if d.id == chosen)
+        with st.form(f"ipe-target-form-{chosen}"):
+            target = st.number_input("Valeur cible (IPE visé)", min_value=0.0, value=float(definition.target_value or 0.0),
+                                     format="%.3f", help="0 = pas de cible. À réviser régulièrement : elle traduit la "
+                                                         "volonté d'amélioration.")
+            threshold = st.number_input("Seuil d'alerte au-dessus de la cible (%)", min_value=1.0, max_value=50.0,
+                                        value=float((definition.alert_threshold_pct or 0.10) * 100), step=1.0)
+            if st.form_submit_button("Enregistrer", type="primary"):
+                try:
+                    ipe_defs.set_target(db, repo, user, chosen, target or None, threshold / 100)
+                except ipe_defs.IpeDefinitionError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("Cible enregistrée : au-delà du seuil d'alerte, le référent énergie en analyse la cause.")
+                    st.rerun()
 
 
 def ipe_proposal_html(db: Session, definition) -> str:
@@ -2852,6 +2903,21 @@ def page_simulator(db: Session, repo: TenantRepository, user: User, org: Organiz
               for line in results["lines"]], numeric={2, 3, 4})
     st.caption("Sur un même usage, les gestes se cumulent sans double compte : 1 − (1 − a)(1 − b)… La colonne « Économie "
                "seule » montre chaque geste pris isolément.")
+    if action_plan.can_edit(user) and st.button("Inscrire ces actions au plan d'actions", icon=":material/playlist_add:",
+                                                key=f"sim-to-plan-{site.id}"):
+        created, skipped = 0, []
+        for template_id in chosen:
+            try:
+                action_plan.from_template(db, repo, user, site.id, by_id[template_id], breakdowns)
+                created += 1
+            except action_plan.ActionPlanError:
+                skipped.append(by_id[template_id].title)
+        for rec_id in picked:
+            action_plan.from_recommendation(db, repo, user, recs[rec_id])
+            created += 1
+        flash(f"{created} action(s) inscrite(s) au plan d'actions, à chiffrer finement et à planifier."
+              + (f" Sans objet sur ce site : {', '.join(skipped)}." if skipped else ""))
+        st.rerun()
     trajectories = [t for t in repo.list_trajectories(org.id) if t.site_id == site.id and t.status != ReviewStatus.SUPERSEDED]
     if trajectories:
         t = trajectories[0]
@@ -3200,6 +3266,859 @@ def page_new_client(db: Session, user: User) -> None:
                 goto(PAGE_MANAGE, org.id)
 
 
+# --- Module référent énergie (formation PRO-REFEI de l'ATEE) ---------------------------------------------------
+
+
+def balance_table(balance) -> None:
+    ui.table(["Énergie", "Consommation", "Part", "Coût € HT", "Part de la facture", "Prix moyen", "Émissions", "Prix"],
+             [[ui.e(FLUID_LABELS[line.fluid]), ui.e(fmt_energy(line.kwh)), ui.e(f"{fmt_number(balance.kwh_share(line) * 100)} %"),
+               ui.e(fmt_eur(line.eur)), ui.e(f"{fmt_number(balance.eur_share(line) * 100)} %"),
+               ui.e(f"{fmt_number(line.price, 3)} €/kWh"), ui.e(fmt_emissions(line.kgco2e)),
+               ui.status({"contrat": "Contrat", "partiel": "Contrat partiel", "indicatif": "Indicatif"}[line.pricing],
+                         "success" if line.pricing == "contrat" else "warning")]
+              for line in balance.lines]
+             + [["<b>Total</b>", f"<b>{ui.e(fmt_energy(balance.total_kwh))}</b>", "100 %",
+                 f"<b>{ui.e(fmt_eur(balance.total_eur))}</b>", "100 %",
+                 ui.e(f"{fmt_number(balance.total_eur / balance.total_kwh, 3)} €/kWh") if balance.total_kwh else "—",
+                 f"<b>{ui.e(fmt_emissions(balance.total_kgco2e))}</b>", ""]],
+             numeric={1, 2, 3, 4, 5, 6})
+
+
+def finances_section(db: Session, repo: TenantRepository, user: User, org: Organization, bill_eur: float) -> None:
+    st.header("Poids économique de l'énergie")
+    weight = energy_balance.financial_weight(org, bill_eur)
+    if weight is None:
+        st.caption("Saisissez le chiffre d'affaires et l'excédent brut d'exploitation (EBE) du dernier exercice : la "
+                   "facture énergétique rapportée à l'EBE traduit l'impact direct de l'énergie sur la marge.")
+    else:
+        cards = [{"label": "Facture énergétique (12 mois)", "value": fmt_eur(bill_eur), "icon": "cost",
+                  "note": f"exercice {weight.year}" if weight.year else ""}]
+        if weight.share_revenue is not None:
+            cards.append({"label": "Part du chiffre d'affaires", "value": f"{fmt_number(weight.share_revenue * 100, 1)} %",
+                          "icon": "total", "note": "à suivre au-delà de 2 %"})
+        if weight.share_ebitda is not None:
+            cards.append({"label": "Part de l'EBE", "value": f"{fmt_number(weight.share_ebitda * 100, 1)} %",
+                          "icon": "total", "note": "impact opérationnel direct"})
+        ui.kpi_grid(cards)
+        for message in weight.messages:
+            st.caption(message)
+    if ipe.can_enter_variables(user):
+        with st.popover("Chiffre d'affaires et EBE"):
+            with st.form(f"finances-{org.id}"):
+                revenue = st.number_input("Chiffre d'affaires (€)", min_value=0.0, value=float(org.revenue_eur or 0.0),
+                                          step=100_000.0)
+                ebitda = st.number_input("Excédent brut d'exploitation (€)", value=float(org.ebitda_eur or 0.0),
+                                         step=10_000.0, help="Chiffre d'affaires − achats − salaires et charges.")
+                year = st.number_input("Exercice", min_value=2000, max_value=today_local().year,
+                                       value=org.finance_year or today_local().year - 1)
+                if st.form_submit_button("Enregistrer", type="primary"):
+                    try:
+                        energy_balance.set_finances(db, repo, user, org.id, revenue_eur=revenue or None,
+                                                    ebitda_eur=ebitda or None, year=int(year))
+                    except energy_balance.BalanceError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("Données financières enregistrées.")
+                        st.rerun()
+
+
+def pareto_chart(rows) -> None:
+    data = pd.DataFrame([{"Usage": r.label, "MWh": r.kwh / 1000, "Cumul (%)": r.cumulative * 100,
+                          "UES": "UES proposé" if r.significant else "Autre usage"} for r in rows])
+    order = [r.label for r in rows]
+    bars = alt.Chart(data).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=alt.X("Usage:N", sort=order, title=None, axis=alt.Axis(labelAngle=-30)),
+        y=alt.Y("MWh:Q", title="MWh sur 12 mois"),
+        color=alt.Color("UES:N", title=None, legend=alt.Legend(columnPadding=28),
+                        scale=alt.Scale(domain=["UES proposé", "Autre usage"], range=[ui.PRIMARY, ui.MUTED])),
+        tooltip=["Usage", alt.Tooltip("MWh:Q", format=",.1f"), alt.Tooltip("Cumul (%):Q", format=".0f")])
+    line = alt.Chart(data).mark_line(point=True, color=ui.SERIES_2).encode(
+        x=alt.X("Usage:N", sort=order), y=alt.Y("Cumul (%):Q", title="Cumul (%)", scale=alt.Scale(domain=[0, 100])))
+    rule = alt.Chart(pd.DataFrame({"y": [80]})).mark_rule(strokeDash=[4, 4], color=ui.MUTED).encode(y="y:Q")
+    chart = alt.layer(bars, alt.layer(line, rule)).resolve_scale(y="independent").properties(height=260)
+    st.altair_chart(style_chart(chart), width="stretch")
+
+
+def usages_tab(db: Session, user: User, site: Site) -> list:
+    if not sees_unvalidated(user):
+        st.caption("La répartition par usage est une estimation : votre auditeur ou votre responsable énergie la "
+                   "consolide (simulateur) avant de la présenter.")
+        return []
+    weather = integrations.weather_provider(db)
+    with st.spinner("Répartition de la consommation par usage…"):
+        breakdowns = simulator.breakdown(db, site, weather)
+    rows, notes = energy_balance.usage_pareto(breakdowns)
+    if not rows:
+        st.caption("Pas assez de données pour répartir la consommation par usage.")
+        return []
+    pareto_chart(rows)
+    ui.table(["Usage", "Consommation", "Part", "Cumul", "Coût € HT", "Provenance", "UES"],
+             [[ui.e(r.label), ui.e(fmt_energy(r.kwh)), ui.e(f"{fmt_number(r.share * 100)} %"),
+               ui.e(f"{fmt_number(r.cumulative * 100)} %"), ui.e(fmt_eur(r.eur)), ui.e(", ".join(r.sources)),
+               ui.status("Proposé", "success") if r.significant else ""] for r in rows], numeric={1, 2, 3, 4})
+    for note in notes:
+        st.caption(note)
+    st.caption("Provenance de chaque part (norme NF EN 16247) : « calculé » par le modèle de consommation et les "
+               "degrés-jours, « estimé » par puissance × durée type de fonctionnement, « par différence » pour le "
+               "reste de la consommation mesurée. Ajustez les parts dans le simulateur.")
+    return rows
+
+
+def metering_tab(db: Session, site: Site, end: date, rows: list) -> None:
+    assessment = metering_plan.assess(db, site, end, rows)
+    ui.kpi_grid([
+        {"label": "Niveau du plan de comptage", "value": f"{assessment.level} / 3", "icon": "check",
+         "note": assessment.level_label},
+        {"label": "Suivie par compteur communicant", "value": f"{fmt_number(assessment.smart_share * 100)} %",
+         "icon": "elec", "note": "courbe 30 min ou index journaliers (N1)"},
+        {"label": "Sous-compteurs à envisager", "value": str(len(assessment.suggestions)), "icon": "total",
+         "note": "usages significatifs sans comptage propre"},
+    ])
+    ui.render("".join(f"<div class='es-output-gain'>{ui.status('Fait', 'success') if s['done'] else ui.status('À faire', 'warning')} "
+                      f"<b>{ui.e(s['title'])}</b> — {ui.e(s['detail'])}</div>" for s in assessment.steps))
+    ui.table(["Compteur", "Données", "Consommation 12 mois", "Rôle"],
+             [[ui.e(m.name), ui.e(m.data), ui.e(fmt_energy(m.kwh)),
+               "sous-compteur" if m.parent_id else "compteur général"]
+              for m in assessment.meters], numeric={2})
+    for rec in assessment.reconciliations:
+        tone = "danger" if rec.status == "INCOHERENT" else "success"
+        ui.render(f"<div class='es-output-gain'>{ui.status('Incohérence' if rec.status == 'INCOHERENT' else 'Recoupement', tone)} "
+                  f"<b>{ui.e(rec.main.name)}</b> : {ui.e(rec.message)}</div>")
+    if assessment.measured_usages:
+        st.caption("Usages mesurés par un compteur dédié : " + ", ".join(
+            f"{simulator.USAGE_LABELS.get(u, u)} ({name})" for u, name in assessment.measured_usages.items()) + ".")
+    if assessment.suggestions:
+        st.markdown("**Sous-compteurs à poser en priorité**")
+        ui.table(["Usage significatif", "Part de la consommation", "Équipements concernés", "Coût indicatif"],
+                 [[ui.e(s.label), ui.e(f"{fmt_number(s.share * 100)} %"), ui.e(", ".join(s.equipment) or "à décrire dans le graphe"),
+                   ui.e(s.cost_hint)] for s in assessment.suggestions], numeric={1})
+    for note in assessment.notes:
+        st.caption(note)
+    st.caption("Méthode ComptIAA en 4 étapes, en amélioration continue : un plan de comptage se déploie "
+               "progressivement et se recoupe (la somme des sous-compteurs ne dépasse pas le compteur général).")
+
+
+def power_tab(db: Session, site: Site) -> None:
+    checks = energy_balance.power_checks(db, site)
+    if not checks:
+        st.caption("Aucun point électricité à courbe de charge avec une puissance souscrite connue.")
+        return
+    price = st.number_input("Part fixe de l'acheminement (€ par kVA souscrit et par an, voir le contrat)", min_value=0.0,
+                            value=0.0, step=1.0, key=f"kva-price-{site.id}",
+                            help="Sert à chiffrer le gain d'un ajustement ; laissez 0 pour un diagnostic en kVA.")
+    for check in checks:
+        label, tone = energy_balance.STATUS_LABELS[check.status]
+        with st.container(border=True):
+            st.markdown(f"**Électricité {check.delivery_point.external_ref}** {ui.status(label, tone)}",
+                        unsafe_allow_html=True)
+            ui.kpi_grid([
+                {"label": "Puissance souscrite", "value": f"{fmt_number(check.subscribed_kva)} kVA", "icon": "elec"},
+                {"label": "Maximum atteint (30 min)", "value": f"{fmt_number(check.max_kva)} kVA", "icon": "elec",
+                 "note": f"{fmt_number(check.max_kw)} kW"},
+                {"label": "Puissance suggérée", "value": f"{fmt_number(check.suggested_kva)} kVA" if check.suggested_kva
+                 else "—", "icon": "check",
+                 "note": f"gain {fmt_eur(check.yearly_gain(price))}/an" if price and check.yearly_gain(price) else ""},
+            ])
+            data = pd.DataFrame([{"Mois": fmt_month(m), "kVA": kw / energy_balance.COS_PHI}
+                                 for m, kw in check.monthly_max_kw.items()])
+            order = list(data["Mois"])
+            bars = alt.Chart(data).mark_bar(color=ui.PRIMARY).encode(
+                x=alt.X("Mois:N", sort=order, title=None), y=alt.Y("kVA:Q", title="Maximum mensuel (kVA)"),
+                tooltip=["Mois", alt.Tooltip("kVA:Q", format=",.0f")])
+            rule = alt.Chart(pd.DataFrame({"kVA": [check.subscribed_kva]})).mark_rule(
+                color=ui.DANGER_LINE, strokeDash=[5, 4]).encode(y="kVA:Q")
+            st.altair_chart(style_chart((bars + rule).properties(height=200)), width="stretch")
+            for step in check.reasoning:
+                st.caption(step)
+
+
+def page_balance(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    ui.page_header(org.name, "Bilan énergétique",
+                   "État des lieux des 12 derniers mois : consommations, coûts et émissions par énergie et par usage, "
+                   "poids de l'énergie dans les comptes, plan de comptage et puissance souscrite. Démarche du "
+                   "référent énergie (formation PRO-REFEI de l'ATEE) : connaître pour agir.")
+    balance = energy_balance.organization_balance(db, org)
+    if balance is None:
+        ui.empty_state("Aucune consommation", "Il faut des consommations (compteurs ou factures) pour établir le bilan.")
+        return
+    data_as_of_banner(balance.end)
+    ui.kpi_grid([
+        {"label": "Consommation", "value": fmt_energy(balance.total_kwh), "icon": "total", "note": "12 derniers mois"},
+        {"label": "Facture énergétique", "value": fmt_eur(balance.total_eur), "icon": "cost", "note": "€ HT, abonnements compris"},
+        {"label": "Émissions", "value": fmt_emissions(balance.total_kgco2e), "icon": "co2", "note": "facteurs ADEME"},
+        {"label": "Intensité", "value": f"{fmt_number(balance.kwh_m2)} kWh/m²" if balance.kwh_m2 else "—",
+         "icon": "total", "note": "surface des sites"},
+    ])
+    balance_table(balance)
+    finances_section(db, repo, user, org, balance.total_eur)
+    st.header("Par site")
+    sites = {s.id: s for s in org.sites}
+    site = sites[st.selectbox("Site", list(sites), format_func=lambda i: sites[i].name, key="balance_site")]
+    site_balance = energy_balance.site_balance(db, site)
+    if site_balance is None:
+        st.caption("Aucune consommation connue sur ce site.")
+        return
+    tabs = st.tabs(["Bilan du site", "Usages et Pareto", "Plan de comptage", "Puissance souscrite"])
+    with tabs[0]:
+        balance_table(site_balance)
+        ratios = []
+        if site_balance.kwh_m2:
+            ratios.append(f"{fmt_number(site_balance.kwh_m2)} kWh/m²/an")
+        if site_balance.kwh_per_unit:
+            ratios.append(f"{fmt_number(site_balance.kwh_per_unit, 2)} kWh et {fmt_number(site_balance.eur_per_unit, 2)} € "
+                          f"par {site_balance.production_unit or 'unité produite'}")
+        if ratios:
+            st.caption("Ratios : " + " ; ".join(ratios) + ".")
+        for note in site_balance.notes:
+            st.caption(note)
+    with tabs[1]:
+        rows = usages_tab(db, user, site)
+    with tabs[2]:
+        metering_tab(db, site, site_balance.end, rows)
+    with tabs[3]:
+        if sees_unvalidated(user):
+            power_tab(db, site)
+        else:
+            st.caption("Diagnostic de la puissance souscrite : préparé par votre auditeur.")
+
+
+# --- R2, R4 : plan d'actions --------------------------------------------------------------------------------
+
+
+def _trb_text(ind) -> str:
+    if ind.immediate:
+        return "immédiat"
+    return f"{fmt_number(ind.trb, 1)} an(s)" if ind.trb is not None else "—"
+
+
+def _discounted_text(ind) -> str:
+    if ind.discounted_payback is None:
+        return "au-delà de la durée d'analyse"
+    return "immédiat" if ind.discounted_payback == 0 else f"{fmt_number(ind.discounted_payback, 1)} an(s)"
+
+
+def _irr_text(ind) -> str:
+    return "—" if ind.irr is None else ("> 1 000 %" if ind.irr >= 10 else f"{fmt_number(ind.irr * 100, 1)} %")
+
+
+def economics_settings(db: Session, repo: TenantRepository, user: User, org: Organization, params: dict) -> None:
+    st.caption(f"Rentabilité sur {params['horizon_years']} ans au plus (durée de vie de chaque équipement), taux "
+               f"d'actualisation {fmt_number(params['discount_rate'] * 100, 1)} %, prix de l'énergie "
+               f"{fmt_pct(params['price_escalation'] * 100)}/an, CEE à {fmt_number(params['cee_price_eur_mwh'], 2)} € "
+               "par MWh cumac.")
+    if not action_plan.can_edit(user):
+        return
+    with st.popover("Paramètres de rentabilité"):
+        with st.form(f"eco-{org.id}"):
+            rate = st.number_input("Taux d'actualisation (%)", min_value=0.0, max_value=30.0,
+                                   value=params["discount_rate"] * 100, step=0.5,
+                                   help="5 à 12 % pour les investissements industriels (formation PRO-REFEI).")
+            horizon = st.number_input("Durée d'analyse (ans)", min_value=1, max_value=30, value=int(params["horizon_years"]))
+            scenarios = {**economics.PRICE_SCENARIOS, "Personnalisé": None}
+            current = next((k for k, v in economics.PRICE_SCENARIOS.items() if v == params["price_escalation"]),
+                           "Personnalisé")
+            scenario = st.selectbox("Évolution du prix de l'énergie", list(scenarios), index=list(scenarios).index(current))
+            custom = st.number_input("Évolution personnalisée (%/an)", min_value=-10.0, max_value=20.0,
+                                     value=params["price_escalation"] * 100, step=0.5)
+            cee = st.number_input("Valorisation des CEE (€ HT par MWh cumac)", min_value=0.0, max_value=50.0,
+                                  value=float(params["cee_price_eur_mwh"]), step=0.5,
+                                  help="Cours du marché ou offre de l'obligé, à mettre à jour.")
+            if st.form_submit_button("Enregistrer", type="primary"):
+                escalation = scenarios[scenario] if scenarios[scenario] is not None else custom / 100
+                try:
+                    action_plan.set_economics(db, repo, user, org.id, {
+                        "discount_rate": rate / 100, "horizon_years": horizon, "price_escalation": escalation,
+                        "cee_price_eur_mwh": cee})
+                except action_plan.ActionPlanError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("Paramètres de rentabilité enregistrés.")
+                    st.rerun()
+
+
+def plan_kpis(summary) -> None:
+    for group in (summary.short, summary.medium):
+        st.markdown(f"**Plan à {'court' if group is summary.short else 'moyen'} terme**"
+                    + (" (reprend le court terme)" if group is summary.medium else ""))
+        ui.kpi_grid([
+            {"label": "Économie d'énergie", "value": fmt_energy(group.saved_kwh), "icon": "total",
+             "note": f"{group.count} action(s), par an"},
+            {"label": "Gain annuel", "value": fmt_eur(group.gain_eur), "icon": "cost",
+             "note": f"soit {fmt_number(group.bill_share * 100, 1)} % de la facture" if group.bill_share else "€ HT par an"},
+            {"label": "Investissement", "value": fmt_eur(group.investment), "icon": "check",
+             "note": f"dont {fmt_eur(group.cee_eur)} de CEE attendus" if group.cee_eur else "€ HT"},
+            {"label": "Retour moyen (CEE inclus)", "value": _trb_text(group.with_cee), "icon": "check",
+             "note": f"VAN {minus(fmt_eur(group.with_cee.npv))} ; TRI {_irr_text(group.with_cee)}"},
+        ])
+
+
+def cashflow_chart(group, params: dict) -> None:
+    flows = group.with_cee.flows
+    if len(flows) < 2:
+        return
+    rows = []
+    for label, values in (("Cumul brut", economics.cumulative(flows)),
+                          ("Cumul actualisé", economics.cumulative(flows, params["discount_rate"]))):
+        rows += [{"Année": year, "Série": label, "k€": value / 1000} for year, value in enumerate(values)]
+    chart = alt.Chart(pd.DataFrame(rows)).mark_line(point=True).encode(
+        x=alt.X("Année:O", title="Année"), y=alt.Y("k€:Q", title="Flux cumulés (k€)"),
+        color=alt.Color("Série:N", title=None, scale=alt.Scale(domain=["Cumul brut", "Cumul actualisé"],
+                                                               range=[ui.PRIMARY, ui.SERIES_2])),
+        tooltip=["Année", "Série", alt.Tooltip("k€:Q", format=",.1f")])
+    zero = alt.Chart(pd.DataFrame({"k€": [0]})).mark_rule(color=ui.MUTED).encode(y="k€:Q")
+    st.altair_chart(style_chart((chart + zero).properties(height=240)), width="stretch")
+    st.caption("Flux du plan à moyen terme, CEE déduits de l'investissement : le cumul actualisé coupe zéro au temps "
+               "de retour actualisé ; sa valeur finale est la VAN.")
+
+
+def action_form_fields(db: Session, site: Site, action=None, key: str = "new") -> dict:
+    """Champs communs à la création et à la modification d'une action (chiffrage et cotation)."""
+    a = action
+    title = st.text_input("Quoi ? Intitulé de l'action", value=a.title if a else "", key=f"{key}-title")
+    left, middle, right = st.columns(3)
+    category = left.selectbox("Famille", list(action_plan.CATEGORIES), format_func=action_plan.CATEGORIES.get,
+                              index=list(action_plan.CATEGORIES).index(a.category) if a else 0, key=f"{key}-cat")
+    nature = middle.selectbox("Nature (SP3)", list(action_plan.NATURES), format_func=action_plan.NATURES.get,
+                              index=list(action_plan.NATURES).index(a.nature) if a else 1, key=f"{key}-nature")
+    horizon = right.selectbox("Horizon", list(action_plan.HORIZONS), format_func=action_plan.HORIZONS.get,
+                              index=list(action_plan.HORIZONS).index(a.horizon) if a else 0, key=f"{key}-horizon")
+    left, middle, right = st.columns(3)
+    priority = left.selectbox("Priorité", list(action_plan.PRIORITIES), format_func=action_plan.PRIORITIES.get,
+                              index=list(action_plan.PRIORITIES).index(a.priority) if a else 0, key=f"{key}-prio")
+    elec = middle.number_input("Économie d'électricité (MWh/an)", value=float((a.savings or {}).get("ELEC", 0)) / 1000
+                               if a else 0.0, step=1.0, key=f"{key}-elec",
+                               help="Négative en cas de surconsommation (ex. pompe à chaleur remplaçant du gaz).")
+    gas = right.number_input("Économie de gaz (MWh/an)", value=float((a.savings or {}).get("GAS", 0)) / 1000
+                             if a else 0.0, step=1.0, key=f"{key}-gas")
+    left, middle, right = st.columns(3)
+    investment = left.number_input("Investissement (€ HT)", min_value=0.0, value=float(a.investment_eur) if a else 0.0,
+                                   step=500.0, key=f"{key}-inv")
+    reference = middle.number_input("Situation de référence (€ HT)", min_value=0.0,
+                                    value=float(a.reference_investment_eur) if a else 0.0, step=500.0, key=f"{key}-ref",
+                                    help="Coût de la solution qu'on paierait de toute façon (ex. rebobiner un moteur) : "
+                                         "la rentabilité porte sur le surinvestissement.")
+    lifetime = right.number_input("Durée de vie (ans)", min_value=1, max_value=50, value=int(a.lifetime_years) if a else 10,
+                                  key=f"{key}-life")
+    left, middle, right = st.columns(3)
+    recurring = left.number_input("Gain (+) ou coût (−) récurrent (€/an)", value=float(a.recurring_eur) if a else 0.0,
+                                  step=100.0, key=f"{key}-rec", help="Maintenance, abonnement, charge de travail…")
+    cumac = middle.number_input("CEE (kWh cumac)", min_value=0.0, value=float(a.cee_kwh_cumac or 0) if a else 0.0,
+                                step=1000.0, key=f"{key}-cumac",
+                                help="Montant de la fiche d'opération standardisée ou de l'offre de l'obligé.")
+    sheet = right.text_input("Fiche CEE", value=(a.cee_sheet or "") if a else "", placeholder="ex. IND-UT-102",
+                             key=f"{key}-sheet")
+    left, middle, right = st.columns(3)
+    notes = [None, 4, 3, 2, 1]
+    note_label = lambda n: "non notée" if n is None else f"{n} — {action_plan.SCORE_LABELS[n]}"  # noqa: E731
+    economic = left.selectbox("Faisabilité économique", notes, format_func=lambda n: "suggérée d'après le retour"
+                              if n is None else note_label(n), index=notes.index(a.score_economic) if a else 0,
+                              key=f"{key}-se", help=action_plan.SCORE_HELP["economic"])
+    technical = middle.selectbox("Faisabilité technique", notes, format_func=note_label,
+                                 index=notes.index(a.score_technical) if a else 0, key=f"{key}-st",
+                                 help=action_plan.SCORE_HELP["technical"])
+    risk = right.selectbox("Risques", notes, format_func=note_label, index=notes.index(a.score_risk) if a else 0,
+                           key=f"{key}-sr", help=action_plan.SCORE_HELP["risk"])
+    cobenefits = st.multiselect("Au-delà de l'énergie (SP4)", list(action_plan.COBENEFITS),
+                                default=(a.cobenefits or []) if a else [], format_func=action_plan.COBENEFITS.get,
+                                key=f"{key}-cob")
+    description = st.text_area("Description", value=(a.description or "") if a else "", key=f"{key}-desc", height=80)
+    return {"title": title, "category": category, "nature": nature, "horizon": horizon, "priority": priority,
+            "savings": {"ELEC": elec * 1000, "GAS": gas * 1000}, "investment_eur": investment,
+            "reference_investment_eur": reference, "lifetime_years": int(lifetime), "recurring_eur": recurring,
+            "cee_kwh_cumac": cumac or None, "cee_sheet": sheet, "score_economic": economic,
+            "score_technical": technical, "score_risk": risk, "cobenefits": cobenefits, "description": description}
+
+
+def action_detail(db: Session, repo: TenantRepository, user: User, org: Organization, action, econ, prices,
+                  params: dict) -> None:
+    editable = action_plan.can_edit(user)
+    label, tone = action_plan.STATUS_LABELS[action.status]
+    st.markdown(f"#### {action.title} {ui.status(label, tone)}", unsafe_allow_html=True)
+    payback, payback_tone = econ.with_cee.payback_label
+    tabs = st.tabs(["Chiffrage", "QQOQPCC et suivi", "Mesure et vérification"])
+    with tabs[0]:
+        ui.kpi_grid([
+            {"label": "Économie", "value": fmt_energy(econ.saved_kwh), "icon": "total",
+             "note": " ; ".join(f"{'élec.' if k == 'ELEC' else 'gaz'} {fmt_energy(v)}" for k, v in econ.lines.items())},
+            {"label": "Gain annuel net", "value": fmt_eur(econ.without_cee.annual_net), "icon": "cost",
+             "note": f"énergie {fmt_eur(econ.energy_gain_eur)}" + (f", récurrent {fmt_eur(action.recurring_eur)}"
+                                                                   if action.recurring_eur else "")},
+            {"label": "Temps de retour brut", "value": _trb_text(econ.without_cee), "icon": "check",
+             "note": f"avec CEE : {_trb_text(econ.with_cee)}" if econ.cee_eur else "sans CEE"},
+            {"label": "VAN", "value": minus(fmt_eur(econ.with_cee.npv)), "icon": "cost",
+             "note": f"TRI {_irr_text(econ.with_cee)} ; retour actualisé " + _discounted_text(econ.with_cee)},
+            {"label": "Émissions évitées", "value": fmt_emissions(econ.saved_kgco2e), "icon": "co2", "note": "par an"},
+        ])
+        ui.render(f"<div class='es-output-gain'>{ui.status(payback, payback_tone)} Note de priorité "
+                  f"<b>{econ.score}/100</b> (faisabilité économique {action.score_economic or econ.suggested_economic_score}"
+                  f"{' suggérée' if not action.score_economic else ''}, technique {action.score_technical or '3 par défaut'}, "
+                  f"risques {action.score_risk or '3 par défaut'}, {len(action.cobenefits or [])} co-bénéfice(s)).</div>")
+        if action.reference_investment_eur:
+            st.caption(f"Situation de référence : {fmt_eur(action.reference_investment_eur)} ; rentabilité calculée sur le "
+                       f"surinvestissement de {fmt_eur(econ.investment)}.")
+        if econ.cee_eur:
+            st.caption(f"CEE : {fmt_number((action.cee_kwh_cumac or 0) / 1000, 1)} MWh cumac"
+                       + (f" (fiche {action.cee_sheet})" if action.cee_sheet else "")
+                       + f", soit {fmt_eur(econ.cee_eur)}" + (f", {fmt_number(econ.cee_aid_share * 100)} % de "
+                                                              "l'investissement" if econ.cee_aid_share else "")
+                       + ". L'accord avec l'obligé (rôle actif et incitatif) se signe AVANT toute commande.")
+        elif action.cee_sheet:
+            st.caption(f"Fiche CEE de référence : {action.cee_sheet}. Renseignez le montant en kWh cumac (fiche ou offre "
+                       "de l'obligé) ; l'accord se signe avant toute commande.")
+        for hint in action_plan.funding_hints(action, econ):
+            st.caption(f"Financement : {hint}")
+        st.caption("Prix payés retenus : " + ", ".join(f"{FLUID_LABELS[f].lower()} {fmt_number(prices.price[f], 3)} €/kWh "
+                                                       f"({prices.source[f]})" for f in Fluid))
+        if editable:
+            with st.expander("Modifier le chiffrage et la cotation"):
+                with st.form(f"edit-eco-{action.id}"):
+                    values = action_form_fields(db, action.site, action, key=f"edit-{action.id}")
+                    if st.form_submit_button("Enregistrer", type="primary"):
+                        try:
+                            action_plan.update_action(db, repo, user, action.id, **values)
+                        except action_plan.ActionPlanError as exc:
+                            st.error(str(exc))
+                        else:
+                            flash("Action mise à jour.")
+                            st.rerun()
+    with tabs[1]:
+        qqoqpcc_tab(db, repo, user, action)
+    with tabs[2]:
+        mv_tab(db, repo, user, org, action, econ, prices)
+
+
+def qqoqpcc_tab(db: Session, repo: TenantRepository, user: User, action) -> None:
+    editable = action_plan.can_edit(user)
+    equipment = {n.id: n.name for n in repo.list_asset_nodes(action.site_id) if n.kind == AssetNodeKind.EQUIPMENT}
+    rows = [("Qui ?", action.owner or "—"), ("Quoi ?", action.title),
+            ("Où ?", ", ".join(x for x in (action.location, equipment.get(action.equipment_id)) if x) or "—"),
+            ("Quand ?", fmt_date(action.due_date)), ("Pourquoi ?", action.why or "—"),
+            ("Combien ?", action.how_much or "—"), ("Comment ?", action.how or "—")]
+    ui.table(["QQOQPCC", ""], [[f"<b>{ui.e(k)}</b>", ui.e(v)] for k, v in rows])
+    if action.contacts:
+        ui.table(["Contact (Qui ?)", "Comment ?", "Quand ?", "Pourquoi ?"],
+                 [[ui.e(c.get("who", "")), ui.e(c.get("channel", "")), ui.e(c.get("when", "")), ui.e(c.get("purpose", ""))]
+                  for c in action.contacts])
+    needs = action.needs or {}
+    if any(needs.values()):
+        st.caption("Besoins : " + " ; ".join(f"{label} : {needs[k]}" for k, label in (
+            ("training", "formation"), ("documentation", "documentation"), ("monitoring", "surveillance et mesurage"))
+            if needs.get(k)))
+    if action.progress_note:
+        st.caption(f"Avancement : {action.progress_note}")
+    if not editable:
+        return
+    with st.expander("Renseigner la fiche QQOQPCC"):
+        with st.form(f"qqoqpcc-{action.id}"):
+            left, right = st.columns(2)
+            owner = left.text_input("Qui ? Responsable (un seul)", value=action.owner or "")
+            due = right.date_input("Quand ? Échéance", value=action.due_date, format="DD/MM/YYYY",
+                                   help="Une date, jamais « asap » ni « S43 ».")
+            left, right = st.columns(2)
+            location = left.text_input("Où ?", value=action.location or "")
+            options = [None, *equipment]
+            equipment_id = right.selectbox("Équipement", options, format_func=lambda i: "—" if i is None else equipment[i],
+                                           index=options.index(action.equipment_id) if action.equipment_id in options else 0)
+            why = st.text_area("Pourquoi ? Objectifs (énergie, qualité, conditions de travail…)", value=action.why or "",
+                               height=70)
+            how_much = st.text_input("Combien ? Quantités", value=action.how_much or "")
+            how = st.text_area("Comment ? Méthode, rétroplanning", value=action.how or "", height=70)
+            contacts = st.data_editor(pd.DataFrame(action.contacts or [], columns=["who", "channel", "when", "purpose"])
+                                      .rename(columns={"who": "Qui", "channel": "Comment", "when": "Quand",
+                                                       "purpose": "Pourquoi"}),
+                                      num_rows="dynamic", hide_index=True, width="stretch", key=f"contacts-{action.id}")
+            left, middle, right = st.columns(3)
+            training = left.text_input("Besoin en formation", value=(action.needs or {}).get("training", ""))
+            documentation = middle.text_input("Besoin en documentation", value=(action.needs or {}).get("documentation", ""))
+            monitoring = right.text_input("Surveillance et mesurage", value=(action.needs or {}).get("monitoring", ""))
+            if st.form_submit_button("Enregistrer la fiche", type="primary"):
+                records = [{"who": r.get("Qui"), "channel": r.get("Comment"), "when": r.get("Quand"),
+                            "purpose": r.get("Pourquoi")} for r in contacts.fillna("").to_dict("records")]
+                try:
+                    action_plan.update_action(db, repo, user, action.id, owner=owner, due_date=due, location=location,
+                                              equipment_id=equipment_id, why=why, how_much=how_much, how=how,
+                                              contacts=records, needs={"training": training,
+                                                                       "documentation": documentation,
+                                                                       "monitoring": monitoring})
+                except action_plan.ActionPlanError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("Fiche QQOQPCC enregistrée.")
+                    st.rerun()
+    with st.form(f"status-{action.id}"):
+        left, middle, right = st.columns(3)
+        statuses = list(action_plan.STATUS_LABELS)
+        status = left.selectbox("Avancement", statuses, index=statuses.index(action.status),
+                                format_func=lambda s: action_plan.STATUS_LABELS[s][0])
+        done_on = middle.date_input("Réalisée le", value=action.done_on or today_local(), format="DD/MM/YYYY")
+        note = right.text_input("Point d'avancement", value="")
+        if st.form_submit_button("Mettre à jour l'avancement"):
+            try:
+                action_plan.set_status(db, repo, user, action.id, status, note or None, done_on)
+            except action_plan.ActionPlanError as exc:
+                st.error(str(exc))
+            else:
+                flash("Avancement mis à jour.")
+                st.rerun()
+    if action.status not in (ActionStatus.DONE, ActionStatus.VERIFIED):
+        if st.button("Retirer l'action du plan", key=f"del-action-{action.id}"):
+            action_plan.delete_action(db, repo, user, action.id)
+            flash("Action retirée du plan.")
+            st.rerun()
+
+
+def mv_tab(db: Session, repo: TenantRepository, user: User, org: Organization, action, econ, prices) -> None:
+    done, total = action_plan.mv_completeness(action.mv_plan)
+    ui.render(ui.progress(done / total * 100, f"{done} points sur {total} du plan de mesure et vérification (IPMVP)"))
+    if action.status in (ActionStatus.DONE, ActionStatus.VERIFIED):
+        result = action_plan.verification(db, action, integrations.weather_provider(db))
+        ui.render(f"<div class='es-output-gain'>{ui.status('Vérification', 'success' if result.kind != 'NONE' else 'warning')} "
+                  f"{ui.e(result.text)}</div>")
+    if action.mv_plan:
+        ui.table(["Point", "Contenu"], [[ui.e(label), ui.e(action.mv_plan.get(key, "—"))]
+                                        for key, label in action_plan.MV_POINTS])
+    editable = action_plan.can_edit(user)
+    ipes = {d.id: d.name for d in repo.list_ipe_definitions(org.id, [ReviewStatus.VALIDATED]) if d.site_id == action.site_id}
+    if editable and ipes:
+        options = [None, *ipes]
+        chosen = st.selectbox("IPE de vérification", options, format_func=lambda i: "—" if i is None else ipes[i],
+                              index=options.index(action.ipe_definition_id) if action.ipe_definition_id in options else 0,
+                              key=f"mv-ipe-{action.id}")
+        if chosen != action.ipe_definition_id:
+            action_plan.update_action(db, repo, user, action.id, ipe_definition_id=chosen)
+            st.rerun()
+    if not editable:
+        return
+    key = f"mv-suggest-{action.id}"
+    if st.button("Suggérer un plan de M&V", key=f"{key}-btn"):
+        balance = energy_balance.site_balance(db, action.site)
+        consumption = {line.fluid.value: line.kwh for line in balance.lines} if balance else {}
+        st.session_state[key] = action_plan.suggest_mv(db, action, econ, consumption, prices)
+    suggestion = st.session_state.get(key)
+    if suggestion:
+        for step in suggestion["reasoning"]:
+            st.caption(step)
+    with st.expander("Rédiger le plan de M&V" if not action.mv_plan else "Modifier le plan de M&V",
+                     expanded=bool(suggestion) or not action.mv_plan), st.form(f"mv-{action.id}"):
+        values = {}
+        for point, label in action_plan.MV_POINTS:
+            default = (action.mv_plan or {}).get(point) or (suggestion["values"].get(point, "") if suggestion else "")
+            values[point] = st.text_area(label, value=default, height=68, key=f"mv-{action.id}-{point}-{bool(suggestion)}")
+        if st.form_submit_button("Enregistrer le plan de M&V", type="primary"):
+            action_plan.save_mv_plan(db, repo, user, action.id, values)
+            st.session_state.pop(key, None)
+            flash("Plan de mesure et vérification enregistré.")
+            st.rerun()
+
+
+def page_actions(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    ui.page_header(org.name, "Plan d'actions",
+                   "Les actions du référent énergie, qualifiées et quantifiées : économies, investissement, temps de "
+                   "retour, VAN, TRI, CEE ; hiérarchisées à court et moyen terme ; planifiées (un responsable, une "
+                   "échéance) et suivies jusqu'à la vérification des économies (IPMVP).")
+    params = economics.params_of(org)
+    economics_settings(db, repo, user, org, params)
+    actions = repo.list_actions(org.id)
+    prices = {site.id: action_plan.site_prices(db, site) for site in org.sites}
+    evaluated = [(a, action_plan.evaluate(a, prices[a.site_id], params)) for a in actions]
+    balance = energy_balance.organization_balance(db, org)
+    bill = balance.total_eur if balance else None
+    if evaluated:
+        summary = action_plan.plan_summary(evaluated, params, bill)
+        plan_kpis(summary)
+        for alert in action_plan.planning_alerts(actions):
+            st.warning(alert)
+        groups = [summary.short, summary.medium, *summary.by_priority]
+        ui.table(["Groupe", "Actions", "Énergie/an", "Gain €/an", "Part facture", "Investissement", "CEE",
+                  "Retour brut (sans / avec CEE)", "VAN", "TRI"],
+                 [[ui.e(g.label), str(g.count), ui.e(fmt_energy(g.saved_kwh)), ui.e(fmt_eur(g.gain_eur)),
+                   ui.e(f"{fmt_number(g.bill_share * 100, 1)} %") if g.bill_share else "—", ui.e(fmt_eur(g.investment)),
+                   ui.e(fmt_eur(g.cee_eur)), ui.e(f"{_trb_text(g.without_cee)} / {_trb_text(g.with_cee)}"),
+                   ui.e(minus(fmt_eur(g.with_cee.npv))), ui.e(_irr_text(g.with_cee))] for g in groups],
+                 numeric={1, 2, 3, 4, 5, 6, 8, 9})
+        if summary.memo:
+            st.caption(f"{summary.memo} action(s) « pour mémoire », hors plan : à garder en tête lors d'un renouvellement.")
+        cashflow_chart(summary.medium, params)
+        weight = energy_balance.financial_weight(org, bill) if bill else None
+        signer = user.email
+        if user.auditor_id:
+            auditor = db.get(Auditor, user.auditor_id)
+            signer = auditor.name if auditor else signer
+        st.download_button("Note de synthèse pour la direction (HTML)", icon=":material/description:",
+                           data=action_plan.director_note(org, summary, evaluated, params, bill, weight, signer),
+                           file_name=f"plan-actions-{org.name.lower().replace(' ', '-')}.html", mime="text/html")
+    st.header("Actions")
+    sites = {s.id: s.name for s in org.sites}
+    left, right = st.columns(2)
+    site_filter = left.selectbox("Site", [None, *sites], format_func=lambda i: "Tous les sites" if i is None else sites[i],
+                                 key="actions_site")
+    horizon_filter = right.selectbox("Horizon", [None, *action_plan.HORIZONS],
+                                     format_func=lambda h: "Tous" if h is None else action_plan.HORIZONS[h],
+                                     key="actions_horizon")
+    shown = [(a, e) for a, e in evaluated if (site_filter is None or a.site_id == site_filter)
+             and (horizon_filter is None or a.horizon == horizon_filter)]
+    shown.sort(key=lambda item: (list(action_plan.HORIZONS).index(item[0].horizon), -item[1].score))
+    if not shown:
+        ui.empty_state("Aucune action", "Ajoutez une action, ou inscrivez au plan un geste du simulateur ou une "
+                                        "recommandation validée.")
+    else:
+        ui.table(["Action", "Horizon, priorité", "Énergie/an", "Gain €/an", "Investissement", "Retour (CEE inclus)", "VAN",
+                  "Note", "Avancement", "Qui, quand"],
+                 [[ui.e(a.title) + f"<span class='sub'>{ui.e(sites[a.site_id])} · {ui.e(action_plan.CATEGORIES[a.category])} · "
+                                   f"{ui.e(action_plan.NATURES[a.nature])}</span>",
+                   ui.e(f"{action_plan.HORIZONS[a.horizon]}, {action_plan.PRIORITIES[a.priority].lower()}"),
+                   ui.e(fmt_energy(e.saved_kwh)), ui.e(fmt_eur(e.without_cee.annual_net)), ui.e(fmt_eur(e.investment)),
+                   ui.e(_trb_text(e.with_cee)), ui.e(minus(fmt_eur(e.with_cee.npv))), f"<b>{e.score}</b>",
+                   ui.status(*action_plan.STATUS_LABELS[a.status]),
+                   ui.e(f"{a.owner or '—'}, {fmt_date(a.due_date)}")] for a, e in shown],
+                 numeric={2, 3, 4, 6, 7})
+        st.caption("Note sur 100 : faisabilité économique (40 %), technique (30 %) et risques (30 %), notées de 1 à 4, "
+                   "plus les co-bénéfices (15 points) ; cotation inspirée de l'exemple WinErgia de la formation. "
+                   "Le temps de retour n'est pas le seul critère de décision.")
+        by_id = {a.id: (a, e) for a, e in shown}
+        chosen = st.selectbox("Ouvrir une action", list(by_id), format_func=lambda i: by_id[i][0].title,
+                              key="action_open")
+        with st.container(border=True):
+            action, econ = by_id[chosen]
+            action_detail(db, repo, user, org, action, econ, prices[action.site_id], params)
+    if action_plan.can_edit(user):
+        with st.expander("Nouvelle action", icon=":material/add:"):
+            with st.form("action-new"):
+                site_id = st.selectbox("Site", list(sites), format_func=sites.get)
+                values = action_form_fields(db, next(s for s in org.sites if s.id == site_id), None, key="new")
+                if st.form_submit_button("Ajouter au plan", type="primary"):
+                    title = values.pop("title")
+                    try:
+                        action_plan.create_action(db, repo, user, site_id, title=title, **values)
+                    except action_plan.ActionPlanError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash("Action ajoutée au plan.")
+                        st.rerun()
+
+
+# --- R3, R7 : management de l'énergie et sensibilisation ---------------------------------------------------
+
+
+def maturity_chart(latest, previous) -> None:
+    rows = []
+    for label, assessment in (("Dernière évaluation", latest), ("Évaluation précédente", previous)):
+        if assessment is None:
+            continue
+        for code, value in assessment.scores["themes"].items():
+            if value is not None:
+                rows.append({"Thème": energy_management.THEMES[code][1], "Score (%)": value * 100, "Évaluation": label})
+    order = [energy_management.THEMES[c][1] for c in energy_management.THEMES]
+    domain = ["Dernière évaluation", "Évaluation précédente"][:1 if previous is None else 2]
+    chart = alt.Chart(pd.DataFrame(rows)).mark_bar(cornerRadiusEnd=3).encode(
+        y=alt.Y("Thème:N", sort=order, title=None, axis=alt.Axis(labelLimit=320)),
+        x=alt.X("Score (%):Q", scale=alt.Scale(domain=[0, 100])),
+        yOffset=alt.YOffset("Évaluation:N", sort=domain),
+        color=alt.Color("Évaluation:N", title=None, legend=alt.Legend(columnPadding=28),
+                        scale=alt.Scale(domain=domain, range=[ui.PRIMARY, ui.MUTED][:len(domain)])),
+        tooltip=["Thème", "Évaluation", alt.Tooltip("Score (%):Q", format=".0f")])
+    st.altair_chart(style_chart(chart.properties(height=420)), width="stretch")
+
+
+def assessment_tab(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    assessments = repo.list_assessments(org.id)
+    latest = assessments[0] if assessments else None
+    if latest is None:
+        st.caption("Aucune auto-évaluation : répondez aux questions ci-dessous pour situer la démarche.")
+    else:
+        level, tone = energy_management.level(latest.scores["global"])
+        st.markdown(f"Dernière évaluation le {fmt_date(to_local(latest.created_at).date())} : "
+                    f"**{fmt_number(latest.scores['global'] * 100)} %** {ui.status(level, tone)}", unsafe_allow_html=True)
+        ui.kpi_grid([{"label": label, "value": "—" if latest.scores["axes"].get(code) is None
+                      else f"{fmt_number(latest.scores['axes'][code] * 100)} %", "icon": "check",
+                      "note": energy_management.level(latest.scores["axes"][code] or 0)[0]
+                      if latest.scores["axes"].get(code) is not None else ""}
+                     for code, label in energy_management.AXES.items()])
+        maturity_chart(latest, assessments[1] if len(assessments) > 1 else None)
+        weak = energy_management.weakest_themes(latest.scores)
+        if weak:
+            st.markdown("**Pistes de progrès**")
+            for code, value in weak:
+                ui.render(f"<div class='es-output-gain'><b>{ui.e(energy_management.THEMES[code][1])}</b> "
+                          f"({fmt_number(value * 100)} %) : {ui.e(energy_management.THEME_ADVICE[code])}</div>")
+        if len(assessments) > 1:
+            ui.table(["Évaluation", "Score global", "Réponses"],
+                     [[fmt_date(to_local(a.created_at).date()), f"{fmt_number(a.scores['global'] * 100)} %",
+                       f"{a.scores['answered']} / {len(energy_management.QUESTIONS)}"] for a in assessments], numeric={1})
+    st.caption("Démarche inspirée de la check-list « énergie CHECK » de l'ATEE (formation PRO-REFEI), selon la "
+               "logique PDCA de l'ISO 50001. Les indices viennent des données EffiSmart : ils éclairent la réponse, "
+               "ils ne la donnent pas.")
+    if not energy_management.can_edit(user):
+        return
+    hints = energy_management.evidence(db, org)
+    previous = latest.answers if latest else {}
+    choices = [2, 1, 0, -1, None]
+    with st.form(f"maturity-{org.id}"):
+        answers = {}
+        for axis, axis_label in energy_management.AXES.items():
+            with st.expander(axis_label):
+                for theme, (theme_axis, theme_label) in energy_management.THEMES.items():
+                    if theme_axis != axis:
+                        continue
+                    st.markdown(f"**{theme_label}**")
+                    for code, q_theme, text in energy_management.QUESTIONS:
+                        if q_theme != theme:
+                            continue
+                        value = st.radio(text, choices, horizontal=True, key=f"mq-{org.id}-{code}",
+                                         index=choices.index(previous.get(code)) if code in previous else 4,
+                                         format_func=lambda v: "Sans réponse" if v is None else energy_management.ANSWERS[v])
+                        if code in hints:
+                            st.caption(f"Indice EffiSmart : {hints[code]}")
+                        if value is not None:
+                            answers[code] = value
+        if st.form_submit_button("Enregistrer l'auto-évaluation", type="primary"):
+            try:
+                energy_management.save_assessment(db, repo, user, org.id, answers)
+            except energy_management.ManagementError as exc:
+                st.error(str(exc))
+            else:
+                flash("Auto-évaluation enregistrée : elle s'ajoute à l'historique.")
+                st.rerun()
+
+
+def foundation_tab(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    record = repo.get_management(org.id)
+    if record is None or not record.policy:
+        st.warning("Pas de politique énergétique enregistrée : c'est le point de départ de la démarche (ISO 50001).")
+    else:
+        approved = (f"validée par la direction le {fmt_date(record.policy_approved_on)}" if record.policy_approved_on
+                    else "pas encore validée par la direction")
+        ui.render(f"<div class='es-output-action'><b>Politique énergétique</b> ({ui.e(approved)}) : "
+                  f"{ui.e(record.policy)}</div>")
+    if record and record.scope:
+        st.caption(f"Périmètre : {record.scope}")
+    if record and record.team:
+        st.markdown("**Équipe énergie**")
+        ui.table(["Membre", "Rôle", "Missions"], [[ui.e(m.get("name")), ui.e(m.get("role")), ui.e(m.get("missions"))]
+                                                 for m in record.team])
+    if record and record.objectives:
+        st.markdown("**Objectifs**")
+        ui.table(["Objectif", "Indicateur", "Cible", "Échéance", "Responsable", "SMART"],
+                 [[ui.e(o.get("label")), ui.e(o.get("indicator") or "—"), ui.e(o.get("target") or "—"),
+                   ui.e(o.get("deadline") or "—"), ui.e(o.get("owner") or "—"),
+                   ui.status("Complet", "success") if not energy_management.smart_gaps(o)
+                   else ui.status("Manque : " + ", ".join(energy_management.smart_gaps(o)), "warning")]
+                  for o in record.objectives])
+    due, late = energy_management.next_review(record)
+    if due:
+        (st.warning if late else st.caption)(f"Revue énergétique tous les {record.review_months} mois ; prochaine le "
+                                             f"{fmt_date(due)}" + (" : en retard." if late else "."))
+    if not energy_management.can_edit(user):
+        return
+    with st.expander("Modifier le socle du management de l'énergie"):
+        with st.form(f"management-{org.id}"):
+            policy = st.text_area("Politique énergétique", value=(record.policy or "") if record else "", height=100,
+                                  help="Engagement de la direction, objectifs chiffrés, amélioration continue, moyens.")
+            left, right = st.columns(2)
+            approved_flag = left.checkbox("Validée par la direction", value=bool(record and record.policy_approved_on))
+            approved_on = right.date_input("Le", value=(record.policy_approved_on if record and record.policy_approved_on
+                                                        else today_local()), format="DD/MM/YYYY")
+            scope = st.text_input("Périmètre (sites, énergies, activités)", value=(record.scope or "") if record else "")
+            team = st.data_editor(pd.DataFrame((record.team or []) if record else [], columns=["name", "role", "missions"])
+                                  .rename(columns={"name": "Membre", "role": "Rôle", "missions": "Missions"}),
+                                  num_rows="dynamic", hide_index=True, width="stretch", key=f"team-{org.id}")
+            objectives = st.data_editor(
+                pd.DataFrame((record.objectives or []) if record else [],
+                             columns=["label", "indicator", "target", "deadline", "owner"])
+                .rename(columns={"label": "Objectif", "indicator": "Indicateur", "target": "Cible",
+                                 "deadline": "Échéance", "owner": "Responsable"}).astype(str).replace("None", ""),
+                num_rows="dynamic", hide_index=True, width="stretch", key=f"objectives-{org.id}")
+            left, right = st.columns(2)
+            months = left.number_input("Revue énergétique tous les (mois)", min_value=1, max_value=36,
+                                       value=(record.review_months or 12) if record else 12)
+            last_review = right.date_input("Dernière revue", value=record.last_review_on if record else None,
+                                           format="DD/MM/YYYY")
+            if st.form_submit_button("Enregistrer", type="primary"):
+                team_rows = [{"name": r.get("Membre"), "role": r.get("Rôle"), "missions": r.get("Missions")}
+                             for r in team.fillna("").to_dict("records")]
+                objective_rows = [{"label": r.get("Objectif"), "indicator": r.get("Indicateur"), "target": r.get("Cible"),
+                                   "deadline": r.get("Échéance"), "owner": r.get("Responsable")}
+                                  for r in objectives.fillna("").to_dict("records")]
+                try:
+                    energy_management.save_management(
+                        db, repo, user, org.id, policy=policy, policy_approved_on=approved_on if approved_flag else None,
+                        scope=scope, team=team_rows, objectives=objective_rows, review_months=int(months),
+                        last_review_on=last_review)
+                except energy_management.ManagementError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("Socle du management de l'énergie enregistré.")
+                    st.rerun()
+
+
+def awareness_tab(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    st.caption("Communication engageante (formation PRO-REFEI, SP6) : un message à la fois, chiffré, qui appelle à "
+               "un geste ; renouvelé régulièrement pour garder son impact. La plateforme prépare des messages d'après "
+               "les données ; un humain les relit et les approuve avant tout affichage.")
+    sites = {s.id: s for s in org.sites}
+    site = sites[st.selectbox("Site", list(sites), format_func=lambda i: sites[i].name, key="awareness_site")]
+    editable = energy_management.can_edit(user)
+    if editable and st.button("Préparer des messages d'après les données", icon=":material/campaign:"):
+        with st.spinner("Lecture des données du site…"):
+            created = energy_management.generate_drafts(db, repo, user, site.id, integrations.weather_provider(db))
+        flash(f"{len(created)} message(s) préparé(s), à relire." if created else "Aucun message à préparer pour ce site.")
+        st.rerun()
+    messages = repo.list_messages(org.id, site.id)
+    if not messages:
+        st.caption("Aucun message pour ce site.")
+    tones = {CommunicationStatus.DRAFT: ("À relire", "warning"), CommunicationStatus.APPROVED: ("Approuvé", "success"),
+             CommunicationStatus.ARCHIVED: ("Archivé", "neutral")}
+    for message in messages:
+        with st.container(border=True):
+            st.markdown(f"**{message.title}** {ui.status(*tones[message.status])} "
+                        f"<span class='sub'>{ui.e(energy_management.THEME_LABELS.get(message.theme, message.theme))}</span>",
+                        unsafe_allow_html=True)
+            st.write(message.body)
+            st.markdown(f"→ *{message.call_to_action}*")
+            if message.status == CommunicationStatus.APPROVED:
+                st.download_button("Affiche à imprimer (HTML)", data=energy_management.poster_html(message),
+                                   file_name=f"affiche-{message.id}.html", mime="text/html", key=f"poster-{message.id}")
+            if editable and message.status != CommunicationStatus.ARCHIVED:
+                with st.expander("Relire et approuver" if message.status == CommunicationStatus.DRAFT else "Modifier"):
+                    with st.form(f"msg-{message.id}"):
+                        title = st.text_input("Titre", value=message.title)
+                        body = st.text_area("Message", value=message.body, height=110)
+                        call = st.text_input("Appel à l'action", value=message.call_to_action)
+                        left, right = st.columns(2)
+                        if left.form_submit_button("Approuver", type="primary"):
+                            new_status = CommunicationStatus.APPROVED
+                        elif right.form_submit_button("Archiver"):
+                            new_status = CommunicationStatus.ARCHIVED
+                        else:
+                            new_status = None
+                        if new_status is not None:
+                            try:
+                                energy_management.review_message(db, repo, user, message.id, title=title, body=body,
+                                                                 call_to_action=call, status=new_status)
+                            except energy_management.ManagementError as exc:
+                                st.error(str(exc))
+                            else:
+                                flash("Message approuvé : prêt à afficher." if new_status == CommunicationStatus.APPROVED
+                                      else "Message archivé.")
+                                st.rerun()
+
+
+def page_management(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
+    ui.page_header(org.name, "Management de l'énergie",
+                   "La démarche du référent énergie selon la logique de l'ISO 50001 : auto-évaluation sur 5 axes, "
+                   "politique, équipe et objectifs, sensibilisation du personnel. Une démarche vertueuse et durable, "
+                   "en amélioration continue.")
+    certified, text = ipe.iso50001_status(org)
+    ui.banner(f"<span><b>ISO 50001.</b> {ui.e(text)}</span>")
+    tabs = st.tabs(["Auto-évaluation", "Politique, équipe, objectifs", "Sensibilisation"])
+    with tabs[0]:
+        assessment_tab(db, repo, user, org)
+    with tabs[1]:
+        foundation_tab(db, repo, user, org)
+    with tabs[2]:
+        awareness_tab(db, repo, user, org)
+
+
 # --- Application ------------------------------------------------------------------------------
 
 
@@ -3413,6 +4332,12 @@ def main() -> None:
                 page_simulator(db, repo, user, org)
             elif page == PAGE_REPORTS:
                 page_reports(db, repo, user, org)
+            elif page == PAGE_BALANCE:
+                page_balance(db, repo, user, org)
+            elif page == PAGE_ACTIONS:
+                page_actions(db, repo, user, org)
+            elif page == PAGE_MANAGEMENT:
+                page_management(db, repo, user, org)
         except ResourceNotFound:
             st.error("Ressource introuvable ou hors de votre périmètre.")
         except ConsentRequiredError:
@@ -3420,7 +4345,7 @@ def main() -> None:
         except (documents_service.DocumentPermissionError, integrations.IntegrationPermissionError,
                 validation.ValidationPermissionError, assets.AssetPermissionError, tariffs.ContractPermissionError,
                 ipe.IpePermissionError, simulator.SimulatorPermissionError,
-                quarterly_reports.ReportPermissionError) as exc:
+                quarterly_reports.ReportPermissionError, action_plan.ActionPlanPermissionError) as exc:
             st.error(str(exc))
 
 

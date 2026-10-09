@@ -48,29 +48,83 @@ logger = logging.getLogger(__name__)
 USAGE_LABELS = {
     "HEATING": "Chauffage", "COOLING": "Refroidissement", "DHW": "Eau chaude sanitaire",
     "VENTILATION": "Ventilation", "LIGHTING": "Éclairage", "IT": "Informatique", "PROCESS": "Process",
-    "REFRIGERATION": "Froid alimentaire", "OTHER": "Autres usages",
+    "REFRIGERATION": "Froid alimentaire", "COMPRESSED_AIR": "Air comprimé", "OTHER": "Autres usages",
 }
 CLIMATE_USAGES = ("HEATING", "COOLING")
 # Durée type de fonctionnement à pleine puissance par an (heures), pour estimer l'énergie d'un usage.
 USAGE_HOURS = {"LIGHTING": 2500, "VENTILATION": 3000, "IT": 5000, "PROCESS": 2000, "REFRIGERATION": 5000,
-               "DHW": 1500, "OTHER": 2000}
-# (code, titre, usage, économie relative, investissement €/m², investissement fixe €, note)
+               "DHW": 1500, "COMPRESSED_AIR": 4000, "OTHER": 2000}
+# Gestes types : (code, titre, usage, économie relative, investissement €/m², investissement fixe €, note,
+# famille du plan d'actions, fiche CEE de référence, durée de vie en années).
+# Gestes industriels : ordres de grandeur de la formation PRO-REFEI (ATEE) et des guides ADEME qu'elle diffuse ;
+# l'investissement fixe est celui du cas « fil rouge » de la formation, à remplacer par le devis.
 DEFAULT_LIBRARY = [
     ("CHAUF_CONSIGNE", "Baisser la consigne de chauffage de 1 °C", "HEATING", 0.07, 0, 0,
-     "Ordre de grandeur couramment admis : environ 7 % du chauffage par degré de consigne."),
-    ("CHAUF_REDUIT", "Réduit de nuit et de week-end du chauffage", "HEATING", 0.12, 2, 0, None),
-    ("CHAUF_ROBINETS", "Robinets thermostatiques sur les émetteurs", "HEATING", 0.08, 4, 0, None),
-    ("CHAUF_CALORIFUGE", "Calorifugeage des réseaux de distribution", "HEATING", 0.05, 2, 0, None),
-    ("CLIM_CONSIGNE", "Consigne de climatisation relevée à 26 °C", "COOLING", 0.15, 0, 0, None),
-    ("ECL_LED", "Éclairage LED", "LIGHTING", 0.50, 15, 0, None),
-    ("ECL_DETECTION", "Détection de présence et gradation de l'éclairage", "LIGHTING", 0.25, 6, 0, None),
-    ("VENT_PROG", "Programmation horaire de la ventilation (CTA)", "VENTILATION", 0.30, 1, 0, None),
-    ("IT_VEILLE", "Extinction des postes et des veilles la nuit", "IT", 0.10, 0, 0, None),
+     "Ordre de grandeur couramment admis : environ 7 % du chauffage par degré de consigne.", "HVAC", None, 5),
+    ("CHAUF_REDUIT", "Réduit de nuit et de week-end du chauffage", "HEATING", 0.12, 2, 0, None, "HVAC", None, 10),
+    ("CHAUF_ROBINETS", "Robinets thermostatiques sur les émetteurs", "HEATING", 0.08, 4, 0, None, "HVAC", None, 15),
+    ("CHAUF_CALORIFUGE", "Calorifugeage des réseaux de distribution", "HEATING", 0.05, 2, 0, None, "STEAM", None, 20),
+    ("CLIM_CONSIGNE", "Consigne de climatisation relevée à 26 °C", "COOLING", 0.15, 0, 0, None, "HVAC", None, 5),
+    ("ECL_LED", "Éclairage LED", "LIGHTING", 0.50, 15, 0,
+     "Remplacement de tubes fluorescents T8 : −50 à −65 % avec des LED, −20 à −40 % avec des T5 (formation "
+     "PRO-REFEI, SP3), à éclairement équivalent.", "LIGHTING", None, 15),
+    ("ECL_DETECTION", "Détection de présence et gradation de l'éclairage", "LIGHTING", 0.25, 6, 0, None, "LIGHTING",
+     None, 10),
+    ("VENT_PROG", "Programmation horaire de la ventilation (CTA)", "VENTILATION", 0.30, 1, 0, None, "HVAC", None, 10),
+    ("IT_VEILLE", "Extinction des postes et des veilles la nuit", "IT", 0.10, 0, 0, None, "BEHAVIOUR", None, 3),
     ("ECS_TEMP", "Température d'eau chaude sanitaire ajustée, dans le respect des règles sanitaires", "DHW", 0.08,
-     0, 0, None),
-    ("PROCESS_ARRET", "Arrêt des machines hors production", "PROCESS", 0.10, 0, 0, None),
-    ("FROID_FERMETURES", "Rideaux et fermetures des zones froides", "REFRIGERATION", 0.10, 3, 0, None),
+     0, 0, None, "HVAC", None, 5),
+    ("PROCESS_ARRET", "Arrêt des machines hors production", "PROCESS", 0.10, 0, 0,
+     "Machines-outils maintenues sous tension le week-end : 8,5 kW × 42 h × 47 semaines ≈ 16,8 MWh/an (exemple de la "
+     "formation PRO-REFEI, SP3).", "PROCESS", None, 5),
+    ("FROID_FERMETURES", "Rideaux et fermetures des zones froides", "REFRIGERATION", 0.10, 3, 0, None, "COLD", None,
+     10),
+    # Air comprimé (ADEME, « Entreprises : optimisez vos consommations énergétiques »).
+    ("AIR_FUITES", "Campagne de détection et de réparation des fuites d'air comprimé", "COMPRESSED_AIR", 0.20, 0,
+     4000, "Les fuites représentent souvent 40 à 50 % de la consommation d'air comprimé ; un taux acceptable est "
+     "inférieur à 15 % (ADEME). Programme annuel : les fuites sont récurrentes.", "COMPRESSED_AIR", None, 3),
+    ("AIR_PRESSION", "Baisse de 1 bar de la pression de production d'air comprimé", "COMPRESSED_AIR", 0.07, 0, 0,
+     "De l'ordre de 7 % de l'énergie de compression par bar, davantage avec la baisse des fuites ; la plupart des "
+     "machines n'ont besoin que de 6 bars (ADEME).", "COMPRESSED_AIR", None, 5),
+    ("AIR_ARRET", "Arrêt des compresseurs hors production (nuits, week-ends)", "COMPRESSED_AIR", 0.15, 0, 3000,
+     "Mesurer d'abord la consommation à vide en période d'inactivité : elle chiffre les fuites.", "COMPRESSED_AIR",
+     None, 10),
+    ("AIR_VARIATION", "Compresseur à vitesse variable", "COMPRESSED_AIR", 0.20, 0, 50000,
+     "Pertinent quand la demande d'air varie ; repère : 110 à 125 Wh par Nm³ à 7 bars.", "COMPRESSED_AIR", None, 15),
+    # Moteurs, pompes et ventilateurs.
+    ("MOT_VEV_POMPES", "Variateur électronique de vitesse sur pompes et ventilateurs de process", "PROCESS", 0.25,
+     0, 2500, "Gains souvent supérieurs à 25 % (ADEME) : −20 % de débit, c'est −45 % de puissance appelée (pompe de "
+     "11 kW du cas de la formation, variateur et sondes : 2 500 € HT).", "MOTORS", "IND-UT-102", 15),
+    ("MOT_VEV_VENTILATION", "Variateur électronique de vitesse sur les ventilateurs des CTA", "VENTILATION", 0.25, 0,
+     2500, "Gains souvent supérieurs à 25 % (ADEME).", "MOTORS", "IND-UT-102", 15),
+    ("MOT_HAUT_RENDEMENT", "Moteur à haut rendement au lieu d'un rebobinage", "PROCESS", 0.04, 0, 0,
+     "Situation de référence : le rebobinage. Saisir dans le plan d'actions le coût du moteur neuf et celui du "
+     "rebobinage : la rentabilité porte sur le surinvestissement (formation PRO-REFEI, SP3).", "MOTORS", None, 20),
+    # Chaufferie, vapeur, calorifugeage.
+    ("CHAUF_POINTS_SINGULIERS", "Calorifugeage des points singuliers en chaufferie (matelas isolants)", "HEATING",
+     0.05, 0, 5300, None, "STEAM", "IND-UT-121", 15),
+    ("CHAUF_ECONOMISEUR", "Récupération de chaleur sur les fumées de chaudière (économiseur)", "HEATING", 0.05, 0,
+     20000, "1 % de rendement gagné par abaissement de 20 °C environ des fumées, soit en général de l'ordre de 5 % "
+     "(ADEME).", "STEAM", None, 20),
+    ("CHAUF_COMBUSTION", "Réglage de la combustion et entretien des brûleurs", "HEATING", 0.03, 0, 500, None,
+     "STEAM", None, 2),
+    # Froid et climatisation.
+    ("FROID_HP_FLOTTANTE", "Régulation haute pression flottante sur les groupes froids", "REFRIGERATION", 0.10, 0,
+     9000, None, "COLD", None, 15),
+    ("CLIM_FREE_COOLING", "Free-cooling des ateliers et des locaux", "COOLING", 0.30, 8, 0, None, "HVAC", None, 20),
+    # Organisation et comptage.
+    ("ORGA_TALONS", "Suppression des talons électriques et sensibilisation du personnel", "OTHER", 0.10, 0, 0,
+     "Actions organisationnelles : coût nul pour la plupart, à condition d'impliquer tout le personnel.", "BEHAVIOUR",
+     None, 3),
+    ("COMPTAGE_SOUS_COMPTEURS", "Sous-comptage des usages significatifs", "OTHER", 0.02, 0, 9000,
+     "Un plan de comptage associé à une gestion de l'énergie permet en général 5 à 15 % d'économies (guide "
+     "ComptIAA) ; seul l'effet du suivi est compté ici. Cas fil rouge : 10 sous-compteurs, 9 000 € HT.", "METERING",
+     None, 15),
 ]
+SOURCE_CALCULATED = "calculé"  # modèle de consommation et degrés-jours
+SOURCE_ESTIMATED = "estimé"  # puissance nominale × durée type de fonctionnement
+SOURCE_REMAINDER = "par différence"  # reste de la consommation mesurée
+SOURCE_UNSPLIT = "non réparti"
 FLUID_NAMES = {Fluid.ELEC: "électricité", Fluid.GAS: "gaz"}
 
 
@@ -86,14 +140,20 @@ class SimulatorPermissionError(PermissionError):
 
 
 def ensure_library(db: Session) -> int:
-    """Crée les gestes de la bibliothèque commune qui manquent (idempotent)."""
-    existing = set(db.scalars(select(ActionTemplate.code).where(ActionTemplate.auditor_id.is_(None))))
+    """Crée les gestes de la bibliothèque commune qui manquent et complète leur famille, fiche CEE et durée de vie
+    (idempotent)."""
+    existing = {t.code: t for t in db.scalars(select(ActionTemplate).where(ActionTemplate.auditor_id.is_(None)))}
     created = 0
-    for code, title, usage, pct, eur_m2, eur, notes in DEFAULT_LIBRARY:
-        if code not in existing:
+    for code, title, usage, pct, eur_m2, eur, notes, family, cee, lifetime in DEFAULT_LIBRARY:
+        template = existing.get(code)
+        if template is None:
             db.add(ActionTemplate(code=code, title=title, usage=usage, savings_pct=pct, investment_eur_m2=eur_m2,
-                                  investment_eur=eur, notes=notes))
+                                  investment_eur=eur, notes=notes, category=family, cee_sheet=cee,
+                                  lifetime_years=lifetime))
             created += 1
+        elif template.category is None:
+            template.category, template.cee_sheet, template.lifetime_years = family, cee, lifetime
+            template.notes = template.notes or notes
     db.commit()
     return created
 
@@ -144,6 +204,8 @@ class UsageBreakdown:
     price_source: str
     kgco2e_per_kwh: float
     notes: list[str] = field(default_factory=list)
+    # R1 : provenance de chaque part (norme NF EN 16247 : flux mesuré, calculé ou estimé), pour le bilan énergétique.
+    sources: dict[str, str] = field(default_factory=dict)
 
     def usage_kwh(self, usage: str) -> float:
         return self.total_kwh * self.shares.get(usage, 0.0)
@@ -180,6 +242,7 @@ def breakdown(db: Session, site: Site, weather: WeatherProvider, as_of: date | N
             continue
         notes = []
         shares: dict[str, float] = {}
+        sources: dict[str, str] = {}
         consented = [dp for dp in points if has_active_consent(db, dp.id)]
         model = consumption_model.train(db, consented, end, weather) if consented else None
         if model is not None:
@@ -187,6 +250,7 @@ def breakdown(db: Session, site: Site, weather: WeatherProvider, as_of: date | N
             normal = heating + cooling + rest
             if normal > 0:
                 shares["HEATING"], shares["COOLING"] = heating / normal, cooling / normal
+                sources["HEATING"] = sources["COOLING"] = SOURCE_CALCULATED
                 notes.append(f"Chauffage {round(shares['HEATING'] * 100)} %, refroidissement "
                              f"{round(shares['COOLING'] * 100)} % : part liée au climat d'après le modèle de "
                              "consommation (année de météo normale comparée à une météo neutre).")
@@ -199,17 +263,23 @@ def breakdown(db: Session, site: Site, weather: WeatherProvider, as_of: date | N
             scale = min(1.0, rest_share * total / sum(estimated.values()))
             for usage, kwh in estimated.items():
                 shares[usage] = shares.get(usage, 0.0) + kwh * scale / total
+                sources.setdefault(usage, SOURCE_ESTIMATED)
             shares["OTHER"] = shares.get("OTHER", 0.0) + max(0.0, 1 - sum(shares.values()))
+            sources["OTHER"] = SOURCE_REMAINDER
             notes.append("Autres usages : puissance nominale des équipements du graphe × durée type de fonctionnement "
                          "(éclairage 2 500 h, ventilation 3 000 h, informatique 5 000 h par an…) ; le reste, non "
                          "modélisé (bureautique, prises…), en « autres usages ». À ajuster.")
         else:
             shares["OTHER"] = shares.get("OTHER", 0.0) + rest_share
+            sources["OTHER"] = SOURCE_REMAINDER if shares else SOURCE_UNSPLIT
             notes.append("Aucun équipement à puissance connue dans le graphe : reste en « autres usages ».")
         price, source = tariffs.effective_price(db, points, start, end, fluid)
         factor = emission_factors_at(db, end).get(fluid)
-        results.append(UsageBreakdown(fluid, total, {u: s for u, s in shares.items() if s > 0}, price, source,
-                                      factor.factor_kgco2_per_kwh if factor else 0.0, notes))
+        kept = {u: s for u, s in shares.items() if s > 0}
+        if set(kept) == {"OTHER"}:
+            sources["OTHER"] = SOURCE_UNSPLIT
+        results.append(UsageBreakdown(fluid, total, kept, price, source, factor.factor_kgco2_per_kwh if factor else 0.0,
+                                      notes, {u: sources.get(u, SOURCE_ESTIMATED) for u in kept}))
     return results
 
 
