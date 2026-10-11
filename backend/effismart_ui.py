@@ -34,6 +34,7 @@ from app.models import (  # noqa: E402
     ActionStatus,
     AdjustmentKind,
     AssetNodeKind,
+    AssetRelationKind,
     Auditor,
     CommunicationStatus,
     IpeKind,
@@ -73,7 +74,7 @@ from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
 from app.services import energy_data, ipe, quarterly_reports, simulator, site_plan, tariffs  # noqa: E402
 from app.services import action_plan, economics, energy_balance, energy_management, metering_plan  # noqa: E402
-from app.services import warmup  # noqa: E402
+from app.services import equipment_view, warmup  # noqa: E402
 from app.services import ipe_definitions as ipe_defs  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
@@ -1523,6 +1524,272 @@ def asset_editor(db: Session, repo: TenantRepository, user: User, site_id: int, 
             st.caption("Un compteur suit son point de livraison : il se gère dans « Patrimoine & consentements ».")
 
 
+# --- Équipements : graphe et plan cliquables, fiche d'un élément ----------------------------------------------
+
+NODE_SHAPES = {
+    AssetNodeKind.METER: "square", AssetNodeKind.EQUIPMENT: "circle", AssetNodeKind.FLOW: "diamond",
+    AssetNodeKind.ZONE: "M-1.5,-0.85H1.5V0.85H-1.5Z",
+    AssetNodeKind.USAGE: "M-1,0L-0.5,-0.87L0.5,-0.87L1,0L0.5,0.87L-0.5,0.87Z",
+}
+RELATION_COLORS = {"alimente": "#94a3b8", "produit": "#22c55e", "dessert": "#a5b4fc", "accueille": "#fbbf24"}
+LABEL_COLOR = "#e2e8f0"
+SELECTED_COLOR = "#f8fafc"  # contour de l'élément cliqué : blanc, lisible sur toutes les couleurs de nœud
+LINE_BREAK = "\n"  # séparateur de lignes des libellés (propriété « lineBreak » de Vega-Lite)
+
+
+def wrap_label(text: str, width: int = 16, lines: int = 2) -> str:
+    """Libellé sur deux lignes au plus (« Compteur élec. / 30001000000003 ») : les voisins ne se chevauchent plus."""
+    out: list[str] = []
+    for word in text.split():
+        if out and len(out[-1]) + 1 + len(word) <= width:
+            out[-1] += " " + word
+        else:
+            out.append(word)
+    if len(out) > lines:
+        out = out[:lines]
+        out[-1] = out[-1][: width - 1].rstrip() + "…"
+    return LINE_BREAK.join(out)
+
+
+def clicked_id(event, *names: str) -> int | None:
+    """Identifiant de l'élément cliqué dans un graphique Altair (`on_select="rerun"`), sinon None."""
+    selection = (event or {}).get("selection", {}) if event is not None else {}
+    for name in names:
+        for item in selection.get(name) or []:
+            if isinstance(item, dict) and item.get("id") is not None:
+                return int(item["id"])
+    return None
+
+
+def focused(key: str, clicked: int | None, options: dict[int, str], label: str) -> int | None:
+    """Élément affiché : le dernier cliqué, ou celui choisi dans la liste (accès au clavier)."""
+    if st.session_state.get(f"{key}-last") != clicked:
+        st.session_state[f"{key}-last"] = clicked
+        st.session_state[f"{key}-pick"] = clicked if clicked in options else None
+    return st.selectbox(label, [None, *options], key=f"{key}-pick",
+                        format_func=lambda i: "— cliquez sur un élément, ou choisissez-le ici —" if i is None
+                        else options[i])
+
+
+def node_tooltip(node) -> str:
+    details = [assets.category(node).label]
+    if node.power_kw:
+        details.append(f"{fmt_number(node.power_kw, 0 if float(node.power_kw).is_integer() else 1)} kW")
+    if node.always_occupied:
+        details.append("occupée 24 h/24")
+    return " · ".join(details)
+
+
+def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int]) -> alt.LayerChart:
+    """Graphe physique cliquable : de gauche à droite, le sens de l'énergie."""
+    lay = equipment_view.layout(graph)
+    style = assets._NODE_STYLE
+    nodes = pd.DataFrame([{
+        "id": n.id, "x": lay.positions[n.id][0], "y": lay.positions[n.id][1], "Élément": n.name,
+        "label": wrap_label(n.name), "Type": assets.KIND_LABELS[n.kind], "Détail": node_tooltip(n),
+        "shape": NODE_SHAPES[n.kind],
+        "fill": style[n.kind][0], "stroke": "#fbbf24" if n.id in highlight else style[n.kind][1],
+    } for n in graph.nodes.values()])
+    edges = pd.DataFrame([{
+        "x": lay.positions[r.source_id][0], "y": lay.positions[r.source_id][1],
+        "x2": lay.positions[r.target_id][0], "y2": lay.positions[r.target_id][1],
+        "Lien": assets.RELATION_LABELS[r.kind],
+    } for r in graph.relations if r.source_id in lay.positions and r.target_id in lay.positions])
+    x = alt.X("x:Q", axis=None, scale=alt.Scale(domain=[-0.45, lay.ranks - 0.55]))
+    y = alt.Y("y:Q", axis=None, scale=alt.Scale(domain=[-0.75, lay.widest - 0.25], reverse=True))
+    select = alt.selection_point(name="element", fields=["id"], on="click")
+    layers = []
+    if not edges.empty:
+        layers.append(alt.Chart(edges).mark_rule(strokeWidth=1.6, opacity=0.55).encode(
+            x=x, y=y, x2="x2:Q", y2="y2:Q",
+            color=alt.Color("Lien:N", title=None, legend=alt.Legend(orient="top", columnPadding=24),
+                            scale=alt.Scale(domain=list(RELATION_COLORS), range=list(RELATION_COLORS.values())))))
+    # L'élément cliqué est mis en évidence par la sélection elle-même : le graphique ne change pas d'un clic à
+    # l'autre (le redessiner effacerait la sélection).
+    layers.append(alt.Chart(nodes).mark_point(filled=True, opacity=1, cursor="pointer").encode(
+        x=x, y=y, shape=alt.Shape("shape:N", scale=None), fill=alt.Fill("fill:N", scale=None),
+        stroke=alt.condition(select, alt.value(SELECTED_COLOR), alt.Stroke("stroke:N", scale=None), empty=False),
+        strokeWidth=alt.condition(select, alt.value(4), alt.value(2.2), empty=False),
+        size=alt.condition(select, alt.value(760), alt.value(520), empty=False),
+        tooltip=["Élément:N", "Type:N", "Détail:N"]).add_params(select))
+    layers.append(alt.Chart(nodes).mark_text(baseline="top", dy=16, fontSize=11, lineHeight=13, lineBreak=LINE_BREAK,
+                                             color=LABEL_COLOR).encode(x=x, y=y, text="label:N"))
+    return alt.layer(*layers).properties(height=max(320, 82 * lay.widest))
+
+
+def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChart:
+    """Plan 2D cliquable : zones (rectangles), équipements et compteurs (points), anomalies situées."""
+    sx, sy = alt.Scale(domain=[0, 100]), alt.Scale(domain=[0, 100], reverse=True)
+    x, y = alt.X("x:Q", axis=None, scale=sx), alt.Y("y:Q", axis=None, scale=sy)
+    layers = []
+    if image_uri:
+        layers.append(alt.Chart(pd.DataFrame([{"x": 0, "y": 0, "x2": 100, "y2": 100, "url": image_uri}]))
+                      .mark_image(aspect=False, opacity=0.92).encode(x=x, y=y, x2="x2:Q", y2="y2:Q", url="url:N"))
+    else:
+        grid = pd.DataFrame([{"v": v} for v in range(10, 100, 10)])
+        layers.append(alt.Chart(grid).mark_rule(color=ui.BORDER, strokeWidth=1).encode(x=alt.X("v:Q", axis=None, scale=sx)))
+        layers.append(alt.Chart(grid).mark_rule(color=ui.BORDER, strokeWidth=1).encode(y=alt.Y("v:Q", axis=None, scale=sy)))
+    zones = pd.DataFrame([{
+        "id": n.id, "x": n.plan_x, "y": n.plan_y, "x2": n.plan_x + n.plan_w, "y2": n.plan_y + n.plan_h,
+        "Zone": n.name, "Détail": node_tooltip(n) + (" · " + " ; ".join(marks.notes[n.id]) if n.id in marks.notes else ""),
+        "fill": "#f59e0b" if n.id in marks.zones else site_plan.ZONE_FILL.get(n.category, "#8b5cf6"),
+        "opacity": 0.34 if n.id in marks.zones else 0.18, "width": 4 if n.id in marks.zones else 1.5,
+    } for n in nodes if n.kind == AssetNodeKind.ZONE and n.plan_x is not None and n.plan_w is not None])
+    points = pd.DataFrame([{
+        "id": n.id, "x": n.plan_x, "y": n.plan_y, "Élément": n.name, "label": wrap_label(n.name, 18),
+        "Type": assets.KIND_LABELS[n.kind],
+        "Détail": node_tooltip(n) + (" · " + " ; ".join(marks.notes[n.id]) if n.id in marks.notes else ""),
+        "shape": NODE_SHAPES[n.kind],
+        "fill": "#ef4444" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][0],
+        "stroke": "#fecaca" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][1],
+    } for n in nodes if n.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) and n.plan_x is not None])
+    if not zones.empty:
+        zone_select = alt.selection_point(name="zone", fields=["id"], on="click")
+        layers.append(alt.Chart(zones).mark_rect(cornerRadius=8, cursor="pointer").encode(
+            x=x, y=y, x2="x2:Q", y2="y2:Q", fill=alt.Fill("fill:N", scale=None),
+            stroke=alt.condition(zone_select, alt.value(SELECTED_COLOR), alt.Stroke("fill:N", scale=None), empty=False),
+            fillOpacity=alt.FillOpacity("opacity:Q", scale=None),
+            strokeWidth=alt.condition(zone_select, alt.value(5), alt.StrokeWidth("width:Q", scale=None), empty=False),
+            tooltip=["Zone:N", "Détail:N"]).add_params(zone_select))
+        layers.append(alt.Chart(zones).mark_text(align="left", baseline="top", dx=8, dy=8, fontSize=13, fontWeight=600,
+                                                 color=LABEL_COLOR).encode(x=x, y=y, text="Zone:N"))
+    if not points.empty:
+        element_select = alt.selection_point(name="element", fields=["id"], on="click")
+        layers.append(alt.Chart(points).mark_point(filled=True, opacity=1, cursor="pointer").encode(
+            x=x, y=y, shape=alt.Shape("shape:N", scale=None), fill=alt.Fill("fill:N", scale=None),
+            stroke=alt.condition(element_select, alt.value(SELECTED_COLOR), alt.Stroke("stroke:N", scale=None),
+                                 empty=False),
+            strokeWidth=alt.condition(element_select, alt.value(4), alt.value(2.2), empty=False),
+            size=alt.condition(element_select, alt.value(620), alt.value(380), empty=False),
+            tooltip=["Élément:N", "Type:N", "Détail:N"]).add_params(element_select))
+        layers.append(alt.Chart(points).mark_text(baseline="top", dy=14, fontSize=11, lineHeight=13,
+                                                  lineBreak=LINE_BREAK, color=LABEL_COLOR)
+                      .encode(x=x, y=y, text="label:N"))
+    aspect = plan.aspect_ratio if plan else site_plan.DEFAULT_ASPECT
+    return alt.layer(*layers).properties(height=round(820 * aspect))
+
+
+def consumption_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str) -> None:
+    """Consommation d'un compteur ou d'un équipement sur 12 mois, avec sa méthode de calcul."""
+    result = equipment_view.node_consumption(db, site, graph, node_id)
+    if result is None:
+        return
+    label, tone, how = equipment_view.METHOD_LABELS[result.method]
+    period = (f" · du {fmt_date(result.start)} au {fmt_date(result.end)}" if result.start else "")
+    ui.render(f"<div class='es-output-gain'>{ui.status(label, tone)} <span class='sub'>{ui.e(how)}{ui.e(period)}"
+              "</span></div>")
+    if result.by_fluid:
+        shares = [s for s in result.sources if s.share is not None and s.method == "ESTIMATED"]
+        ui.kpi_grid([
+            {"label": "Consommation sur 12 mois", "value": fmt_energy(result.kwh), "icon": "total",
+             "note": " + ".join(f"{FLUID_LABELS[f].lower()} {fmt_energy(sum(d.values()))}"
+                                for f, d in result.by_fluid.items())},
+            {"label": "Coût", "value": fmt_eur(result.eur), "icon": "cost", "note": "au prix payé, € HT"},
+            {"label": "Émissions", "value": fmt_emissions(result.kgco2e), "icon": "co2", "note": "facteurs ADEME"},
+            {"label": "Part du compteur", "value": f"{fmt_number(shares[0].share * 100)} %" if shares else "100 %",
+             "icon": "elec", "note": shares[0].meter.name if shares else "mesure entière"},
+        ])
+        rows = [{"Mois": fmt_month(month), "Énergie": FLUID_LABELS[fluid], "kWh": kwh}
+                for (month, fluid), kwh in result.monthly().items()]
+        order = list(dict.fromkeys(r["Mois"] for r in rows))
+        chart = alt.Chart(pd.DataFrame(rows)).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3,
+                                                       opacity=0.7 if result.method == "ESTIMATED" else 1).encode(
+            x=alt.X("Mois:N", sort=order, title=None, axis=alt.Axis(labelAngle=-45)),
+            y=alt.Y("kWh:Q", title="kWh par mois" + (" (estimés)" if result.method == "ESTIMATED" else "")),
+            color=alt.Color("Énergie:N", title=None, legend=alt.Legend(columnPadding=24), scale=alt.Scale(
+                domain=[FLUID_LABELS[f] for f in result.by_fluid],
+                range=[FLUID_COLORS[FLUID_LABELS[f]] for f in result.by_fluid])),
+            tooltip=["Mois", "Énergie", alt.Tooltip("kWh:Q", format=",.0f")])
+        st.altair_chart(style_chart(chart.properties(height=220)), width="stretch", key=f"{key}-months")
+        if result.method in ("MEASURED", "DIFFERENCE") and result.end:
+            recent = [{"Jour": day, "kWh": kwh} for days in result.by_fluid.values() for day, kwh in days.items()
+                      if day > result.end - timedelta(days=30)]
+            if recent:
+                line = alt.Chart(pd.DataFrame(recent)).mark_line(point=True, color=ui.PRIMARY).encode(
+                    x=alt.X("Jour:T", title=None, axis=alt.Axis(format="%d/%m")), y=alt.Y("sum(kWh):Q", title="kWh par jour"),
+                    tooltip=[alt.Tooltip("Jour:T", format="%d/%m/%Y"), alt.Tooltip("sum(kWh):Q", format=",.0f")])
+                st.caption("30 derniers jours (données J+1)")
+                st.altair_chart(style_chart(line.properties(height=180)), width="stretch", key=f"{key}-days")
+    for line_text in result.explanation:
+        st.caption(line_text)
+    if result.method == "ESTIMATED":
+        st.caption("Pour une mesure plutôt qu'une estimation, posez un sous-compteur sur cet équipement (page Bilan "
+                   "énergétique, plan de comptage).")
+
+
+def relations_text(graph: assets.SiteGraph, node) -> list[str]:
+    """Liens physiques de l'élément, en clair : ce qui l'alimente, ce qu'il produit, ce qu'il dessert."""
+    lines = []
+    for rel_kind, verb in ((AssetRelationKind.SUPPLIES, "Alimenté par"), (AssetRelationKind.PRODUCES, "Produit par"),
+                           (AssetRelationKind.SERVES, "Desservie par"), (AssetRelationKind.HOSTS, "Accueilli dans")):
+        names = [n.name for r, n in graph.predecessors(node.id) if r.kind == rel_kind]
+        if names:
+            lines.append(f"{verb} : {', '.join(names)}")
+    for rel_kind, verb in ((AssetRelationKind.SUPPLIES, "Alimente"), (AssetRelationKind.PRODUCES, "Produit"),
+                           (AssetRelationKind.SERVES, "Dessert"), (AssetRelationKind.HOSTS, "Accueille")):
+        names = [n.name for r, n in graph.successors(node.id) if r.kind == rel_kind]
+        if names:
+            lines.append(f"{verb} : {', '.join(names)}")
+    return lines
+
+
+def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, key: str) -> None:
+    """Équipements présents dans une zone : ceux qui la desservent (graphe) et ceux placés dans son périmètre."""
+    content = equipment_view.zone_content(graph, zone_id)
+    if content is None:
+        return
+    zone = content.zone
+    facts = [f"{fmt_number(zone.surface_m2)} m²"] if zone.surface_m2 else []
+    if content.usages:
+        facts.append("usages : " + ", ".join(u.name for u in content.usages))
+    if facts:
+        st.caption(" · ".join(facts))
+    equipment = content.serving + [n for n in content.placed if n.kind == AssetNodeKind.EQUIPMENT]
+    if not equipment and not content.placed:
+        st.info("Aucun équipement ne dessert cette zone ni n'y est placé : complétez le graphe ou le plan.")
+        return
+    rows = []
+    for node in content.serving + content.placed:
+        result = equipment_view.node_consumption(db, site, graph, node.id) if node.kind in (
+            AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) else None
+        label, tone, _ = equipment_view.METHOD_LABELS[result.method] if result else ("—", "neutral", "")
+        where = "dessert la zone" if node in content.serving else "placé dans la zone"
+        shared = content.shared.get(node.id)
+        rows.append([ui.e(node.name) + f"<span class='sub'>{ui.e(assets.KIND_LABELS[node.kind])} · {ui.e(where)}"
+                     + (f" · dessert aussi {ui.e(', '.join(shared))}" if shared else "") + "</span>",
+                     ui.e(node_tooltip(node)),
+                     ui.e(fmt_energy(result.kwh)) if result and result.by_fluid else "—",
+                     ui.status(label, tone) if result else ""])
+    ui.table(["Équipement", "Type, puissance", "Consommation 12 mois", "Méthode"], rows, numeric={2})
+    if any(content.shared.values()):
+        st.caption("Un équipement qui dessert plusieurs zones est compté en entier dans chacune : sa consommation "
+                   "n'est pas répartie entre les zones.")
+    consumers = {n.id: n.name for n in content.serving + content.placed}
+    chosen = st.selectbox("Voir le détail d'un équipement de la zone", [None, *consumers], key=f"{key}-zone-pick",
+                          format_func=lambda i: "—" if i is None else consumers[i])
+    if chosen is not None:
+        with st.container(border=True):
+            st.markdown(f"**{consumers[chosen]}**")
+            consumption_detail(db, site, graph, chosen, f"{key}-zone-{chosen}")
+
+
+def node_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str, notes: list[str]) -> None:
+    node = graph.nodes.get(node_id)
+    if node is None:
+        return
+    with st.container(border=True):
+        st.markdown(f"#### {node.name}")
+        st.caption(f"{assets.KIND_LABELS[node.kind]} · {node_tooltip(node)}")
+        for note in notes:
+            ui.render(f"<div class='es-output-gain'>{ui.status('Anomalie récente', 'danger')} {ui.e(note)}</div>")
+        if node.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER):
+            consumption_detail(db, site, graph, node.id, key)
+        elif node.kind == AssetNodeKind.ZONE:
+            zone_detail(db, site, graph, node.id, key)
+        for line_text in relations_text(graph, node):
+            st.caption(line_text)
+
+
 def page_assets(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     ui.page_header(org.name, "Équipements",
                    "Graphe physique : ce qui alimente quoi, ce qui produit quoi, quelles zones et quels usages sont "
@@ -1546,18 +1813,29 @@ def asset_graph_view(db: Session, repo: TenantRepository, user: User, org: Organ
                      graph: assets.SiteGraph) -> None:
     active = [r for r in repo.list_recommendations(org.id, [ReviewStatus.PROPOSED, ReviewStatus.VALIDATED])
               if r.site_id == site_id and r.equipment_id]
+    site = repo.get_site(site_id)
+    focus = None
     with st.container(border=True):
         st.header("Graphe physique")
-        if graph.relations:
-            st.graphviz_chart(graph.to_dot({r.equipment_id for r in active}), width="stretch")
-        else:
-            st.caption("Aucune relation pour l'instant : seuls les compteurs sont connus.")
+        if graph.nodes:
+            key = f"asset-graph-{site_id}"
+            event = st.altair_chart(style_chart(asset_graph_chart(graph, {r.equipment_id for r in active})),
+                                    on_select="rerun", key=f"{key}-chart", width="stretch")
+            options = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in
+                       sorted(graph.nodes.values(), key=lambda n: (equipment_view.KIND_ORDER[n.kind], n.name.lower()))}
+            focus = focused(key, clicked_id(event, "element"), options, "Élément affiché")
+            if not graph.relations:
+                st.caption("Aucune relation pour l'instant : seuls les compteurs sont connus.")
         ui.render(
             "<div class='es-legend'><span><i class='k-meter'></i>Compteur</span><span><i class='k-equipment'></i>"
             "Équipement</span><span><i class='k-flow'></i>Fluide produit</span><span><i class='k-zone'></i>Zone</span>"
             "<span><i class='k-usage'></i>Usage</span><span><i class='k-target'></i>Visé par une recommandation "
             "en cours</span></div>"
         )
+        st.caption("De gauche à droite, le sens de l'énergie. Cliquez sur un équipement ou un compteur pour voir sa "
+                   "consommation, sur une zone pour voir ses équipements.")
+    if focus is not None:
+        node_detail(db, site, graph, focus, f"asset-graph-{site_id}", plan_marks(db, user, site_id).notes.get(focus, []))
     left, right = st.columns([3, 2])
     with left:
         st.header("Chaînes physiques")
@@ -3066,14 +3344,28 @@ def page_reports(db: Session, repo: TenantRepository, user: User, org: Organizat
 # --- F8 : plan 2D ---------------------------------------------------------------------------------------------
 
 
+def plan_marks(db: Session, user: User, site_id: int) -> site_plan.PlanMarks:
+    """Anomalies des 30 derniers jours situées sur le site (à valider : vues des seuls valideurs, principe P1)."""
+    statuses = (DriftStatus.OPEN, DriftStatus.QUALIFIED) if sees_unvalidated(user) else (DriftStatus.QUALIFIED,)
+    return site_plan.marks_for(site_plan.recent_anomalies(db, site_id, statuses=statuses))
+
+
 def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int) -> None:
     nodes = repo.list_asset_nodes(site_id)
     plan = site_plan.get_plan(db, site_id)
-    statuses = (DriftStatus.OPEN, DriftStatus.QUALIFIED) if sees_unvalidated(user) else (DriftStatus.QUALIFIED,)
-    anomalies = site_plan.recent_anomalies(db, site_id, statuses=statuses)
-    ui.render(site_plan.render_svg(nodes, plan, site_plan.marks_for(anomalies), site_plan.image_data_uri(plan)))
+    marks = plan_marks(db, user, site_id)
+    key = f"asset-plan-{site_id}"
+    event = st.altair_chart(style_chart(plan_chart(nodes, plan, marks, site_plan.image_data_uri(plan))),
+                            on_select="rerun", key=f"{key}-chart", width="stretch")
     st.caption("En rouge : équipement suspect d'une anomalie des 30 derniers jours ; en orange : zone potentiellement "
-               "impactée. Survolez un élément pour le détail. Maquette 3D : prévue en version 3.")
+               "impactée. Cliquez sur un équipement pour voir sa consommation, sur une zone pour voir les équipements "
+               "présents. Maquette 3D : prévue en version 3.")
+    placed = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in nodes if n.plan_x is not None
+              and n.kind in (AssetNodeKind.ZONE, AssetNodeKind.EQUIPMENT, AssetNodeKind.METER)}
+    focus = focused(key, clicked_id(event, "element", "zone"), placed, "Élément affiché")
+    if focus is not None:
+        node_detail(db, repo.get_site(site_id), assets.site_graph(db, repo, site_id), focus, key,
+                    marks.notes.get(focus, []))
     missing = site_plan.unplaced(nodes)
     if missing:
         st.caption("Non placés : " + ", ".join(n.name for n in missing) + ".")

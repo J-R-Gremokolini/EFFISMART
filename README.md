@@ -385,9 +385,11 @@ s'arrêtent. C'est un argument commercial que l'étude de marché n'exploitait p
 
 **F8 — plan 2D** (`app/services/site_plan.py`). Les zones du graphe P2 sont des rectangles, les équipements et
 les compteurs des points, placés en % du plan ; une image (PNG ou JPEG) peut servir de fond. Les anomalies des
-30 derniers jours y sont situées : l'équipement suspect clignote en rouge, les zones potentiellement impactées
-sont surlignées. Le plan apparaît aussi sur la carte de l'anomalie. La maquette 3D, coûteuse à développer et à
-alimenter, est reportée en V3 : un plan 2D branché sur le graphe est plus utile qu'une 3D vide.
+30 derniers jours y sont situées : l'équipement suspect est en rouge, les zones potentiellement impactées sont
+surlignées en orange. Le plan apparaît aussi sur la carte de l'anomalie (l'équipement suspect y clignote). Un
+clic sur un équipement affiche sa consommation, un clic sur une zone ses équipements (voir « Graphe et plan
+cliquables »). La maquette 3D, coûteuse à développer et à alimenter, est reportée en V3 : un plan 2D branché
+sur le graphe est plus utile qu'une 3D vide.
 
 **F9 — simulateur** (`app/services/simulator.py`).
 1. **Consommation par usage** sur 12 mois :
@@ -705,6 +707,36 @@ Compteur → alimente → Chaudière → produit → Eau chaude → alimente →
 - **Qui modifie** : l'auditeur ; l'espace client consulte. Démo : graphes de la Clinique du Parc et des deux
   sites de Logistique Rhône ; les Boulangeries Martin n'en ont pas, pour montrer une recommandation
   « identifier l'équipement en cause ». API : `GET /api/sites/{id}/assets`.
+
+### Graphe et plan cliquables
+
+Le graphe physique se lit de gauche à droite, dans le sens de l'énergie : compteurs, équipements, fluides
+produits, équipements desservis, zones, usages. L'ordre dans chaque colonne limite les croisements de liens.
+Sur le graphe comme sur le plan 2D :
+
+- **un clic sur un équipement ou un compteur** affiche sa consommation sur 12 mois : énergie, coût au prix
+  payé (contrat F6, à défaut un prix indicatif), émissions, part du compteur, barres mensuelles par énergie.
+  Pour une mesure, la courbe des 30 derniers jours s'y ajoute ;
+- **un clic sur une zone** liste ses équipements, avec la consommation et la méthode de chacun : ceux qui la
+  desservent (graphe) et ceux qui sont seulement placés dans son rectangle sur le plan. Un équipement qui
+  dessert aussi d'autres zones est signalé, car sa consommation n'est pas propre à la zone.
+
+Un menu « Élément affiché » reprend le dernier clic et permet aussi de choisir l'élément au clavier. Les
+anomalies récentes de l'élément s'affichent avec sa consommation.
+
+La consommation d'un équipement dépend de son comptage, et la méthode est toujours indiquée
+(`app/services/equipment_view.py`) :
+
+| Méthode | Cas | Calcul |
+|---|---|---|
+| Mesurée | seul équipement de son compteur | la mesure du compteur |
+| Calculée | seul équipement restant d'un compteur qui a des sous-compteurs | compteur moins ses sous-compteurs |
+| Estimée | le compteur alimente plusieurs équipements | part au prorata de puissance nominale × durée type à pleine puissance (éclairage 2 500 h, informatique 5 000 h, groupe froid 800 h…) |
+| Sans compteur en amont | l'équipement reçoit un fluide (eau chaude, eau glacée…) | aucune : l'énergie est comptée sur l'équipement qui produit ce fluide |
+| Non estimable | puissance inconnue, ou pas de données | aucune ; l'interface dit ce qui manque |
+
+Une estimation reste une estimation : seul un sous-compteur la transforme en mesure, et la page renvoie alors
+au plan de comptage.
 
 ## Intégrations d'API
 
