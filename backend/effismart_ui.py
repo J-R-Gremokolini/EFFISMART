@@ -1617,6 +1617,13 @@ def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int]) -> alt.Layer
     return alt.layer(*layers).properties(height=max(320, 82 * lay.widest))
 
 
+def on_plan(node) -> bool:
+    """Élément dessiné sur le plan : une zone avec son rectangle, un équipement ou un compteur avec sa position."""
+    if node.kind == AssetNodeKind.ZONE:
+        return node.plan_x is not None and node.plan_w is not None
+    return node.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) and node.plan_x is not None
+
+
 def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChart:
     """Plan 2D cliquable : zones (rectangles), équipements et compteurs (points), anomalies situées."""
     sx, sy = alt.Scale(domain=[0, 100]), alt.Scale(domain=[0, 100], reverse=True)
@@ -1634,7 +1641,7 @@ def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChar
         "Zone": n.name, "Détail": node_tooltip(n) + (" · " + " ; ".join(marks.notes[n.id]) if n.id in marks.notes else ""),
         "fill": "#f59e0b" if n.id in marks.zones else site_plan.ZONE_FILL.get(n.category, "#8b5cf6"),
         "opacity": 0.34 if n.id in marks.zones else 0.18, "width": 4 if n.id in marks.zones else 1.5,
-    } for n in nodes if n.kind == AssetNodeKind.ZONE and n.plan_x is not None and n.plan_w is not None])
+    } for n in nodes if n.kind == AssetNodeKind.ZONE and on_plan(n)])
     points = pd.DataFrame([{
         "id": n.id, "x": n.plan_x, "y": n.plan_y, "Élément": n.name, "label": wrap_label(n.name, 18),
         "Type": assets.KIND_LABELS[n.kind],
@@ -1642,7 +1649,7 @@ def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChar
         "shape": NODE_SHAPES[n.kind],
         "fill": "#ef4444" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][0],
         "stroke": "#fecaca" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][1],
-    } for n in nodes if n.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) and n.plan_x is not None])
+    } for n in nodes if n.kind != AssetNodeKind.ZONE and on_plan(n)])
     if not zones.empty:
         zone_select = alt.selection_point(name="zone", fields=["id"], on="click")
         layers.append(alt.Chart(zones).mark_rect(cornerRadius=8, cursor="pointer").encode(
@@ -3355,17 +3362,23 @@ def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int) 
     plan = site_plan.get_plan(db, site_id)
     marks = plan_marks(db, user, site_id)
     key = f"asset-plan-{site_id}"
-    event = st.altair_chart(style_chart(plan_chart(nodes, plan, marks, site_plan.image_data_uri(plan))),
-                            on_select="rerun", key=f"{key}-chart", width="stretch")
-    st.caption("En rouge : équipement suspect d'une anomalie des 30 derniers jours ; en orange : zone potentiellement "
-               "impactée. Cliquez sur un équipement pour voir sa consommation, sur une zone pour voir les équipements "
-               "présents. Maquette 3D : prévue en version 3.")
-    placed = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in nodes if n.plan_x is not None
-              and n.kind in (AssetNodeKind.ZONE, AssetNodeKind.EQUIPMENT, AssetNodeKind.METER)}
-    focus = focused(key, clicked_id(event, "element", "zone"), placed, "Élément affiché")
-    if focus is not None:
-        node_detail(db, repo.get_site(site_id), assets.site_graph(db, repo, site_id), focus, key,
-                    marks.notes.get(focus, []))
+    chart = style_chart(plan_chart(nodes, plan, marks, site_plan.image_data_uri(plan)))
+    placed = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in nodes if on_plan(n)}
+    if not placed:
+        # Rien à cliquer : Streamlit refuse une sélection que le graphique ne définit pas.
+        st.altair_chart(chart, width="stretch")
+        st.caption("Aucun élément placé sur le plan pour l'instant" + (
+            " : placez les zones, les équipements et les compteurs ci-dessous." if assets.can_edit(user)
+            else " : votre auditeur énergétique s'en charge.") + " Maquette 3D : prévue en version 3.")
+    else:
+        event = st.altair_chart(chart, on_select="rerun", key=f"{key}-chart", width="stretch")
+        st.caption("En rouge : équipement suspect d'une anomalie des 30 derniers jours ; en orange : zone "
+                   "potentiellement impactée. Cliquez sur un équipement pour voir sa consommation, sur une zone pour "
+                   "voir les équipements présents. Maquette 3D : prévue en version 3.")
+        focus = focused(key, clicked_id(event, "element", "zone"), placed, "Élément affiché")
+        if focus is not None:
+            node_detail(db, repo.get_site(site_id), assets.site_graph(db, repo, site_id), focus, key,
+                        marks.notes.get(focus, []))
     missing = site_plan.unplaced(nodes)
     if missing:
         st.caption("Non placés : " + ", ".join(n.name for n in missing) + ".")
