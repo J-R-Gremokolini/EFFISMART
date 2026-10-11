@@ -1571,22 +1571,36 @@ def focused(key: str, clicked: int | None, options: dict[int, str], label: str) 
                         else options[i])
 
 
-def node_tooltip(node) -> str:
+def consumption_text(result: equipment_view.NodeConsumption | None) -> str:
+    """Consommation sur 12 mois en quelques mots, avec sa méthode quand ce n'est pas une mesure."""
+    if result is None:
+        return ""
+    if result.method == "NO_METER":
+        return "consommation comptée sur l'équipement producteur"
+    if result.method == "UNKNOWN":
+        return "consommation non estimable"
+    suffix = {"ESTIMATED": " (estimée)", "DIFFERENCE": " (calculée)"}.get(result.method, "")
+    return ("≈ " if result.method == "ESTIMATED" else "") + f"{fmt_energy(result.kwh)} sur 12 mois{suffix}"
+
+
+def node_tooltip(node, consumption: equipment_view.NodeConsumption | None = None) -> str:
     details = [assets.category(node).label]
-    if node.power_kw:
-        details.append(f"{fmt_number(node.power_kw, 0 if float(node.power_kw).is_integer() else 1)} kW")
+    if consumption is not None:
+        details.append(consumption_text(consumption))
     if node.always_occupied:
         details.append("occupée 24 h/24")
     return " · ".join(details)
 
 
-def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int]) -> alt.LayerChart:
+def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int],
+                      consumptions: dict[int, equipment_view.NodeConsumption]) -> alt.LayerChart:
     """Graphe physique cliquable : de gauche à droite, le sens de l'énergie."""
     lay = equipment_view.layout(graph)
     style = assets._NODE_STYLE
     nodes = pd.DataFrame([{
         "id": n.id, "x": lay.positions[n.id][0], "y": lay.positions[n.id][1], "Élément": n.name,
-        "label": wrap_label(n.name), "Type": assets.KIND_LABELS[n.kind], "Détail": node_tooltip(n),
+        "label": wrap_label(n.name), "Type": assets.KIND_LABELS[n.kind],
+        "Détail": node_tooltip(n, consumptions.get(n.id)),
         "shape": NODE_SHAPES[n.kind],
         "fill": style[n.kind][0], "stroke": "#fbbf24" if n.id in highlight else style[n.kind][1],
     } for n in graph.nodes.values()])
@@ -1624,7 +1638,8 @@ def on_plan(node) -> bool:
     return node.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) and node.plan_x is not None
 
 
-def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChart:
+def plan_chart(nodes: list, plan, marks, image_uri: str | None,
+               consumptions: dict[int, equipment_view.NodeConsumption]) -> alt.LayerChart:
     """Plan 2D cliquable : zones (rectangles), équipements et compteurs (points), anomalies situées."""
     sx, sy = alt.Scale(domain=[0, 100]), alt.Scale(domain=[0, 100], reverse=True)
     x, y = alt.X("x:Q", axis=None, scale=sx), alt.Y("y:Q", axis=None, scale=sy)
@@ -1645,7 +1660,8 @@ def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChar
     points = pd.DataFrame([{
         "id": n.id, "x": n.plan_x, "y": n.plan_y, "Élément": n.name, "label": wrap_label(n.name, 18),
         "Type": assets.KIND_LABELS[n.kind],
-        "Détail": node_tooltip(n) + (" · " + " ; ".join(marks.notes[n.id]) if n.id in marks.notes else ""),
+        "Détail": node_tooltip(n, consumptions.get(n.id))
+                  + (" · " + " ; ".join(marks.notes[n.id]) if n.id in marks.notes else ""),
         "shape": NODE_SHAPES[n.kind],
         "fill": "#ef4444" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][0],
         "stroke": "#fecaca" if n.id in marks.suspects else assets._NODE_STYLE[n.kind][1],
@@ -1676,9 +1692,10 @@ def plan_chart(nodes: list, plan, marks, image_uri: str | None) -> alt.LayerChar
     return alt.layer(*layers).properties(height=round(820 * aspect))
 
 
-def consumption_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str) -> None:
+def consumption_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str,
+                       consumptions: dict[int, equipment_view.NodeConsumption]) -> None:
     """Consommation d'un compteur ou d'un équipement sur 12 mois, avec sa méthode de calcul."""
-    result = equipment_view.node_consumption(db, site, graph, node_id)
+    result = consumptions.get(node_id)
     if result is None:
         return
     label, tone, how = equipment_view.METHOD_LABELS[result.method]
@@ -1740,7 +1757,8 @@ def relations_text(graph: assets.SiteGraph, node) -> list[str]:
     return lines
 
 
-def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, key: str) -> None:
+def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, key: str,
+                consumptions: dict[int, equipment_view.NodeConsumption]) -> None:
     """Équipements présents dans une zone : ceux qui la desservent (graphe) et ceux placés dans son périmètre."""
     content = equipment_view.zone_content(graph, zone_id)
     if content is None:
@@ -1757,8 +1775,7 @@ def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, 
         return
     rows = []
     for node in content.serving + content.placed:
-        result = equipment_view.node_consumption(db, site, graph, node.id) if node.kind in (
-            AssetNodeKind.EQUIPMENT, AssetNodeKind.METER) else None
+        result = consumptions.get(node.id)
         label, tone, _ = equipment_view.METHOD_LABELS[result.method] if result else ("—", "neutral", "")
         where = "dessert la zone" if node in content.serving else "placé dans la zone"
         shared = content.shared.get(node.id)
@@ -1767,7 +1784,7 @@ def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, 
                      ui.e(node_tooltip(node)),
                      ui.e(fmt_energy(result.kwh)) if result and result.by_fluid else "—",
                      ui.status(label, tone) if result else ""])
-    ui.table(["Équipement", "Type, puissance", "Consommation 12 mois", "Méthode"], rows, numeric={2})
+    ui.table(["Équipement", "Type", "Consommation 12 mois", "Méthode"], rows, numeric={2})
     if any(content.shared.values()):
         st.caption("Un équipement qui dessert plusieurs zones est compté en entier dans chacune : sa consommation "
                    "n'est pas répartie entre les zones.")
@@ -1777,22 +1794,23 @@ def zone_detail(db: Session, site: Site, graph: assets.SiteGraph, zone_id: int, 
     if chosen is not None:
         with st.container(border=True):
             st.markdown(f"**{consumers[chosen]}**")
-            consumption_detail(db, site, graph, chosen, f"{key}-zone-{chosen}")
+            consumption_detail(db, site, graph, chosen, f"{key}-zone-{chosen}", consumptions)
 
 
-def node_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str, notes: list[str]) -> None:
+def node_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id: int, key: str, notes: list[str],
+                consumptions: dict[int, equipment_view.NodeConsumption]) -> None:
     node = graph.nodes.get(node_id)
     if node is None:
         return
     with st.container(border=True):
         st.markdown(f"#### {node.name}")
-        st.caption(f"{assets.KIND_LABELS[node.kind]} · {node_tooltip(node)}")
+        st.caption(f"{assets.KIND_LABELS[node.kind]} · {node_tooltip(node, consumptions.get(node.id))}")
         for note in notes:
             ui.render(f"<div class='es-output-gain'>{ui.status('Anomalie récente', 'danger')} {ui.e(note)}</div>")
         if node.kind in (AssetNodeKind.EQUIPMENT, AssetNodeKind.METER):
-            consumption_detail(db, site, graph, node.id, key)
+            consumption_detail(db, site, graph, node.id, key, consumptions)
         elif node.kind == AssetNodeKind.ZONE:
-            zone_detail(db, site, graph, node.id, key)
+            zone_detail(db, site, graph, node.id, key, consumptions)
         for line_text in relations_text(graph, node):
             st.caption(line_text)
 
@@ -1809,15 +1827,17 @@ def page_assets(db: Session, repo: TenantRepository, user: User, org: Organizati
         return
     site_id = st.selectbox("Site", list(sites), format_func=lambda i: sites[i].name, key="asset_site")
     graph = assets.site_graph(db, repo, site_id)
+    # Consommation de chaque équipement et compteur, calculée une fois pour le graphe, le plan et les détails.
+    consumptions = equipment_view.site_consumptions(db, sites[site_id], graph)
     graph_tab, plan_tab = st.tabs(["Graphe physique", "Plan 2D"])
     with plan_tab:
-        plan_section(db, repo, user, site_id)
+        plan_section(db, repo, user, site_id, graph, consumptions)
     with graph_tab:
-        asset_graph_view(db, repo, user, org, site_id, graph)
+        asset_graph_view(db, repo, user, org, site_id, graph, consumptions)
 
 
 def asset_graph_view(db: Session, repo: TenantRepository, user: User, org: Organization, site_id: int,
-                     graph: assets.SiteGraph) -> None:
+                     graph: assets.SiteGraph, consumptions: dict[int, equipment_view.NodeConsumption]) -> None:
     active = [r for r in repo.list_recommendations(org.id, [ReviewStatus.PROPOSED, ReviewStatus.VALIDATED])
               if r.site_id == site_id and r.equipment_id]
     site = repo.get_site(site_id)
@@ -1826,8 +1846,8 @@ def asset_graph_view(db: Session, repo: TenantRepository, user: User, org: Organ
         st.header("Graphe physique")
         if graph.nodes:
             key = f"asset-graph-{site_id}"
-            event = st.altair_chart(style_chart(asset_graph_chart(graph, {r.equipment_id for r in active})),
-                                    on_select="rerun", key=f"{key}-chart", width="stretch")
+            chart = asset_graph_chart(graph, {r.equipment_id for r in active}, consumptions)
+            event = st.altair_chart(style_chart(chart), on_select="rerun", key=f"{key}-chart", width="stretch")
             options = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in
                        sorted(graph.nodes.values(), key=lambda n: (equipment_view.KIND_ORDER[n.kind], n.name.lower()))}
             focus = focused(key, clicked_id(event, "element"), options, "Élément affiché")
@@ -1839,10 +1859,11 @@ def asset_graph_view(db: Session, repo: TenantRepository, user: User, org: Organ
             "<span><i class='k-usage'></i>Usage</span><span><i class='k-target'></i>Visé par une recommandation "
             "en cours</span></div>"
         )
-        st.caption("De gauche à droite, le sens de l'énergie. Cliquez sur un équipement ou un compteur pour voir sa "
-                   "consommation, sur une zone pour voir ses équipements.")
+        st.caption("De gauche à droite, le sens de l'énergie. Survolez un équipement ou un compteur pour sa "
+                   "consommation sur 12 mois, cliquez pour son détail ; cliquez sur une zone pour voir ses équipements.")
     if focus is not None:
-        node_detail(db, site, graph, focus, f"asset-graph-{site_id}", plan_marks(db, user, site_id).notes.get(focus, []))
+        node_detail(db, site, graph, focus, f"asset-graph-{site_id}", plan_marks(db, user, site_id).notes.get(focus, []),
+                    consumptions)
     left, right = st.columns([3, 2])
     with left:
         st.header("Chaînes physiques")
@@ -3357,12 +3378,13 @@ def plan_marks(db: Session, user: User, site_id: int) -> site_plan.PlanMarks:
     return site_plan.marks_for(site_plan.recent_anomalies(db, site_id, statuses=statuses))
 
 
-def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int) -> None:
+def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int, graph: assets.SiteGraph,
+                 consumptions: dict[int, equipment_view.NodeConsumption]) -> None:
     nodes = repo.list_asset_nodes(site_id)
     plan = site_plan.get_plan(db, site_id)
     marks = plan_marks(db, user, site_id)
     key = f"asset-plan-{site_id}"
-    chart = style_chart(plan_chart(nodes, plan, marks, site_plan.image_data_uri(plan)))
+    chart = style_chart(plan_chart(nodes, plan, marks, site_plan.image_data_uri(plan), consumptions))
     placed = {n.id: f"{assets.KIND_LABELS[n.kind]} : {n.name}" for n in nodes if on_plan(n)}
     if not placed:
         # Rien à cliquer : Streamlit refuse une sélection que le graphique ne définit pas.
@@ -3373,12 +3395,12 @@ def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int) 
     else:
         event = st.altair_chart(chart, on_select="rerun", key=f"{key}-chart", width="stretch")
         st.caption("En rouge : équipement suspect d'une anomalie des 30 derniers jours ; en orange : zone "
-                   "potentiellement impactée. Cliquez sur un équipement pour voir sa consommation, sur une zone pour "
-                   "voir les équipements présents. Maquette 3D : prévue en version 3.")
+                   "potentiellement impactée. Survolez un équipement pour sa consommation sur 12 mois, cliquez pour son "
+                   "détail ; cliquez sur une zone pour voir les équipements présents. Maquette 3D : prévue en "
+                   "version 3.")
         focus = focused(key, clicked_id(event, "element", "zone"), placed, "Élément affiché")
         if focus is not None:
-            node_detail(db, repo.get_site(site_id), assets.site_graph(db, repo, site_id), focus, key,
-                        marks.notes.get(focus, []))
+            node_detail(db, repo.get_site(site_id), graph, focus, key, marks.notes.get(focus, []), consumptions)
     missing = site_plan.unplaced(nodes)
     if missing:
         st.caption("Non placés : " + ", ".join(n.name for n in missing) + ".")

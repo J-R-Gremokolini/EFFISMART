@@ -161,6 +161,17 @@ def test_only_meters_and_equipment_have_a_consumption(db, world, site):
     assert equipment_view.node_consumption(db, world.site_a, graph, 10**6) is None
 
 
+def test_site_consumptions_match_each_element_computed_alone(db, world, site):
+    """Calcul groupé (survol du graphe et du plan) : mêmes chiffres qu'élément par élément."""
+    graph = _graph(db, world)
+    together = equipment_view.site_consumptions(db, world.site_a, graph)
+    assert set(together) == {site.meter.id, site.chargers.id, site.lighting.id, site.ahu.id}
+    for node_id, result in together.items():
+        alone = equipment_view.node_consumption(db, world.site_a, graph, node_id)
+        assert result.method == alone.method
+        assert (result.kwh, result.eur, result.kgco2e) == pytest.approx((alone.kwh, alone.eur, alone.kgco2e))
+
+
 def test_zone_lists_the_equipment_serving_it_and_what_sits_inside(db, world, site):
     site_plan.set_position(db, site.repo, site.user, site.store.id, 10, 10, 40, 40)
     site_plan.set_position(db, site.repo, site.user, site.meter.id, 20, 20)  # dans l'entrepôt, sans le desservir

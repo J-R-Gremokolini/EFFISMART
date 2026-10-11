@@ -122,7 +122,15 @@ def _fr(value: float, digits: int = 0) -> str:
     return f"{value:,.{digits}f}".replace(",", " ").replace(".", ",")
 
 
-def node_consumption(db: Session, site: Site, graph: assets.SiteGraph, node_id: int) -> NodeConsumption | None:
+def site_consumptions(db: Session, site: Site, graph: assets.SiteGraph) -> dict[int, NodeConsumption]:
+    """Consommation de chaque compteur et de chaque équipement du site (affichée au survol du graphe et du plan)."""
+    prices = action_plan.site_prices(db, site)
+    return {node.id: node_consumption(db, site, graph, node.id, prices) for node in graph.nodes.values()
+            if node.kind in (K.METER, K.EQUIPMENT)}
+
+
+def node_consumption(db: Session, site: Site, graph: assets.SiteGraph, node_id: int,
+                     prices: action_plan.SitePrices | None = None) -> NodeConsumption | None:
     """Consommation d'un compteur ou d'un équipement sur les 12 derniers mois ; None pour les autres éléments."""
     node = graph.nodes.get(node_id)
     if node is None or node.kind not in (K.METER, K.EQUIPMENT):
@@ -200,7 +208,7 @@ def node_consumption(db: Session, site: Site, graph: assets.SiteGraph, node_id: 
         result.explanation.insert(0, "Seul équipement restant sur son compteur : consommation du compteur moins celle "
                                      "de ses sous-compteurs.")
     if result.by_fluid:
-        prices = action_plan.site_prices(db, site)
+        prices = prices or action_plan.site_prices(db, site)
         for fluid, days in result.by_fluid.items():
             kwh = sum(days.values())
             result.eur += kwh * prices.price.get(fluid, 0.0)

@@ -714,6 +714,9 @@ Le graphe physique se lit de gauche à droite, dans le sens de l'énergie : comp
 produits, équipements desservis, zones, usages. L'ordre dans chaque colonne limite les croisements de liens.
 Sur le graphe comme sur le plan 2D :
 
+- **au survol d'un équipement ou d'un compteur**, sa consommation sur 12 mois (« ≈ » et « estimée » quand elle
+  est répartie entre plusieurs équipements d'un même compteur). Elle remplace la puissance nominale, qui reste
+  saisie dans la fiche de l'équipement et sert au calcul d'une estimation ;
 - **un clic sur un équipement ou un compteur** affiche sa consommation sur 12 mois : énergie, coût au prix
   payé (contrat F6, à défaut un prix indicatif), émissions, part du compteur, barres mensuelles par énergie.
   Pour une mesure, la courbe des 30 derniers jours s'y ajoute ;
