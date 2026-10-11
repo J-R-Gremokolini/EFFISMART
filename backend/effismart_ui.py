@@ -476,7 +476,7 @@ def site_overview(db: Session, user: User, org: Organization, sites: list[dict],
     if st.session_state.get(key) not in [s["site_id"] for s in sites]:
         st.session_state[key] = sites[0]["site_id"]
     current = next(s for s in sites if s["site_id"] == st.session_state[key])
-    photo_col, list_col = st.columns([2.2, 1], gap="medium")
+    photo_col, list_col = st.container(key="es-head").columns([2.2, 1], gap="medium")
     with photo_col:
         chips = [ui.chip("total", fmt_energy(current["total_kwh"]), "Consommation sur la période"),
                  ui.chip("cost", fmt_eur(current["cost_eur"]), "Coût estimé, prix indicatifs"),
@@ -550,33 +550,29 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
     site_overview(db, repo.user, org, sites, data["data_as_of"])
     scope = "Tous les sites" if len(sites) > 1 else (sites[0]["name"] if sites else org.name)
     span = f"du {fmt_date(p_start)} au {fmt_date(p_end)}"
-    first, second, third = st.columns([1.3, 1, 1], gap="medium")
-    with first:
-        badge, tone = ui.trend(variation(totals["total_kwh"], previous["total_kwh"]))
-        ui.panel("Consommation", f"{scope}, {span}", aside=badge, body=(
-            f'<div class="es-panel-value">{ui.e(fmt_energy(totals["total_kwh"]))}</div>'
-            f'<div class="es-kpi-note">{ui.e(total_note)}</div>{ui.sparkline(total, tone)}'
-            + ui.stat_pills([("elec", fmt_energy(totals["elec_kwh"]), "Électricité"),
-                             ("gas", fmt_energy(totals["gas_kwh"]), "Gaz"),
-                             ("calendar", fmt_energy(totals["total_kwh"] / length), "Par jour en moyenne")])))
-    with second:
-        badge, tone = ui.trend(variation(totals["cost_eur"], previous["cost_eur"]))
-        co2_badge, _ = ui.trend(variation(totals["emissions_kgco2e"], previous["emissions_kgco2e"]))
-        ui.panel("Coût estimé", f"{scope}, prix indicatifs", ink=True, aside=badge, body=(
-            f'<div class="es-panel-value">{ui.e(fmt_eur(totals["cost_eur"]))}</div>'
-            f'<div class="es-kpi-note">{ui.e(note)}</div>{ui.sparkline(cost, tone)}'
-            f'<div class="es-subcard"><span class="es-stat-icon">{ui.icon("co2")}</span>'
-            f'<div class="es-subcard-text"><div class="es-subcard-title">Émissions</div>'
-            f'<div class="es-subcard-sub">facteurs ADEME</div></div>'
-            f'<div class="es-subcard-end"><div class="es-subcard-value">{ui.e(fmt_emissions(totals["emissions_kgco2e"]))}'
-            f'</div>{co2_badge}</div></div>'))
-    with third:
-        energy = totals["elec_kwh"] + totals["gas_kwh"]
-        body = ui.ring(totals["elec_kwh"] / energy * 100, [
-            ("Électricité", fmt_energy(totals["elec_kwh"]), "électricité"),
-            ("Gaz", fmt_energy(totals["gas_kwh"]), "gaz"),
-        ]) if energy > 0 else '<div class="es-kpi-note">Aucune donnée sur la période.</div>'
-        ui.panel("Répartition", f"{scope}, par énergie", body=body)
+    badge, tone = ui.trend(variation(totals["total_kwh"], previous["total_kwh"]))
+    consumption = ui.panel("Consommation", f"{scope}, {span}", aside=badge, body=(
+        f'<div class="es-panel-value">{ui.e(fmt_energy(totals["total_kwh"]))}</div>'
+        f'<div class="es-kpi-note">{ui.e(total_note)}</div>{ui.sparkline(total, tone)}'
+        + ui.stat_pills([("elec", fmt_energy(totals["elec_kwh"]), "Électricité"),
+                         ("gas", fmt_energy(totals["gas_kwh"]), "Gaz"),
+                         ("calendar", fmt_energy(totals["total_kwh"] / length), "Par jour en moyenne")])))
+    badge, tone = ui.trend(variation(totals["cost_eur"], previous["cost_eur"]))
+    co2_badge, _ = ui.trend(variation(totals["emissions_kgco2e"], previous["emissions_kgco2e"]))
+    spending = ui.panel("Coût estimé", f"{scope}, prix indicatifs", ink=True, aside=badge, body=(
+        f'<div class="es-panel-value">{ui.e(fmt_eur(totals["cost_eur"]))}</div>'
+        f'<div class="es-kpi-note">{ui.e(note)}</div>{ui.sparkline(cost, tone)}'
+        f'<div class="es-subcard"><span class="es-stat-icon">{ui.icon("co2")}</span>'
+        f'<div class="es-subcard-text"><div class="es-subcard-title">Émissions</div>'
+        f'<div class="es-subcard-line"><span class="es-subcard-value">'
+        f'{ui.e(fmt_emissions(totals["emissions_kgco2e"]))}</span>{co2_badge}</div>'
+        f'<div class="es-subcard-sub">facteurs ADEME</div></div></div>'))
+    energy = totals["elec_kwh"] + totals["gas_kwh"]
+    split = ui.panel("Répartition", f"{scope}, par énergie", body=ui.ring(totals["elec_kwh"] / energy * 100, [
+        ("Électricité", fmt_energy(totals["elec_kwh"]), "électricité"),
+        ("Gaz", fmt_energy(totals["gas_kwh"]), "gaz"),
+    ]) if energy > 0 else '<div class="es-kpi-note">Aucune donnée sur la période.</div>')
+    ui.panels([consumption, spending, split])
 
     # Courbe de charge
     points = data["delivery_points"]

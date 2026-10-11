@@ -443,15 +443,26 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {
 # Inspiré d'un tableau de bord domotique : grande photo avec ses mesures en pastilles, liste à pastilles rondes,
 # carte foncée mise en avant, pastilles de statistiques, anneau. Aucune commande décorative : tout bouton agit.
 _DASHBOARD_CSS = """
+/* Cartes du tableau de bord : grille qui passe sur deux puis une colonne quand la place manque. */
+.es-panels-wrap { container-type: inline-size; margin: 8px 0 24px; }
+.es-panels { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 1fr); }
+@container (max-width: 900px) {
+  .es-panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .es-panels > :first-child { grid-column: 1 / -1; }
+}
+@container (max-width: 560px) { .es-panels { grid-template-columns: minmax(0, 1fr); } }
 .es-panel {
   background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-card);
   box-shadow: var(--shadow-card); padding: 24px; min-height: 330px; display: flex; flex-direction: column; gap: 16px;
+  container-type: inline-size; min-width: 0;
 }
 .es-panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.es-panel-head > div:first-child { min-width: 0; }
+.es-panel-head > .es-badge { flex-shrink: 0; }
 .es-panel-title { font-size: 20px; font-weight: 700; color: var(--color-text); letter-spacing: -0.01em; }
 .es-panel-sub { font-size: 14px; color: var(--color-muted); margin-top: 2px; }
 .es-panel-value {
-  font-size: 40px; font-weight: 700; line-height: 1.05; color: var(--color-text); letter-spacing: -0.03em;
+  font-size: clamp(26px, 13cqi, 40px); overflow-wrap: anywhere; font-weight: 700; line-height: 1.05; color: var(--color-text); letter-spacing: -0.03em;
   font-variant-numeric: tabular-nums; font-family: 'Fira Code', ui-monospace, monospace;
 }
 .es-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -461,15 +472,15 @@ _DASHBOARD_CSS = """
 .es-panel.es-ink .es-panel-title, .es-panel.es-ink .es-panel-value { color: var(--color-on-ink); }
 .es-panel.es-ink .es-panel-sub, .es-panel.es-ink .es-kpi-note { color: var(--color-on-ink-muted); }
 .es-subcard {
-  margin-top: auto; display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 20px;
+  margin-top: auto; display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; border-radius: 20px;
   background: var(--color-surface-2); color: var(--color-text);
 }
 .es-panel.es-ink .es-subcard { background: var(--color-on-ink); color: var(--color-ink); }
-.es-subcard-text { flex: 1; min-width: 72px; }
-.es-subcard-end { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.es-subcard-text { flex: 1; min-width: 0; }
 .es-subcard-title { font-size: 15px; font-weight: 700; }
+.es-subcard-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 2px 0; }
 .es-subcard-sub { font-size: 13px; opacity: 0.78; }
-.es-subcard-value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.es-subcard-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* Pastilles de statistiques : rond foncé + icône, valeur, libellé. */
 .es-stats { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -517,6 +528,10 @@ _DASHBOARD_CSS = """
   box-shadow: var(--shadow-card); padding: 22px 18px 18px; min-height: 400px; gap: 10px;
 }
 .st-key-es-sites > div:has(.st-key-es-add-site) { margin-top: auto; }
+/* En-tête : la liste des sites passe sous la photo quand la place manque, au lieu de se tasser. */
+.st-key-es-head [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+.st-key-es-head [data-testid="stColumn"]:first-child { flex: 2.2 1 440px !important; min-width: min(100%, 440px); }
+.st-key-es-head [data-testid="stColumn"]:last-child { flex: 1 1 280px !important; min-width: min(100%, 280px); }
 .st-key-es-sites .es-panel-head { padding-bottom: 14px; }
 
 /* Listes déroulantes (Streamlit 1.64 : composant react-aria, « role=group ») : pilules, comme les champs. */
@@ -543,7 +558,7 @@ _DASHBOARD_CSS = """
   background: var(--color-surface); color: var(--color-text); border: 1px solid var(--color-border);
 }
 .es-site-avatar svg { width: 20px; height: 20px; }
-.es-site-name { font-size: 15px; font-weight: 700; color: var(--color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.es-site-name { font-size: 15px; font-weight: 700; color: var(--color-text); overflow-wrap: anywhere; line-height: 1.3; }
 .es-site-meta { font-size: 13px; color: var(--color-muted); }
 [class*="st-key-es-siterow-on-"] .es-site-name { color: var(--color-on-ink); }
 [class*="st-key-es-siterow-on-"] .es-site-meta { color: var(--color-on-ink-muted); }
@@ -566,7 +581,7 @@ _DASHBOARD_CSS = """
 .es-ring-center { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; }
 .es-ring-value { font-size: 30px; font-weight: 700; color: var(--color-text); font-variant-numeric: tabular-nums; }
 .es-ring-label { font-size: 13px; color: var(--color-muted); }
-.es-ring-legend { display: flex; justify-content: space-between; gap: 12px; margin-top: auto; }
+.es-ring-legend { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; margin-top: auto; }
 .es-ring-legend span { font-size: 13px; color: var(--color-muted); }
 .es-ring-legend b { display: block; font-size: 15px; color: var(--color-text); font-variant-numeric: tabular-nums; }
 .es-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
@@ -1022,13 +1037,18 @@ def stat_pills(items: Sequence[tuple[str, str, str]]) -> str:
     ) + "</div>"
 
 
-def panel(title: str, subtitle: str, body: str, *, ink: bool = False, aside: str = "") -> None:
-    """Carte du tableau de bord : titre, sous-titre, élément à droite (pilule de tendance…), contenu HTML."""
-    render(
+def panel(title: str, subtitle: str, body: str, *, ink: bool = False, aside: str = "") -> str:
+    """Carte du tableau de bord (HTML) : titre, sous-titre, élément à droite (pilule de tendance…), contenu."""
+    return (
         f'<section class="es-panel{" es-ink" if ink else ""}"><div class="es-panel-head"><div>'
         f'<div class="es-panel-title">{e(title)}</div><div class="es-panel-sub">{e(subtitle)}</div></div>'
         f'{aside}</div>{body}</section>'
     )
+
+
+def panels(items: Sequence[str]) -> None:
+    """Rangée de cartes : trois colonnes sur grand écran, deux puis une quand la place manque."""
+    render(f'<div class="es-panels-wrap"><div class="es-panels">{"".join(items)}</div></div>')
 
 
 def ring(share_pct: float, legend: Sequence[tuple[str, str, str]]) -> str:

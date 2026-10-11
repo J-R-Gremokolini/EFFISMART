@@ -74,9 +74,12 @@ Data is J+1: never promise "real time" (the photo badge reads « Données J+1, a
     period; site name and address on a bottom scrim.
   - Sites card: rounded rows (round avatar, name, « N point(s), X MWh », chevron button « Afficher … »);
     the shown site is an ink row; « Ajouter un site » ink pill for auditors only.
-- **Dashboard cards** (three, unequal widths 1.3 / 1 / 1): Consommation (value, trend pill, sparkline, stat
-  pills: round dark icon + value + label); Coût estimé (ink card, sparkline, white emissions sub-card with its
-  trend); Répartition (two-color ring, electricity green / gas sky, values written below).
+- **Dashboard cards** (`ui.panels`, CSS grid with container queries: three columns 1.3 / 1 / 1, two columns
+  with the first card full width under 900px of content, one column under 560px; equal heights): Consommation
+  (value, trend pill, sparkline, stat pills: round dark icon + value + label); Coût estimé (ink card, sparkline,
+  white emissions sub-card: value and trend on one line that wraps instead of overflowing); Répartition
+  (two-color ring, electricity green / gas sky, values written below). Card values scale with the card width
+  (`clamp(26px, 13cqi, 40px)`). The sites list moves under the photo when both no longer fit side by side.
 - **KPI grid** (other pages): one hero card and compact cards (icon + label, value, trend pill, sparkline).
   Energy, cost and emissions: increase = danger, decrease = success.
 - **Buttons**: primary = green pill with dark text; secondary = pill with `color-border-strong` outline
@@ -119,7 +122,8 @@ concise, confident, implementation-focused — French UI copy, sentence case, no
 ## QA Checklist
 - [ ] All text pairs ≥ 4.5:1, UI boundaries and series ≥ 3:1, in both modes.
 - [ ] Every trend/status readable without color.
-- [ ] No truncated KPI values at 1280px and 800px widths; top bar without overlap at 390px.
+- [ ] No truncated or overflowing value at 1440, 1280, 1100, 960, 800, 640 and 390px, in both modes (scripted check:
+  no element's box outside its card); top bar without overlap at 390px.
 - [ ] Focus ring visible on buttons, inputs, nav items; never hidden by the top bar.
 - [ ] Client (read-only) screens show no write controls (no « Ajouter un site », no photo upload).
 - [ ] Mode toggle restores the user's choice at the next login.
