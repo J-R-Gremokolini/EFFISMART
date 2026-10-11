@@ -52,7 +52,8 @@ def get_plan(db: Session, site_id: int) -> SitePlan | None:
     return db.scalar(select(SitePlan).where(SitePlan.site_id == site_id))
 
 
-def _content_type(content: bytes) -> str | None:
+def image_type(content: bytes) -> str | None:
+    """Type d'une image PNG ou JPEG d'après sa signature ; None pour tout autre contenu."""
     if content.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if content.startswith(b"\xff\xd8\xff"):
@@ -81,7 +82,7 @@ def save_plan(db: Session, repo: TenantRepository, user: User, site_id: int, fil
     site = repo.get_site(site_id)
     if len(content) > MAX_PLAN_MB * 1024 * 1024:
         raise PlanError(f"Image trop lourde : {MAX_PLAN_MB} Mo au plus.")
-    content_type = _content_type(content)
+    content_type = image_type(content)
     if content_type is None:
         raise PlanError("Format refusé : image PNG ou JPEG uniquement.")
     plan = get_plan(db, site.id)

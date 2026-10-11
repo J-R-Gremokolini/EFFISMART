@@ -30,10 +30,25 @@ rattrapage automatique au démarrage et par le bouton « Mettre à jour les donn
 
 ### Design de l'interface
 
-- **Thème « Verre »** (par défaut) : design system généré par le skill UI/UX Pro Max pour un tableau de
-  bord énergie SaaS (verre dépoli sombre, ardoise + vert, Fira Sans / Fira Code), contrastes vérifiés
-  WCAG AA. Règles : `.claude/skills/design-system-effismart/SKILL.md` ; code : `backend/ui_theme.py`.
-- **Thème « Nova »** (violet) toujours disponible : lancer avec `EFFISMART_THEME=nova`.
+- **Mode clair ou sombre, au choix de chaque utilisateur** : bouton lune / soleil dans la barre du haut ;
+  le choix est retenu sur le compte et retrouvé à la connexion. Règles : `.claude/skills/design-system-effismart/SKILL.md` ;
+  code : `backend/ui_theme.py`.
+  - **Clair** (par défaut) : inspiré d'un tableau de bord domotique fourni comme référence, avec les couleurs
+    d'EffiSmart. Cadre blanc, cartes gris très clair très arrondies, barre latérale ardoise avec une icône par
+    page, pastilles de mesures, boutons et rangées sélectionnées en ardoise. Contrastes recalculés sur fond
+    clair (WCAG AA).
+  - **Sombre, thème « Verre »** : design system généré par le skill UI/UX Pro Max (verre dépoli sombre,
+    ardoise + vert, Fira Sans / Fira Code). Le thème « Nova » (violet) reste disponible : `EFFISMART_THEME=nova`.
+- **Tableau de bord** : en tête, la photo du site choisi avec ses mesures de la période en pastilles
+  (consommation, coût, émissions, kWh/m², fraîcheur « Données J+1 »), et la liste des sites à droite. Dessous,
+  trois cartes : consommation (pastilles électricité, gaz, moyenne par jour), coût estimé avec les émissions,
+  répartition par énergie en anneau. La consommation de chaque site est calculée comme les totaux du tableau
+  de bord (`dashboard.site_breakdown`) : la somme des sites redonne ces totaux.
+- **Photo du site** : déposée par l'auditeur dans « Patrimoine & consentements » (PNG ou JPEG, 10 Mo au plus,
+  type vérifié sur le contenu ; `app/services/site_photo.py`). Sans photo, une illustration de la courbe de
+  charge la remplace.
+- Streamlit reste configuré en sombre : en mode clair, ses composants (listes, menus, dates, cases, alertes)
+  sont repeints par le thème, et ses tableaux de données inversés pour rester lisibles.
 - **Visuels** (skill canvas-design) : affiche « Registre silencieux » et illustrations de l'interface,
   générées à partir des vraies données simulées — `docs/visuel/`. Pour les régénérer :
   `.venv\Scripts\python.exe docs\visuel\generer_visuels.py`.

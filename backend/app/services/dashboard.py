@@ -253,6 +253,38 @@ def organization_dashboard(
     }
 
 
+def site_breakdown(db: Session, org: Organization, start: date, end: date) -> list[dict]:
+    """Consommation, coût indicatif et émissions de chaque site sur la période, calculés comme les totaux du
+    tableau de bord (mesures N1 des points consentis, complétées par les factures N0) : la somme des sites redonne
+    ces totaux."""
+    from app.services.energy_data import organization_n0  # import local : évite un cycle
+
+    consented = {dp.id for dp in consented_delivery_points(db, org.id)}
+    t0, t1 = local_day_bounds(start, end)
+    n0 = organization_n0(db, org.id, start, end)
+    factors = emission_factors_at(db, end)
+    rows = []
+    for site in org.sites:
+        points = list(site.delivery_points)
+        by_fluid = defaultdict(float, sum_kwh_by_fluid(db, [dp.id for dp in points if dp.id in consented], t0, t1))
+        for dp in points:
+            by_fluid[dp.fluid] += sum(n0.get(dp.id, {}).values())
+        rows.append({
+            "site_id": site.id,
+            "name": site.name,
+            "address": site.address,
+            "surface_m2": site.surface_m2,
+            "points": len(points),
+            "elec_kwh": round(by_fluid[Fluid.ELEC], 1),
+            "gas_kwh": round(by_fluid[Fluid.GAS], 1),
+            "total_kwh": round(sum(by_fluid.values()), 1),
+            "cost_eur": round(sum(kwh * estimated_price(fluid) for fluid, kwh in by_fluid.items()), 2),
+            "emissions_kgco2e": round(sum(kwh * factors[fluid].factor_kgco2_per_kwh
+                                          for fluid, kwh in by_fluid.items() if fluid in factors), 1),
+        })
+    return rows
+
+
 def performance(db: Session, org: Organization, end: date) -> dict:
     """F1 — indicateurs de performance sur les 12 mois se terminant à `end`, par site et pour l'organisation :
     intensité énergétique (kWh/m²/an), coût et émissions par m², et niveau des données utilisées (N1, N0)."""

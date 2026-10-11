@@ -74,7 +74,7 @@ from app.services import documents as documents_service  # noqa: E402
 from app.services import drift as drift_service  # noqa: E402
 from app.services import energy_data, ipe, quarterly_reports, simulator, site_plan, tariffs  # noqa: E402
 from app.services import action_plan, economics, energy_balance, energy_management, metering_plan  # noqa: E402
-from app.services import equipment_view, warmup  # noqa: E402
+from app.services import equipment_view, site_photo, warmup  # noqa: E402
 from app.services import ipe_definitions as ipe_defs  # noqa: E402
 from app.services import predictions as predictions_service  # noqa: E402
 from app.services import recommendations as recommendations_service  # noqa: E402
@@ -103,7 +103,11 @@ disable_debug_mode()
 
 APP_NAME = "EffiSmart"
 FLUID_LABELS = {Fluid.ELEC: "Électricité", Fluid.GAS: "Gaz"}
-FLUID_COLORS = {"Électricité": ui.PRIMARY, "Gaz": ui.SERIES_2}
+
+
+def fluid_colors() -> dict[str, str]:
+    """Couleur de chaque énergie dans les graphiques, selon le mode clair ou sombre de la session."""
+    return {"Électricité": ui.PRIMARY, "Gaz": ui.SERIES_2}
 ROLE_LABELS = {Role.AUDITOR: "Auditeur", Role.CLIENT_VIEWER: "Espace client", Role.ADMIN: "Administrateur"}
 PERIOD_LABELS = {"7d": "7 jours", "30d": "30 jours", "12m": "12 mois", "custom": "Personnalisée"}
 DRIFT_KIND_LABELS = {
@@ -210,6 +214,17 @@ CLIENT_PAGES = [PAGE_DASHBOARD, PAGE_MONTHLY, PAGE_BALANCE, PAGE_DRIFTS, PAGE_RE
                 PAGE_EXPORTS]
 # Le responsable énergie du client a en plus la file de validation (principe P1) et le simulateur.
 ENERGY_MANAGER_PAGES = [PAGE_DASHBOARD, PAGE_VALIDATION, *CLIENT_PAGES[1:8], PAGE_SIMULATOR, *CLIENT_PAGES[8:]]
+
+
+# Icône de chaque page dans la navigation (Material Symbols).
+PAGE_ICONS = {
+    PAGE_PORTFOLIO: "work", PAGE_DASHBOARD: "dashboard", PAGE_MONTHLY: "calendar_month", PAGE_BALANCE: "balance",
+    PAGE_VALIDATION: "task_alt", PAGE_DRIFTS: "warning", PAGE_RECOMMENDATIONS: "lightbulb",
+    PAGE_PREDICTIONS: "insights", PAGE_TRAJECTORY: "trending_down", PAGE_IPE: "speed", PAGE_SIMULATOR: "tune",
+    PAGE_ACTIONS: "checklist", PAGE_MANAGEMENT: "groups", PAGE_ASSETS: "hub", PAGE_DOCUMENTS: "folder",
+    PAGE_REPORTS: "description", PAGE_REGULATORY: "gavel", PAGE_EXPORTS: "eco", PAGE_MANAGE: "domain",
+    PAGE_NEW_CLIENT: "person_add", PAGE_INTEGRATIONS: "extension",
+}
 
 
 def pages_for(user: User) -> list[str]:
@@ -340,7 +355,7 @@ def login_page(db: Session) -> None:
             "chaque demi-heure en ligne ; la journée ressort en vert, la nuit et le week-end en sombre.",
         ))
     with center:
-        ui.render(ui.logo_html(large=True))
+        ui.render(ui.logo_html(large=True, on_light=ui.is_light()))
         st.title("Connexion")
         st.caption(f"Suivi énergétique & conformité réglementaire — {TAGLINE[0].lower()}{TAGLINE[1:]}")
         with st.form("login"):
@@ -351,6 +366,7 @@ def login_page(db: Session) -> None:
             user = db.scalar(select(User).where(User.email == email.strip().lower()))
             if user and verify_password(password, user.password_hash):
                 st.session_state["user_id"] = user.id
+                st.session_state["es-ui-mode"] = user.ui_theme or ui.DEFAULT_MODE  # mode retenu par l'utilisateur
                 st.rerun()
             st.error("Identifiants invalides")
         st.caption(
@@ -448,6 +464,48 @@ def page_portfolio(db: Session, repo: TenantRepository, user: User) -> None:
             ui.feed([(to_local(n.created_at).strftime("%d/%m %H:%M"), ui.e(n.message)) for n in notifications])
 
 
+def _show_site(key: str, site_id: int) -> None:
+    st.session_state[key] = site_id
+
+
+def site_overview(db: Session, user: User, org: Organization, sites: list[dict], as_of: date | None) -> None:
+    """Tête du tableau de bord : photo du site choisi et ses mesures de la période, liste des sites à droite."""
+    if not sites:
+        return
+    key = f"dash-site-{org.id}"
+    if st.session_state.get(key) not in [s["site_id"] for s in sites]:
+        st.session_state[key] = sites[0]["site_id"]
+    current = next(s for s in sites if s["site_id"] == st.session_state[key])
+    photo_col, list_col = st.columns([2.2, 1], gap="medium")
+    with photo_col:
+        chips = [ui.chip("total", fmt_energy(current["total_kwh"]), "Consommation sur la période"),
+                 ui.chip("cost", fmt_eur(current["cost_eur"]), "Coût estimé, prix indicatifs"),
+                 ui.chip("co2", fmt_emissions(current["emissions_kgco2e"]), "Émissions")]
+        if current["surface_m2"]:
+            chips.append(ui.chip("surface", f"{fmt_number(current['total_kwh'] / current['surface_m2'], 1)} kWh/m²",
+                                 "Consommation par m² sur la période"))
+        where = [current["address"], f"{fmt_number(current['surface_m2'])} m²" if current["surface_m2"] else None]
+        photo = site_photo.get_photo(db, current["site_id"])
+        ui.site_hero(site_photo.photo_data_uri(photo), f"Photo du site {current['name']}", current["name"],
+                     ", ".join(w for w in where if w) or "Adresse non renseignée",
+                     f"Données J+1, au {fmt_date(as_of)}" if as_of else "Aucune donnée", chips)
+        if photo is None and can_write(user):
+            st.caption("Ajoutez une photo de ce site dans « Patrimoine & consentements ».")
+    with list_col, st.container(key="es-sites"):
+        ui.render(f'<div class="es-panel-head"><div><div class="es-panel-title">Sites</div>'
+                  f'<div class="es-panel-sub">{len(sites)} site(s), consommation de la période</div></div></div>')
+        for s in sites:
+            shown = s["site_id"] == current["site_id"]
+            with st.container(key=f"es-siterow-{'on-' if shown else ''}{s['site_id']}", horizontal=True,
+                              vertical_alignment="center"):
+                ui.render(ui.site_row(s["name"], f"{s['points']} point(s), {fmt_energy(s['total_kwh'])}"))
+                st.button(f"Afficher {s['name']}", key=f"es-site-open-{s['site_id']}", icon=":material/chevron_right:",
+                          on_click=_show_site, args=(key, s["site_id"]), disabled=shown,
+                          help="Site affiché" if shown else f"Afficher {s['name']}")
+        if can_write(user) and st.button("Ajouter un site", key="es-add-site", icon=":material/add:"):
+            goto(PAGE_MANAGE, org.id)
+
+
 def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> None:
     ui.page_header(org.name, "Tableau de bord",
                    "Consommations, indicateurs de performance, coûts et émissions, et évolution avant / après "
@@ -487,24 +545,38 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
     elec, gas = series[Fluid.ELEC], series[Fluid.GAS]
     total = [a + b for a, b in zip(elec, gas)]
     prices = data["estimated_prices_eur_kwh"]
-    factors = {f["fluid"]: f["factor_kgco2_per_kwh"] for f in data["emission_factors"]}
     cost = [a * prices["ELEC"] + b * prices["GAS"] for a, b in zip(elec, gas)]
-    co2 = [a * factors.get(Fluid.ELEC, 0) + b * factors.get(Fluid.GAS, 0) for a, b in zip(elec, gas)]
-    ui.kpi_grid(
-        [
-            {"label": "Consommation totale", "value": fmt_energy(totals["total_kwh"]), "note": total_note, "icon": "total", "hero": True,
-             "pct": variation(totals["total_kwh"], previous["total_kwh"]), "spark": total},
-            {"label": "Électricité", "value": fmt_energy(totals["elec_kwh"]), "icon": "elec",
-             "pct": variation(totals["elec_kwh"], previous["elec_kwh"]), "spark": elec},
-            {"label": "Gaz", "value": fmt_energy(totals["gas_kwh"]), "icon": "gas",
-             "pct": variation(totals["gas_kwh"], previous["gas_kwh"]), "spark": gas},
-            {"label": "Coût estimé", "value": fmt_eur(totals["cost_eur"]), "note": "prix indicatifs", "icon": "cost",
-             "pct": variation(totals["cost_eur"], previous["cost_eur"]), "spark": cost},
-            {"label": "Émissions", "value": fmt_emissions(totals["emissions_kgco2e"]), "icon": "co2",
-             "pct": variation(totals["emissions_kgco2e"], previous["emissions_kgco2e"]), "spark": co2},
-        ]
-    )
-    st.caption(f"Période du {fmt_date(p_start)} au {fmt_date(p_end)}")
+    sites = dashboard.site_breakdown(db, org, p_start, p_end)
+    site_overview(db, repo.user, org, sites, data["data_as_of"])
+    scope = "Tous les sites" if len(sites) > 1 else (sites[0]["name"] if sites else org.name)
+    span = f"du {fmt_date(p_start)} au {fmt_date(p_end)}"
+    first, second, third = st.columns([1.3, 1, 1], gap="medium")
+    with first:
+        badge, tone = ui.trend(variation(totals["total_kwh"], previous["total_kwh"]))
+        ui.panel("Consommation", f"{scope}, {span}", aside=badge, body=(
+            f'<div class="es-panel-value">{ui.e(fmt_energy(totals["total_kwh"]))}</div>'
+            f'<div class="es-kpi-note">{ui.e(total_note)}</div>{ui.sparkline(total, tone)}'
+            + ui.stat_pills([("elec", fmt_energy(totals["elec_kwh"]), "Électricité"),
+                             ("gas", fmt_energy(totals["gas_kwh"]), "Gaz"),
+                             ("calendar", fmt_energy(totals["total_kwh"] / length), "Par jour en moyenne")])))
+    with second:
+        badge, tone = ui.trend(variation(totals["cost_eur"], previous["cost_eur"]))
+        co2_badge, _ = ui.trend(variation(totals["emissions_kgco2e"], previous["emissions_kgco2e"]))
+        ui.panel("Coût estimé", f"{scope}, prix indicatifs", ink=True, aside=badge, body=(
+            f'<div class="es-panel-value">{ui.e(fmt_eur(totals["cost_eur"]))}</div>'
+            f'<div class="es-kpi-note">{ui.e(note)}</div>{ui.sparkline(cost, tone)}'
+            f'<div class="es-subcard"><span class="es-stat-icon">{ui.icon("co2")}</span>'
+            f'<div class="es-subcard-text"><div class="es-subcard-title">Émissions</div>'
+            f'<div class="es-subcard-sub">facteurs ADEME</div></div>'
+            f'<div class="es-subcard-end"><div class="es-subcard-value">{ui.e(fmt_emissions(totals["emissions_kgco2e"]))}'
+            f'</div>{co2_badge}</div></div>'))
+    with third:
+        energy = totals["elec_kwh"] + totals["gas_kwh"]
+        body = ui.ring(totals["elec_kwh"] / energy * 100, [
+            ("Électricité", fmt_energy(totals["elec_kwh"]), "électricité"),
+            ("Gaz", fmt_energy(totals["gas_kwh"]), "gaz"),
+        ]) if energy > 0 else '<div class="es-kpi-note">Aucune donnée sur la période.</div>'
+        ui.panel("Répartition", f"{scope}, par énergie", body=body)
 
     # Courbe de charge
     points = data["delivery_points"]
@@ -525,7 +597,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                 else:
                     frame["t"] = pd.to_datetime(frame["t"])
                     y_title = "Consommation (kWh/jour)"
-                color = FLUID_COLORS[fluid_label]
+                color = fluid_colors()[fluid_label]
                 base = alt.Chart(frame).encode(
                     x=alt.X("t:T", title=None, axis=alt.Axis(format="%d/%m")),
                     y=alt.Y("value:Q", title=y_title),
@@ -537,7 +609,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                     interpolate="monotone",
                     color=alt.Gradient(gradient="linear", x1=0, x2=0, y1=0, y2=1,
                                        stops=[alt.GradientStop(color=color, offset=0),
-                                              alt.GradientStop(color="rgba(0,0,0,0)", offset=1)]),
+                                              alt.GradientStop(color=f"{color}00", offset=1)]),
                     opacity=0.35,
                 )
                 line = base.mark_line(strokeWidth=2.5, color=color, interpolate="monotone")
@@ -570,8 +642,7 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                 + ". À défaut, l'auditeur peut saisir les factures (page « Documents »)."
             )
 
-    left, right = st.columns([2, 1])
-    with left, st.container(border=True):
+    with st.container(border=True):
         st.header("Consommation mensuelle")
         monthly = pd.DataFrame(data["monthly"])
         monthly["Mois"] = monthly["month"].map(fmt_month)
@@ -584,8 +655,8 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
             .encode(
                 x=alt.X("Mois:N", sort=list(monthly["Mois"]), title=None, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("kWh:Q", stack=True, title="kWh", axis=alt.Axis(format="~s")),
-                color=alt.Color("Énergie:N", title=None, scale=alt.Scale(domain=list(FLUID_COLORS),
-                                                                         range=list(FLUID_COLORS.values()))),
+                color=alt.Color("Énergie:N", title=None, scale=alt.Scale(domain=list(fluid_colors()),
+                                                                         range=list(fluid_colors().values()))),
                 tooltip=["Mois", "Énergie", alt.Tooltip("kWh:Q", format=",.0f")],
             )
             .properties(height=280)
@@ -597,14 +668,6 @@ def page_dashboard(db: Session, repo: TenantRepository, org: Organization) -> No
                     columns={"elec_kwh": "Électricité (kWh)", "gas_kwh": "Gaz (kWh)"}),
                 hide_index=True,
             )
-    with right, st.container(border=True):
-        st.header("Part de l'électricité")
-        total = totals["elec_kwh"] + totals["gas_kwh"]
-        if total > 0:
-            ui.gauge(totals["elec_kwh"] / total * 100,
-                     f"Électricité {fmt_energy(totals['elec_kwh'])}, gaz {fmt_energy(totals['gas_kwh'])}")
-        else:
-            st.caption("Aucune donnée.")
 
     performance_section(db, org, data["data_as_of"] or yesterday_local())
     savings_section(db, repo, repo.user, org)
@@ -1532,8 +1595,18 @@ NODE_SHAPES = {
     AssetNodeKind.USAGE: "M-1,0L-0.5,-0.87L0.5,-0.87L1,0L0.5,0.87L-0.5,0.87Z",
 }
 RELATION_COLORS = {"alimente": "#94a3b8", "produit": "#22c55e", "dessert": "#a5b4fc", "accueille": "#fbbf24"}
-LABEL_COLOR = "#e2e8f0"
-SELECTED_COLOR = "#f8fafc"  # contour de l'élément cliqué : blanc, lisible sur toutes les couleurs de nœud
+# Mode clair : mêmes teintes, plus soutenues (≥ 3:1 sur fond blanc).
+RELATION_COLORS_LIGHT = {"alimente": "#64748b", "produit": "#16a34a", "dessert": "#6366f1", "accueille": "#d97706"}
+
+
+def relation_colors() -> dict[str, str]:
+    return RELATION_COLORS_LIGHT if ui.is_light() else RELATION_COLORS
+
+
+def target_color() -> str:
+    """Contour d'un équipement visé par une recommandation en cours."""
+    return "#d97706" if ui.is_light() else "#fbbf24"
+
 LINE_BREAK = "\n"  # séparateur de lignes des libellés (propriété « lineBreak » de Vega-Lite)
 
 
@@ -1602,7 +1675,7 @@ def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int],
         "label": wrap_label(n.name), "Type": assets.KIND_LABELS[n.kind],
         "Détail": node_tooltip(n, consumptions.get(n.id)),
         "shape": NODE_SHAPES[n.kind],
-        "fill": style[n.kind][0], "stroke": "#fbbf24" if n.id in highlight else style[n.kind][1],
+        "fill": style[n.kind][0], "stroke": target_color() if n.id in highlight else style[n.kind][1],
     } for n in graph.nodes.values()])
     edges = pd.DataFrame([{
         "x": lay.positions[r.source_id][0], "y": lay.positions[r.source_id][1],
@@ -1617,17 +1690,17 @@ def asset_graph_chart(graph: assets.SiteGraph, highlight: set[int],
         layers.append(alt.Chart(edges).mark_rule(strokeWidth=1.6, opacity=0.55).encode(
             x=x, y=y, x2="x2:Q", y2="y2:Q",
             color=alt.Color("Lien:N", title=None, legend=alt.Legend(orient="top", columnPadding=24),
-                            scale=alt.Scale(domain=list(RELATION_COLORS), range=list(RELATION_COLORS.values())))))
+                            scale=alt.Scale(domain=list(relation_colors()), range=list(relation_colors().values())))))
     # L'élément cliqué est mis en évidence par la sélection elle-même : le graphique ne change pas d'un clic à
     # l'autre (le redessiner effacerait la sélection).
     layers.append(alt.Chart(nodes).mark_point(filled=True, opacity=1, cursor="pointer").encode(
         x=x, y=y, shape=alt.Shape("shape:N", scale=None), fill=alt.Fill("fill:N", scale=None),
-        stroke=alt.condition(select, alt.value(SELECTED_COLOR), alt.Stroke("stroke:N", scale=None), empty=False),
+        stroke=alt.condition(select, alt.value(ui.SELECTED), alt.Stroke("stroke:N", scale=None), empty=False),
         strokeWidth=alt.condition(select, alt.value(4), alt.value(2.2), empty=False),
         size=alt.condition(select, alt.value(760), alt.value(520), empty=False),
         tooltip=["Élément:N", "Type:N", "Détail:N"]).add_params(select))
     layers.append(alt.Chart(nodes).mark_text(baseline="top", dy=16, fontSize=11, lineHeight=13, lineBreak=LINE_BREAK,
-                                             color=LABEL_COLOR).encode(x=x, y=y, text="label:N"))
+                                             color=ui.TEXT).encode(x=x, y=y, text="label:N"))
     return alt.layer(*layers).properties(height=max(320, 82 * lay.widest))
 
 
@@ -1670,23 +1743,23 @@ def plan_chart(nodes: list, plan, marks, image_uri: str | None,
         zone_select = alt.selection_point(name="zone", fields=["id"], on="click")
         layers.append(alt.Chart(zones).mark_rect(cornerRadius=8, cursor="pointer").encode(
             x=x, y=y, x2="x2:Q", y2="y2:Q", fill=alt.Fill("fill:N", scale=None),
-            stroke=alt.condition(zone_select, alt.value(SELECTED_COLOR), alt.Stroke("fill:N", scale=None), empty=False),
+            stroke=alt.condition(zone_select, alt.value(ui.SELECTED), alt.Stroke("fill:N", scale=None), empty=False),
             fillOpacity=alt.FillOpacity("opacity:Q", scale=None),
             strokeWidth=alt.condition(zone_select, alt.value(5), alt.StrokeWidth("width:Q", scale=None), empty=False),
             tooltip=["Zone:N", "Détail:N"]).add_params(zone_select))
         layers.append(alt.Chart(zones).mark_text(align="left", baseline="top", dx=8, dy=8, fontSize=13, fontWeight=600,
-                                                 color=LABEL_COLOR).encode(x=x, y=y, text="Zone:N"))
+                                                 color=ui.TEXT).encode(x=x, y=y, text="Zone:N"))
     if not points.empty:
         element_select = alt.selection_point(name="element", fields=["id"], on="click")
         layers.append(alt.Chart(points).mark_point(filled=True, opacity=1, cursor="pointer").encode(
             x=x, y=y, shape=alt.Shape("shape:N", scale=None), fill=alt.Fill("fill:N", scale=None),
-            stroke=alt.condition(element_select, alt.value(SELECTED_COLOR), alt.Stroke("stroke:N", scale=None),
+            stroke=alt.condition(element_select, alt.value(ui.SELECTED), alt.Stroke("stroke:N", scale=None),
                                  empty=False),
             strokeWidth=alt.condition(element_select, alt.value(4), alt.value(2.2), empty=False),
             size=alt.condition(element_select, alt.value(620), alt.value(380), empty=False),
             tooltip=["Élément:N", "Type:N", "Détail:N"]).add_params(element_select))
         layers.append(alt.Chart(points).mark_text(baseline="top", dy=14, fontSize=11, lineHeight=13,
-                                                  lineBreak=LINE_BREAK, color=LABEL_COLOR)
+                                                  lineBreak=LINE_BREAK, color=ui.TEXT)
                       .encode(x=x, y=y, text="label:N"))
     aspect = plan.aspect_ratio if plan else site_plan.DEFAULT_ASPECT
     return alt.layer(*layers).properties(height=round(820 * aspect))
@@ -1722,7 +1795,7 @@ def consumption_detail(db: Session, site: Site, graph: assets.SiteGraph, node_id
             y=alt.Y("kWh:Q", title="kWh par mois" + (" (estimés)" if result.method == "ESTIMATED" else "")),
             color=alt.Color("Énergie:N", title=None, legend=alt.Legend(columnPadding=24), scale=alt.Scale(
                 domain=[FLUID_LABELS[f] for f in result.by_fluid],
-                range=[FLUID_COLORS[FLUID_LABELS[f]] for f in result.by_fluid])),
+                range=[fluid_colors()[FLUID_LABELS[f]] for f in result.by_fluid])),
             tooltip=["Mois", "Énergie", alt.Tooltip("kWh:Q", format=",.0f")])
         st.altair_chart(style_chart(chart.properties(height=220)), width="stretch", key=f"{key}-months")
         if result.method in ("MEASURED", "DIFFERENCE") and result.end:
@@ -3447,6 +3520,29 @@ def plan_section(db: Session, repo: TenantRepository, user: User, site_id: int, 
             st.rerun()
 
 
+def site_photo_editor(db: Session, repo: TenantRepository, user: User, site: Site) -> None:
+    """Photo du site, affichée en tête du tableau de bord : déposer, remplacer ou retirer (auditeur)."""
+    photo = site_photo.get_photo(db, site.id)
+    with st.popover("Remplacer la photo du site" if photo else "Ajouter une photo du site",
+                    icon=":material/photo_camera:"):
+        st.caption("PNG ou JPEG, 10 Mo au plus. Elle s'affiche en tête du tableau de bord, avec les mesures du site.")
+        upload = st.file_uploader("Photo du site", type=["png", "jpg", "jpeg"], key=f"photo-upload-{site.id}")
+        if upload is not None and st.button("Utiliser cette photo", key=f"photo-save-{site.id}", type="primary"):
+            try:
+                site_photo.save_photo(db, repo, user, site.id, upload.name, upload.getvalue())
+            except (site_plan.PlanError, assets.AssetPermissionError) as exc:
+                st.error(str(exc))
+            else:
+                flash(f"Photo enregistrée pour {site.name}.")
+                st.rerun()
+        if photo is not None:
+            st.caption(f"Photo actuelle : {photo.file_name}")
+            if st.button("Retirer la photo", key=f"photo-remove-{site.id}"):
+                site_photo.remove_photo(db, repo, user, site.id)
+                flash(f"Photo retirée pour {site.name}.")
+                st.rerun()
+
+
 def page_manage(db: Session, repo: TenantRepository, user: User, org: Organization) -> None:
     guard_write(user)
     ui.page_header(org.name, "Patrimoine & consentements",
@@ -3459,6 +3555,7 @@ def page_manage(db: Session, repo: TenantRepository, user: User, org: Organizati
         with st.expander(f"{site.name}{tags}", expanded=True):
             surface = f", {fmt_number(site.surface_m2)} m²" if site.surface_m2 else ""
             st.caption(f"{site.address or 'Adresse non renseignée'}{surface}")
+            site_photo_editor(db, repo, user, site)
             for dp in site.delivery_points:
                 consent = active_consent(db, dp.id)
                 details = [FLUID_LABELS[dp.fluid], f"source : {source_label(dp, connectors)}"]
@@ -4471,7 +4568,8 @@ def sidebar(repo: TenantRepository, user: User) -> str:
         ui.render(ui.logo_html())
         ui.section_label("Menu")
         page = st.radio("Navigation", pages, key="page", label_visibility="collapsed",
-                        format_func=lambda p: f"{p} ({waiting})" if p == PAGE_VALIDATION and waiting else p)
+                        format_func=lambda p: f":material/{PAGE_ICONS[p]}: "
+                        + (f"{p} ({waiting})" if p == PAGE_VALIDATION and waiting else p))
         st.caption(f"Base locale : {settings.database_url.rsplit('/', 1)[-1]}")
     return page
 
@@ -4497,6 +4595,17 @@ def _on_search() -> None:
     else:
         st.session_state["page"] = value
     st.session_state["es_search"] = None
+
+
+def _toggle_mode(user_id: int) -> None:
+    """Bascule clair / sombre, retenue sur le compte (préférence personnelle, modifiable par tout compte)."""
+    target = ui.DARK if st.session_state.get("es-ui-mode", ui.DEFAULT_MODE) == ui.LIGHT else ui.LIGHT
+    st.session_state["es-ui-mode"] = target
+    with SessionLocal() as db:
+        account = db.get(User, user_id)
+        if account is not None:
+            account.ui_theme = target
+            db.commit()
 
 
 def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organization | None:
@@ -4561,6 +4670,13 @@ def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organ
                     for n in recent:
                         st.caption(f"{to_local(n.created_at).strftime('%d/%m à %H:%M')} : {n.message}")
 
+            # Mode clair / sombre : le bouton annonce le mode qu'il active.
+            light = ui.is_light()
+            with st.container(key="es-mode"):
+                st.button("Passer en mode sombre" if light else "Passer en mode clair", key="es-mode-toggle",
+                          icon=":material/dark_mode:" if light else ":material/light_mode:",
+                          help="Mode sombre" if light else "Mode clair", on_click=_toggle_mode, args=(user.id,))
+
             with st.container(key="es-help"):
                 with st.popover("Aide", icon=":material/support:", help="Aide"):
                     st.markdown("**Aide**")
@@ -4615,6 +4731,7 @@ def top_bar(db: Session, repo: TenantRepository, user: User, page: str) -> Organ
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon=ui.ICON_PATH, layout="wide")
+    ui.set_mode(st.session_state.get("es-ui-mode"))  # avant tout graphique : les couleurs suivent le mode
     ui.inject_css()
     initialize()
     with SessionLocal() as db:

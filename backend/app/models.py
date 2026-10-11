@@ -153,6 +153,8 @@ class User(Base):
     is_energy_manager: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # Notification immédiate par e-mail (F2, F3) : réglable par chaque utilisateur dans « Mon compte ».
     email_notifications: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    # Mode d'affichage choisi dans la barre du haut : « clair » ou « sombre » (vide : mode par défaut).
+    ui_theme: Mapped[str | None] = mapped_column(String(8))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -834,6 +836,21 @@ class SitePlan(Base):
     content_type: Mapped[str] = mapped_column(String(64))
     stored_name: Mapped[str] = mapped_column(String(80))
     aspect_ratio: Mapped[float] = mapped_column(Float, default=0.62)  # hauteur / largeur
+    uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SitePhoto(Base):
+    """Photo d'un site (facultative), en tête du tableau de bord ; déposée par l'auditeur."""
+
+    __tablename__ = "site_photos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), unique=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(64))
+    stored_name: Mapped[str] = mapped_column(String(80))
     uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
