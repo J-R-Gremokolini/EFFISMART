@@ -69,6 +69,22 @@ def test_sites_add_up_to_the_dashboard_totals(db, world):
         assert sum(r[key] for r in rows) == pytest.approx(totals[key], abs=0.2)
 
 
+def test_online_demo_makes_no_outgoing_call(monkeypatch):
+    """Démonstration en ligne : comptes connus de tous, donc aucun appel sortant, comme une coupure réseau."""
+    import smtplib
+
+    import httpx
+
+    from app.config import settings
+    from app.services import mailer, net
+
+    monkeypatch.setattr(settings, "public_demo", True)
+    with pytest.raises(httpx.ConnectError, match="démonstration en ligne"), net.client() as http:
+        http.get("https://example.org/")
+    with pytest.raises(smtplib.SMTPException, match="démonstration en ligne"):
+        mailer._connect({"host": "smtp.example.org", "port": 587})
+
+
 def test_theme_preference_is_kept_on_the_account(db, world):
     assert world.client_a.ui_theme is None  # mode par défaut tant que l'utilisateur n'a rien choisi
     world.client_a.ui_theme = "sombre"

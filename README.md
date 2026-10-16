@@ -28,6 +28,40 @@ Cette interface (`backend/effismart_ui.py`) appelle directement les services du 
 métier, même isolation entre clients et mêmes rôles que l'API. Le job quotidien est remplacé par un
 rattrapage automatique au démarrage et par le bouton « Mettre à jour les données ».
 
+### Démonstration en ligne (Streamlit Community Cloud)
+
+Pour ouvrir EffiSmart depuis un simple lien, sans rien installer : hébergement gratuit de Streamlit,
+déployé depuis ce dépôt GitHub. L'application démarre seule sur un serveur vide : elle crée sa base et
+génère la démonstration au premier lancement (1 à 2 minutes).
+
+1. Pousser le dépôt sur GitHub (branche `main`).
+2. Sur https://share.streamlit.io, se connecter avec le compte GitHub du dépôt, puis « Create app »,
+   « Deploy a public app from GitHub » :
+   - dépôt `J-R-Gremokolini/EFFISMART`, branche `main`, fichier principal `backend/effismart_ui.py` ;
+   - adresse : un sous-domaine au choix, par exemple `effismart` (lien `https://effismart.streamlit.app`
+     s'il est libre).
+3. « Advanced settings » : Python 3.12, et dans « Secrets » :
+   ```toml
+   EFFISMART_PUBLIC_DEMO = "true"
+   ```
+   Ce réglage affiche le bandeau « Démonstration en ligne » (données fictives, remises à zéro à chaque
+   redémarrage) et coupe tout appel sortant : connecteurs Enedis, GRDF, webhooks, météo, e-mails.
+4. « Deploy ». Les mises à jour poussées sur `main` sont redéployées automatiquement.
+
+Points d'attention :
+- **Accès** : un dépôt public donne une application publique ; les comptes de démonstration sont affichés
+  sur la page de connexion, donc toute personne qui a le lien peut entrer. Pour limiter l'accès : « Share »,
+  « Only specific people can view this app », puis inviter des adresses e-mail (une application privée à la
+  fois par compte Streamlit).
+- **Données éphémères** : le serveur ne garde rien d'un redémarrage à l'autre (mise en veille après une
+  période sans visite, redéploiement) ; la démonstration est alors régénérée.
+- **Démonstration seulement** : aucune donnée réelle de client. Un service en production (données Enedis
+  et GRDF réelles, RGPD) passe par la version complète (Docker, PostgreSQL), avec sauvegardes et accès maîtrisés.
+- Fichiers utilisés par Community Cloud : `.streamlit/config.toml` à la racine (même contenu que
+  `backend/.streamlit/config.toml`, à garder identiques) et `backend/requirements.txt` (voisin du fichier
+  principal, prioritaire sur le `requirements.txt` de la racine). Streamlit y est figé en 1.64.0 : le thème
+  vise la structure HTML de cette version.
+
 ### Design de l'interface
 
 - **Mode clair ou sombre, au choix de chaque utilisateur** : bouton lune / soleil dans la barre du haut ;

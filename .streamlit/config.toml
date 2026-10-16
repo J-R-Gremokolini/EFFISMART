@@ -1,0 +1,20 @@
+# Configuration de la démonstration en ligne (Streamlit Community Cloud).
+# Community Cloud lit ce fichier à la racine du dépôt, même si l'application est dans backend/ ;
+# la version locale (lancer.py) lit backend/.streamlit/config.toml. Garder les deux identiques.
+[theme]
+# Streamlit reste en sombre : le mode clair est appliqué par le thème EffiSmart (ui_theme.py).
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#f8fafc"
+
+[server]
+# Taille maximale d'un fichier déposé (Mo), alignée sur EFFISMART_DOCUMENT_MAX_MB.
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

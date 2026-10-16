@@ -73,6 +73,8 @@ def _message(email: OutgoingEmail, sender: str) -> EmailMessage:
 
 
 def _connect(config: dict) -> smtplib.SMTP:
+    if settings.public_demo:
+        raise smtplib.SMTPException("Envoi d'e-mails désactivé dans la démonstration en ligne.")
     host, port = config.get("host", ""), int(config.get("port") or 587)
     timeout = settings.integrations_http_timeout_s
     if config.get("security") == "ssl":

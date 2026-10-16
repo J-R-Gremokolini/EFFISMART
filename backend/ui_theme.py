@@ -540,6 +540,14 @@ _DASHBOARD_CSS = """
   min-height: 44px; padding-left: 10px;
 }
 [data-testid="stSelectbox"] [role="group"] input { color: var(--color-text); -webkit-text-fill-color: var(--color-text); }
+/* Champs texte (Streamlit 1.64 : « stTextInputRootElement ») : pilule, fond et contour du thème, bouton
+   « afficher le mot de passe » compris. */
+[data-testid="stTextInputRootElement"] {
+  background: var(--color-surface-2) !important; border: 1px solid var(--color-border-strong) !important;
+  border-radius: 999px !important; overflow: hidden;
+}
+[data-testid="stTextInputRootElement"] input { background: transparent !important; color: var(--color-text); }
+[data-testid="stTextInputRootElement"] button svg { color: var(--color-muted); fill: var(--color-muted); }
 [data-testid="stSelectbox"] [role="group"] button svg { color: var(--color-muted); }
 .st-key-es_search [role="group"], .st-key-org_id [role="group"] { min-height: 52px; }
 .st-key-org_id [role="group"] { background: var(--color-surface) !important; border-color: var(--color-border); }
@@ -743,6 +751,9 @@ body { color: var(--color-text-2); }
 [data-testid="stRadioOption"] > div > div:first-child:not([data-testid]) { background: var(--color-border-strong) !important; }
 [data-testid="stRadioOption"][data-selected="true"] > div > div:first-child:not([data-testid]) { background: var(--color-primary-hover) !important; }
 [data-testid="stRadioOption"] > div > div:first-child:not([data-testid]) > div { background: #ffffff !important; }
+
+/* Message d'attente (premier lancement, calculs) : Streamlit lui donne un fond dégradé de la couleur sombre. */
+[data-testid="stSpinner"] { background-image: none !important; color: var(--color-text-2); }
 
 /* Onglets, volets, séparateurs, code. */
 [data-baseweb="tab-list"] button p { color: var(--color-muted); }

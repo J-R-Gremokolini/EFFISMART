@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 backend/data/
 .env
+
+# Secrets Streamlit (démonstration en ligne : saisis dans Community Cloud, jamais dans Git)
+.streamlit/secrets.toml
+backend/.streamlit/secrets.toml

@@ -346,7 +346,16 @@ def current_user(db: Session) -> User | None:
     return db.get(User, user_id) if user_id else None
 
 
+def public_demo_notice() -> None:
+    """Démonstration en ligne : rappel que tout est fictif et éphémère (EFFISMART_PUBLIC_DEMO)."""
+    if settings.public_demo:
+        st.info("Démonstration en ligne : entreprises, sites et consommations fictifs, remis à zéro à chaque "
+                "redémarrage du serveur. N'y saisissez aucune donnée réelle (identifiants, factures, contacts). "
+                "Les appels vers l'extérieur (Enedis, GRDF, webhooks, e-mails) y sont désactivés.")
+
+
 def login_page(db: Session) -> None:
+    public_demo_notice()
     art, center = st.columns([1.05, 1], gap="large", vertical_alignment="center")
     with art:
         ui.render(ui.artwork(
@@ -4738,6 +4747,7 @@ def main() -> None:
         repo = TenantRepository(db, user)
         page = sidebar(repo, user)
         org = top_bar(db, repo, user, page)
+        public_demo_notice()
         show_flash()
         try:
             if page == PAGE_PORTFOLIO:

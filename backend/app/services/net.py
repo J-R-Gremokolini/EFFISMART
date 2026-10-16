@@ -7,6 +7,8 @@ Règles appliquées à toute URL fournie par un utilisateur (connecteur, webhook
 - les redirections ne sont pas suivies (elles pourraient pointer vers une adresse interne).
 
 Les tests remplacent le transport réseau (`set_transport`) : aucune résolution DNS n'est alors faite.
+En démonstration en ligne (`EFFISMART_PUBLIC_DEMO`), tout appel sortant échoue comme une coupure réseau : les
+appelants le traitent déjà (message d'erreur, nouvelle tentative de webhook, météo simulée).
 """
 from __future__ import annotations
 
@@ -52,10 +54,17 @@ def check_public_url(url: str) -> str:
     return url.strip()
 
 
+def _refuse(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("Appels externes désactivés dans la démonstration en ligne.", request=request)
+
+
 def client() -> httpx.Client:
+    transport = _transport
+    if transport is None and settings.public_demo:
+        transport = httpx.MockTransport(_refuse)
     return httpx.Client(
         timeout=settings.integrations_http_timeout_s,
         follow_redirects=False,
-        transport=_transport,
+        transport=transport,
         headers={"User-Agent": "EffiSmart/1.0"},
     )

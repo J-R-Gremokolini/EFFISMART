@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     document_dir: str = "./data/documents"
     document_max_mb: float = 10
     timezone: str = "Europe/Paris"
+    # Démonstration en ligne (hébergement public, comptes de démonstration connus de tous) : bandeau
+    # « données fictives » et aucun appel sortant (connecteurs, webhooks, météo, e-mails).
+    public_demo: bool = False
 
     # --- Intégrations d'API -------------------------------------------------
     # Clé de chiffrement des identifiants (Fernet, base64). En production : EFFISMART_SECRET_KEY.
